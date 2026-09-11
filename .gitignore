@@ -1,0 +1,78 @@
+# =========================
+# Dependencies
+# =========================
+node_modules/
+
+# =========================
+# Runtime data + secrets
+# data/ 下基本都不入库（运行时生成，含凭据 / 私密会话）
+# =========================
+data/codex-homes/
+data/sessions.json
+data/usage.json
+data/scan-state.json
+data/scheduled.json
+data/ssh.json
+data/settings.json
+data/model-cache.json
+data/uploads/
+data/tmp-settings/
+
+# 万一以后还有别的运行时数据落进 data/，整目录兜底
+# 如果未来需要提交某些示例/种子数据，再单独 !data/xxx.json 放行
+# data/
+
+# =========================
+# Temporary / debug scripts
+# 调试用过的下划线开头脚本与清理脚本
+# =========================
+/_acp_e2e.js
+/_fix_context.js
+/_mm.txt
+/_patch_features.js
+/_patch_rows.js
+/_probe.js
+/_probe_workbuddy_auth.js
+/cleanup_result.txt
+/scan_after.txt
+/do_cleanup.ps1
+/scan_cleanup.ps1
+
+# =========================
+# Logs
+# =========================
+*.log
+server.*.log
+server.*.err.log
+server.reload*.log
+server.live.log
+
+# =========================
+# Backups
+# =========================
+*.backup
+*.bak
+*.swp
+*~
+public/style.*-backup.css
+public/style.*.backup.css
+
+# =========================
+# Editor / OS
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.iml
+
+# =========================
+# Secrets (兜底)
+# =========================
+.env
+.env.*
+*.pem
+*.key
+auth.json
+config.toml
