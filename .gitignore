@@ -76,3 +76,9 @@ desktop.ini
 *.key
 auth.json
 config.toml
+
+# =========================
+# Chinese-local docs (kept on disk, never pushed)
+# English versions live as README.md (no .zh.md) on the repo
+# =========================
+*.zh.md
