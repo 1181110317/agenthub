@@ -7,7 +7,7 @@
     "lib": "lib"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node test/syntax.js && node test/logic.js && node test/reasoning-smoke.js",
     "start": "node server.js"
   },
   "keywords": [],
@@ -22,10 +22,18 @@
     "echarts": "^6.1.0",
     "exceljs": "^4.4.0",
     "express": "^5.2.1",
+    "image-size": "file:vendor/image-size-safe",
+    "jszip": "^3.10.1",
     "node-pty": "^1.1.0",
     "pptxgenjs": "^4.0.1",
     "ssh2": "^1.17.0",
     "undici": "^8.10.2",
     "ws": "^8.21.3"
+  },
+  "overrides": {
+    "image-size": "file:vendor/image-size-safe",
+    "exceljs": {
+      "uuid": "^11.1.1"
+    }
   }
 }

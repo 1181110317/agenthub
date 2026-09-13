@@ -20,11 +20,11 @@
       </div>
     </div>
 
-    <div class="side-newtask" id="btnNewTask" title="在当前项目下新建会话">
+    <button type="button" class="side-newtask" id="btnNewTask" title="在当前项目下新建会话">
       <span class="nt-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></span>
       <span>新建任务</span>
       <span class="nt-key">Alt+N</span>
-    </div>
+    </button>
     
 
     <div class="agent-grid" id="agentGrid"></div>
@@ -54,9 +54,9 @@
         <svg viewBox="0 0 24 24"><path d="M4 20V10m6 10V4m6 16v-7m4 7H2" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
         <span>用量</span>
       </button>
-      <button class="foot-btn" id="btnProviders" title="供应商 / 模型（读取 cc-switch）">
+      <button class="foot-btn" id="btnProviders" title="API 管理（AgentHub 独立配置）">
         <svg viewBox="0 0 24 24"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" stroke="currentColor" stroke-width="2" fill="none" stroke-linejoin="round"/></svg>
-        <span>供应商</span>
+        <span>API 管理</span>
       </button>
       <button class="foot-btn" id="btnSSH" title="SSH 主机管理">
         <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2" stroke="currentColor" stroke-width="2" fill="none"/><path d="M8 21h8M12 18v3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
@@ -77,7 +77,7 @@
   <main id="main">
     <header id="mainHeader">
       <div class="hdr-left">
-        <button id="sbToggle" class="sb-toggle" title="侧栏">
+        <button id="sbToggle" class="sb-toggle" title="侧栏" aria-label="打开或隐藏侧栏" aria-expanded="false">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
         </button>
         <div class="hdr-title" id="hdrTitle" title="双击重命名">新会话</div>
@@ -105,31 +105,31 @@
           <textarea id="inpText" rows="1" placeholder="继续输入，Enter 发送 / Shift+Enter 换行；可直接粘贴截图"></textarea>
           <div id="attachStrip" class="attach-strip hidden"></div>
           <div class="composer-controls">
-            <span class="ctrl-pill ctrl-menu" id="pillPerm" title="权限模式：自动=跳过全部确认；接受编辑=文件编辑自动批准；计划=只读调研；询问=不跳过（无头运行下需要确认的操作会被拒绝，读/搜索不受影响）">
+            <button type="button" class="ctrl-pill ctrl-menu" id="pillPerm" aria-haspopup="listbox" title="权限模式：自动=跳过全部确认；接受编辑=文件编辑自动批准；计划=只读调研；询问=不跳过（无头运行下需要确认的操作会被拒绝，读/搜索不受影响）">
               <span class="ctrl-label">权限</span><span class="dd-value" id="permLabel">自动</span><span class="dd-caret">▾</span>
-            </span>
+            </button>
             <button class="composer-icon" id="btnAttach" title="添加图片附件">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
             </button>
-            <div id="ctxMeter" class="ctx-meter hidden" title="查看上下文容量">
+            <button type="button" id="ctxMeter" class="ctx-meter hidden" aria-label="查看上下文容量" title="查看上下文容量">
               <div class="ctx-track"><i class="ctx-fill"></i></div>
               <span class="ctx-text"></span>
-            </div>
+            </button>
             <span class="ctrl-spacer"></span>
             <div class="ctrl-config" role="group" aria-label="运行配置">
               <span class="config-caption">运行配置</span>
-              <span class="ctrl-pill ctrl-menu" id="pillProvider" title="供应商（来自 cc-switch 或手动添加，点击切换）">
+              <button type="button" class="ctrl-pill ctrl-menu" id="pillProvider" aria-haspopup="listbox" title="API 入口（来自 AgentHub 本地配置，点击切换）">
                 <span class="ctrl-label config-label">供应商</span><span class="dd-value" id="providerLabel">跟随系统配置</span><span class="dd-caret">▾</span>
-              </span>
-              <span class="ctrl-pill ctrl-menu" id="pillRemote" title="运行位置：本机 / WSL / SSH 主机">
+              </button>
+              <button type="button" class="ctrl-pill ctrl-menu" id="pillRemote" aria-haspopup="listbox" title="运行位置：本机 / WSL / SSH 主机">
                 <span class="ctrl-label config-label">位置</span><span class="dd-value" id="remoteLabel">本机</span><span class="dd-caret">▾</span>
-              </span>
-              <span class="ctrl-pill ctrl-menu" id="pillEffort" title="推理强度（思考预算）">
+              </button>
+              <button type="button" class="ctrl-pill ctrl-menu" id="pillEffort" aria-haspopup="listbox" title="推理强度（思考预算）">
                 <span class="ctrl-label config-label">推理</span><span class="dd-value" id="effortLabel">默认</span><span class="dd-caret">▾</span>
-              </span>
-              <span class="ctrl-pill ctrl-menu" id="pillModel" title="模型（点击选择）">
+              </button>
+              <button type="button" class="ctrl-pill ctrl-menu" id="pillModel" aria-haspopup="listbox" title="模型（点击选择）">
                 <span class="ctrl-label config-label">模型</span><span class="dd-value" id="modelLabel">默认</span><span class="dd-caret">▾</span>
-              </span>
+              </button>
             </div>
             <input id="fileAttach" class="hidden" type="file" accept="image/*" multiple>
             <input id="inpCwd" class="hidden">
@@ -196,11 +196,11 @@
 </div>
 
 <!-- ================= 通用弹窗 ================= -->
-<div id="overlay" class="hidden">
-  <div id="dlg" role="dialog">
+<div id="overlay" class="hidden" aria-hidden="true">
+  <div id="dlg" role="dialog" aria-modal="true" aria-labelledby="dlgTitle">
     <div class="dlg-head">
       <span id="dlgTitle"></span>
-      <button class="btn-mini" id="dlgClose">✕</button>
+      <button class="btn-mini" id="dlgClose" aria-label="关闭弹窗">✕</button>
     </div>
     <div class="dlg-body" id="dlgBody"></div>
   </div>
@@ -208,12 +208,10 @@
 
 <div id="toastWrap"></div>
 
-<script src="/vendor/echarts.min.js"></script>
-<script src="/vendor/xterm.js"></script>
-<script src="/vendor/addon-fit.js"></script>
-<script src="/vendor/mermaid.min.js"></script>
+<!-- mermaid(3.3MB)/echarts/xterm 只在真正渲染图表或打开终端时按需加载，
+     见 app.js 的 ensureMermaid/ensureEcharts/ensureXterm；hljs 每条消息都要用，保留但 defer -->
 <link rel="stylesheet" href="/vendor/hljs/styles/github.css" id="hljsCss">
-<script src="/vendor/hljs/highlight.min.js"></script>
-<script src="/app.js"></script>
+<script defer src="/vendor/hljs/highlight.min.js"></script>
+<script defer src="/app.js"></script>
 </body>
 </html>

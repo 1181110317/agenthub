@@ -5,6 +5,8 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const dns = require('dns').promises;
+const net = require('net');
 const { Readable } = require('stream');
 const { WebSocketServer } = require('ws');
 
@@ -22,6 +24,9 @@ const ccswitch = require('./lib/ccswitch');
 const usage = require('./lib/usage');
 const balance = require('./lib/balance');
 const ssh = require('./lib/ssh');
+const { PERM_MODES, normalizePermissionState } = require('./lib/session-policy');
+const { privatePageAddress } = require('./lib/page-security');
+const { requestPinned } = require('./lib/api-agent');
 // 本机终端（可选依赖，缺失时降级提示）
 let pty = null;
 try { pty = require('node-pty'); } catch { pty = null; }
@@ -39,7 +44,7 @@ const settings = new Store('settings', {
   contextWindows: {},
 });
 const sessionsStore = new Store('sessions', { sessions: [] });
-const providerStore = new Store('providers', { list: [] }); // 手动添加
+const providerStore = new Store('providers', { list: [], meta: {} }); // AgentHub 独立管理的 API 入口
 const modelCacheStore = new Store('model-cache', { byProvider: {} }); // 拉取过的 /v1/models 缓存（#3）
 
 // JSON 文件可能被旧版本、手工编辑或异常中断写入成 null/数组/错误字段。
@@ -69,7 +74,7 @@ else {
     const id = c.id.trim().slice(0, 128);
     const name = c.name.trim().slice(0, 120);
     const bin = c.bin.trim().slice(0, 2048);
-    if (!/^[A-Za-z0-9:_-]{1,128}$/.test(id) || !name || !bin || seenCustom.has(id)) continue;
+    if (!/^[A-Za-z0-9:_-]{1,128}$/.test(id) || agents.DEFS[id] || id.startsWith('acp:') || !name || !bin || seenCustom.has(id)) continue;
     seenCustom.add(id);
     custom.push({
       id, name, bin,
@@ -137,7 +142,15 @@ const cleanStoredFiles = files => {
   }).filter(Boolean).slice(0, 60);
 };
 const cleanStoredImages = images => Array.isArray(images)
-  ? images.filter(isSafeImageSource).slice(0, 6)
+  ? images.map(item => {
+    // 旧历史只保存 URL；新消息同时保存上传路径，编辑重发/重试时才能
+    // 把原图再次交给 Agent，而不是只在网页上显示一张无法发送的缩略图。
+    if (typeof item === 'string') return isSafeImageSource(item) ? item : null;
+    if (!isRecord(item)) return null;
+    const url = typeof item.url === 'string' ? item.url : '';
+    const imagePath = typeof item.path === 'string' ? item.path.slice(0, 4096) : '';
+    return isSafeImageSource(url) && imagePath ? { path: imagePath, url } : null;
+  }).filter(Boolean).slice(0, 6)
   : undefined;
 const cleanStoredPages = pages => Array.isArray(pages)
   ? pages.filter(x => typeof x === 'string' && /^https?:\/\//i.test(x) && x.length <= 4096).slice(0, 8)
@@ -193,6 +206,7 @@ const normalizeSessionRecord = s => {
     m.plan = cleanStoredPlan(m.plan);
     m.usage = cleanStoredUsage(m.usage);
   }
+  const permission = normalizePermissionState(s.autoPerms === true, s.permMode);
   return {
     ...s,
     id,
@@ -204,8 +218,8 @@ const normalizeSessionRecord = s => {
     cwd: typeof s.cwd === 'string' ? s.cwd.slice(0, 4096) : '',
     cliSessionId: typeof s.cliSessionId === 'string' ? s.cliSessionId.slice(0, 256) : '',
     cliSessionStartTs: Number.isFinite(Number(s.cliSessionStartTs)) ? Number(s.cliSessionStartTs) : 0,
-    autoPerms: s.autoPerms === true,
-    permMode: ['auto', 'edits', 'plan', 'ask'].includes(s.permMode) ? s.permMode : '',
+    autoPerms: permission.autoPerms,
+    permMode: permission.permMode,
     effort: ['minimal', 'low', 'medium', 'high', 'max'].includes(s.effort) ? s.effort : '',
     titled: s.titled === true,
     pinned: s.pinned === true,
@@ -217,17 +231,56 @@ const normalizeSessionRecord = s => {
 sessionsStore.data.sessions = sessionsStore.data.sessions.map(normalizeSessionRecord).filter(Boolean);
 if (!isRecord(providerStore.data)) providerStore.data = {};
 if (!Array.isArray(providerStore.data.list)) providerStore.data.list = [];
-providerStore.data.list = providerStore.data.list.filter(isRecord).map(p => ({
+const normalizeProviderRecord = p => ({
   ...p,
   id: typeof p.id === 'string' ? p.id.slice(0, 256) : '',
   agent: typeof p.agent === 'string' ? p.agent.slice(0, 128) : '',
   name: typeof p.name === 'string' ? p.name.slice(0, 120) : '未命名供应商',
   baseUrl: typeof p.baseUrl === 'string' ? p.baseUrl.slice(0, 2048) : '',
   apiKey: typeof p.apiKey === 'string' ? p.apiKey.slice(0, 4096) : '',
+  protocol: ['anthropic', 'openai'].includes(String(p.protocol || '').toLowerCase()) ? String(p.protocol).toLowerCase() : '',
+  balanceType: typeof p.balanceType === 'string' ? p.balanceType.slice(0, 64) : '',
+  source: typeof p.source === 'string' && p.source.trim() ? p.source.trim().slice(0, 32) : 'manual',
+  managed: p.managed !== false,
+  importedFrom: typeof p.importedFrom === 'string' ? p.importedFrom.slice(0, 64) : '',
+  ccsId: typeof p.ccsId === 'string' ? p.ccsId.slice(0, 256) : '',
+  websiteUrl: typeof p.websiteUrl === 'string' ? p.websiteUrl.slice(0, 2048) : '',
+  createdAt: Number.isFinite(Number(p.createdAt)) ? Number(p.createdAt) : Date.now(),
   model: typeof p.model === 'string' ? p.model.slice(0, 256) : '',
   models: Array.isArray(p.models) ? p.models.map(x => typeof x === 'string' ? x : (isRecord(x) ? (x.id || x.model || x.slug || x.name || '') : ''))
     .filter(x => typeof x === 'string' && x.trim()).map(x => x.trim().slice(0, 256)).slice(0, 2000) : [],
-})).filter(p => p.id);
+});
+providerStore.data.list = providerStore.data.list.filter(isRecord).map(normalizeProviderRecord).filter(p => p.id);
+if (!isRecord(providerStore.data.meta)) providerStore.data.meta = {};
+
+// 旧版本从 cc-switch 实时读取供应商。首次启动时只做一次兼容性导入，
+// 之后所有 API 路由都只读 AgentHub 自己的 providers.json；即使用户卸载
+// cc-switch、数据库不可读或 Node 没有 node:sqlite，已导入/手动配置仍可用。
+function importLegacyCcswitchProviders() {
+  if (providerStore.data.meta.ccswitchImportDone === true) return;
+  const legacyDb = ccswitch.dbPath();
+  if (!legacyDb || !legacyDb.toLowerCase().endsWith('.db')) return;
+  let legacy = [];
+  try { legacy = ccswitch.listProviders(); } catch { return; }
+  // 数据库存在但当前 Node 无法读取时，保留重试机会；这不影响独立
+  // provider store 的正常工作。
+  if (ccswitch.lastError) return;
+  const existing = new Set(providerStore.data.list.map(p => p.id));
+  for (const p of Array.isArray(legacy) ? legacy : []) {
+    if (!isRecord(p) || typeof p.id !== 'string' || existing.has(p.id)) continue;
+    providerStore.data.list.push(normalizeProviderRecord({
+      ...p,
+      source: 'imported',
+      importedFrom: 'ccswitch',
+      managed: true,
+    }));
+    existing.add(p.id);
+  }
+  providerStore.data.meta.ccswitchImportDone = true;
+  // 首次导入要立即落盘，避免页面刚启动又因进程退出而重复导入。
+  providerStore.saveNow();
+}
+importLegacyCcswitchProviders();
 if (!isRecord(modelCacheStore.data)) modelCacheStore.data = {};
 if (!isRecord(modelCacheStore.data.byProvider)) modelCacheStore.data.byProvider = {};
 else modelCacheStore.data.byProvider = Object.fromEntries(Object.entries(modelCacheStore.data.byProvider)
@@ -259,6 +312,39 @@ function readArchivedSessions() {
   return [...byId.values()].sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
 }
 
+// 删除会话时同步清理 JSONL 历史。只从“活动会话”数组删除会让它在重启、
+// 刷新归档列表或再次触发容量归档后重新出现。
+function removeArchivedSession(id) {
+  const target = String(id || '');
+  if (!target) return true;
+  if (!fs.existsSync(SESSION_ARCHIVE_FILE)) {
+    archivedSessionIds.delete(target);
+    return true;
+  }
+  const raw = fs.readFileSync(SESSION_ARCHIVE_FILE, 'utf8');
+  const kept = raw.split('\n').filter(line => {
+    if (!line.trim()) return false;
+    try {
+      const item = JSON.parse(line);
+      return !item || String(item.id || '') !== target;
+    } catch {
+      // 保留无法解析的历史行，避免一次删除操作扩大数据损失。
+      return true;
+    }
+  });
+  const tmp = SESSION_ARCHIVE_FILE + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
+  try {
+    fs.mkdirSync(path.dirname(SESSION_ARCHIVE_FILE), { recursive: true });
+    fs.writeFileSync(tmp, kept.join('\n') + (kept.length ? '\n' : ''), 'utf8');
+    fs.renameSync(tmp, SESSION_ARCHIVE_FILE);
+    archivedSessionIds.delete(target);
+    return true;
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
+}
+
 // 归档采用追加写，恢复后再次归档会产生同一会话的旧副本。只要文件
 // 变大到一定程度就做一次“按 ID 保留最新副本”的无损压缩；不同会话
 // 的历史不会被删除，避免 JSONL 归档本身因反复恢复而无限放大。
@@ -275,6 +361,24 @@ function compactArchiveIfNeeded() {
     try { fs.unlinkSync(tmp); } catch {}
     console.error('[sessions] archive compaction failed:', e.message);
   }
+}
+
+// 会话级临时配置（claude 桥的 --settings 文件、供应商 env 文件）在正常销毁
+// 路径会被删除。进程被强杀或崩溃时不会执行清理，而这些文件含供应商凭据，
+// 不能放任累积。启动时没有活动会话，安全地把上次遗留的临时文件清掉。
+// data/tmp-settings 由本应用独占（只写临时 --settings），整目录 *.json 都是
+// 一次性文件，包含早期版本以供应商名/`prov-<id>` 命名的历史残留。
+function sweepTmpSettings() {
+  const dir = path.join(__dirname, 'data', 'tmp-settings');
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return 0; }
+  let removed = 0;
+  for (const name of names) {
+    if (!/\.json$/i.test(name)) continue;
+    try { fs.unlinkSync(path.join(dir, name)); removed++; } catch {}
+  }
+  if (removed) console.log('[startup] 清理遗留临时配置 ' + removed + ' 个');
+  return removed;
 }
 
 function maybeArchiveSessions() {
@@ -420,7 +524,6 @@ function collectRemoteOutput(handle, timeoutMs = 20000, maxBytes = 24 * 1024 * 1
 const app = express();
 // 图片以 data URL 传输，12MiB 二进制经过 base64 后还要加 data URL 前缀；
 // 16MiB 的 JSON 上限会在边界处提前拒绝，因此留出少量协议开销。
-app.use(express.json({ limit: '17mb' }));
 // 访问令牌（AGENTHUB_TOKEN 设置后启用）：守护所有 /api 接口；静态资源放行以便页面加载
 if (process.env.AGENTHUB_TOKEN) {
   app.use((req, res, next) => {
@@ -429,9 +532,28 @@ if (process.env.AGENTHUB_TOKEN) {
     res.status(401).json({ error: '需要访问令牌：在 URL 加 ?token=… 或请求头 x-agenthub-token' });
   });
 }
+// 先做令牌校验，再读取请求体。这样未授权的大 JSON/图片不会先被
+// express.json 完整读入内存，避免认证前的资源消耗。
+app.use(express.json({ limit: '17mb' }));
+
+// 图片经 base64 后体积膨胀约 4/3：约 13MB 以上的图片会先触碰到上面的 JSON
+// 上限，拿到"请求体过大"这种通用提示，而不是"图片超过 12MB"的可执行指引。
+// 解析阶段的错误在这里就地换成上传语境的说法，其余请求继续交给全局处理器。
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.too.large' && req.path === '/api/upload') {
+    return res.status(413).json({ error: '图片过大，无法上传：请压缩或裁剪到 12MB 以内再粘贴' });
+  }
+  return next(err);
+});
 
 // ---------- 静态资源 + vendor ----------
-app.use(express.static(path.join(__dirname, 'public')));
+// AgentHub 是本地工作台，前端迭代时不能继续复用旧的 app.js/style.css；
+// 否则新增统计布局会出现“源码有、页面没有”的错觉。
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders(res, filePath) {
+    if (/\.(?:html?|css|js)$/i.test(filePath)) res.setHeader('Cache-Control', 'no-store');
+  },
+}));
 app.get('/vendor/echarts.min.js', (req, res) => res.sendFile(path.join(__dirname, 'node_modules/echarts/dist/echarts.min.js')));
 app.get('/vendor/xterm.js', (req, res) => res.sendFile(path.join(__dirname, 'node_modules/@xterm/xterm/lib/xterm.js')));
 app.get('/vendor/xterm.css', (req, res) => res.sendFile(path.join(__dirname, 'node_modules/@xterm/xterm/css/xterm.css')));
@@ -439,11 +561,17 @@ app.get('/vendor/addon-fit.js', (req, res) => res.sendFile(path.join(__dirname, 
 
 // ---------- providers ----------
 function allProviders() {
-  const ccs = ccswitch.listProviders();
-  const manual = providerStore.data.list.map(p => ({ ...p, source: 'manual' }));
-  // #3：合并历史拉取过的模型目录缓存（cc-switch 的 claude 供应商没有目录，拉过一次就有）
+  // 供应商管理以 AgentHub 自己的 providers.json 为唯一运行时来源。
+  // cc-switch 只在进程启动时参与一次兼容导入，不再影响页面刷新、会话
+  // 创建或模型目录请求。
+  const local = providerStore.data.list.map(p => ({
+    ...p,
+    source: p.source || 'manual',
+    managed: p.managed !== false,
+  }));
+  // 合并历史拉取过的模型目录缓存。
   const cache = modelCacheStore.data.byProvider || {};
-  return [...ccs, ...manual].map(p => ({ ...p, models: (p.models && p.models.length) ? p.models : (cache[p.id] || []) }));
+  return local.map(p => ({ ...p, models: (p.models && p.models.length) ? p.models : (cache[p.id] || []) }));
 }
 function findProvider(id) {
   return allProviders().find(p => p.id === id) || null;
@@ -459,8 +587,15 @@ function knownAgent(agent) {
   }
   return false;
 }
+function supportsManagedPermissions(agent) {
+  const id = String(agent || '');
+  if (id === 'builtin' || id.startsWith('acp:')) return true;
+  const custom = (settings.data.customAgents || []).find(c => c && c.id === id);
+  if (custom) return custom.acp === true;
+  return ['claude', 'codex', 'zcode'].includes(id);
+}
 function providerFitsAgent(agent, provider) {
-  if (!provider || agent === 'builtin') return true;
+  if (!provider || agent === 'builtin' || agent === 'chatgpt-web') return true;
   if (agent === 'zcode') return provider.agent === 'zcode' || provider.agent === 'claude';
   if (String(agent).startsWith('acp:')) return false;
   return provider.agent === agent;
@@ -468,8 +603,15 @@ function providerFitsAgent(agent, provider) {
 function validRemoteHost(hostId) {
   return !hostId || hostId === 'wsl' || !!ssh.getHostCfg(hostId);
 }
-// 解析某 Agent 的"默认供应商"：本应用 ★ 默认 → cc-switch 当前 → 无（与前端 #11 逻辑一致）
+// 解析某 Agent 的默认供应商：本应用 ★ 默认 → 导入记录的历史当前标记 → 无。
 function defaultProviderForAgent(agentId) {
+  if (agentId === 'chatgpt-web') {
+    const current = settings.data.currentProvider || {};
+    const star = current[agentId] || current.builtin || '';
+    const list = allProviders();
+    if (star) { const p = list.find(x => x.id === star); if (p) return p; }
+    return list.find(p => p.isCurrent) || list[0] || null;
+  }
   const want = agentId === 'zcode' ? 'claude' : agentId;
   const current = settings.data.currentProvider || {};
   const star = current[agentId] || current[want] || '';
@@ -490,11 +632,19 @@ app.get('/api/providers', (req, res) => {
 function maskProvider(p) {
   const key = String(p.apiKey || '');
   const masked = key ? (key.length <= 10 ? key.slice(0, Math.max(1, key.length - 3)) + '***' : key.slice(0, 6) + '***' + key.slice(-4)) : '';
-  return { ...p, apiKey: masked, raw: undefined, models: p.models || [] };
+  // 显式白名单：raw/env 可能包含 OAuth、配置文本或完整密钥，不能依赖
+  // “覆盖后设 undefined”来防止未来字段扩散到前端。
+  return {
+    id: p.id, agent: p.agent, name: p.name, baseUrl: p.baseUrl || '', model: p.model || '',
+    models: Array.isArray(p.models) ? p.models : [], apiKey: masked, maskedKey: masked,
+    isCurrent: !!p.isCurrent, websiteUrl: p.websiteUrl || '', source: p.source || 'manual',
+    managed: p.managed !== false, importedFrom: p.importedFrom || '', ccsId: p.ccsId || '',
+    protocol: p.protocol || '', balanceType: p.balanceType || '',
+  };
 }
 app.post('/api/providers', (req, res) => {
   if (!isRecord(req.body)) return res.status(400).json({ error: '供应商请求格式无效' });
-  const { agent, name, baseUrl, apiKey, model } = req.body;
+  const { agent, name, baseUrl, apiKey, model, protocol } = req.body;
   if (typeof agent !== 'string' || typeof name !== 'string' || !agent.trim() || !name.trim()) return res.status(400).json({ error: 'agent/name 必填' });
   const agentId = agent.trim();
   const providerName = name.trim();
@@ -503,42 +653,64 @@ app.post('/api/providers', (req, res) => {
   if (baseUrl != null && typeof baseUrl !== 'string') return res.status(400).json({ error: 'Base URL 格式无效' });
   if (apiKey != null && typeof apiKey !== 'string') return res.status(400).json({ error: 'API Key 格式无效' });
   if (model != null && typeof model !== 'string') return res.status(400).json({ error: '模型格式无效' });
+  if (protocol != null && typeof protocol !== 'string') return res.status(400).json({ error: '协议格式无效' });
   if (String(baseUrl || '').length > 2048 || String(apiKey || '').length > 4096 || String(model || '').length > 256) return res.status(400).json({ error: '供应商字段过长' });
+  const protocolValue = String(protocol || '').trim().toLowerCase();
+  if (protocolValue && !['anthropic', 'openai'].includes(protocolValue)) return res.status(400).json({ error: '协议必须是 Anthropic 或 OpenAI 兼容' });
   const cleanBase = String(baseUrl || '').trim();
   if (cleanBase) {
     try { const u = new URL(cleanBase); if (!/^https?:$/.test(u.protocol) || !u.hostname) throw new Error(); }
     catch { return res.status(400).json({ error: 'Base URL 必须是 http(s) 地址' }); }
   }
-  const p = { id: 'local:' + crypto.randomUUID(), agent: agentId, name: providerName, baseUrl: cleanBase, apiKey: apiKey || '', model: model || '', source: 'manual', createdAt: Date.now() };
+  const p = { id: 'local:' + crypto.randomUUID(), agent: agentId, name: providerName, baseUrl: cleanBase, apiKey: apiKey || '', model: model || '', protocol: protocolValue, source: 'manual', managed: true, createdAt: Date.now() };
   providerStore.data.list.push(p);
   providerStore.save();
   res.json(maskProvider(p));
 });
 app.put('/api/providers/:id', (req, res) => {
   const i = providerStore.data.list.findIndex(p => p.id === req.params.id);
-  if (i < 0) return res.status(404).json({ error: '仅可编辑手动添加的供应商' });
+  if (i < 0) return res.status(404).json({ error: 'API 入口不存在' });
   if (!isRecord(req.body)) return res.status(400).json({ error: '供应商请求格式无效' });
-  const { name, baseUrl, apiKey, model } = req.body;
+  const { name, baseUrl, apiKey, model, protocol, clearApiKey } = req.body;
   if (name != null && (typeof name !== 'string' || !name.trim() || name.length > 120)) return res.status(400).json({ error: '供应商名称无效' });
   if (baseUrl != null && typeof baseUrl !== 'string') return res.status(400).json({ error: 'Base URL 格式无效' });
   if (apiKey != null && typeof apiKey !== 'string') return res.status(400).json({ error: 'API Key 格式无效' });
+  if (clearApiKey != null && typeof clearApiKey !== 'boolean') return res.status(400).json({ error: '清除 API Key 标记无效' });
   if (model != null && typeof model !== 'string') return res.status(400).json({ error: '模型格式无效' });
+  if (protocol != null && typeof protocol !== 'string') return res.status(400).json({ error: '协议格式无效' });
   if (String(baseUrl || '').length > 2048 || String(apiKey || '').length > 4096 || String(model || '').length > 256) return res.status(400).json({ error: '供应商字段过长' });
+  const protocolValue = protocol == null ? undefined : String(protocol || '').trim().toLowerCase();
+  if (protocolValue !== undefined && protocolValue && !['anthropic', 'openai'].includes(protocolValue)) return res.status(400).json({ error: '协议必须是 Anthropic 或 OpenAI 兼容' });
   const cleanBase = baseUrl == null ? undefined : String(baseUrl).trim();
   if (cleanBase) {
     try { const u = new URL(cleanBase); if (!/^https?:$/.test(u.protocol) || !u.hostname) throw new Error(); }
     catch { return res.status(400).json({ error: 'Base URL 必须是 http(s) 地址' }); }
   }
   const cur = providerStore.data.list[i];
-  providerStore.data.list[i] = { ...cur, name: name == null ? cur.name : name.trim(), baseUrl: cleanBase == null ? cur.baseUrl : cleanBase, apiKey: apiKey && !apiKey.includes('***') ? apiKey : cur.apiKey, model: model == null ? cur.model : model.slice(0, 256) };
+  providerStore.data.list[i] = {
+    ...cur,
+    name: name == null ? cur.name : name.trim(),
+    baseUrl: cleanBase == null ? cur.baseUrl : cleanBase,
+    apiKey: clearApiKey === true ? '' : (apiKey && !apiKey.includes('***') ? apiKey : cur.apiKey),
+    model: model == null ? cur.model : model.slice(0, 256),
+    protocol: protocolValue === undefined ? cur.protocol || '' : protocolValue,
+  };
   providerStore.save();
   res.json(maskProvider(providerStore.data.list[i]));
 });
 app.delete('/api/providers/:id', (req, res) => {
+  const affected = sessionsStore.data.sessions.concat(readArchivedSessions()).filter(s => s.providerId === req.params.id);
+  if (affected.length) return res.status(409).json({ error: `供应商仍被 ${affected.length} 个会话使用，请先切换会话供应商` });
   const before = providerStore.data.list.length;
   providerStore.data.list = providerStore.data.list.filter(p => p.id !== req.params.id);
-  if (before === providerStore.data.list.length) return res.status(404).json({ error: '手动供应商不存在' });
+  if (before === providerStore.data.list.length) return res.status(404).json({ error: 'API 入口不存在' });
   providerStore.save();
+  for (const [agentId, providerId] of Object.entries(settings.data.currentProvider || {})) {
+    if (providerId === req.params.id) delete settings.data.currentProvider[agentId];
+  }
+  settings.save();
+  if (modelCacheStore.data.byProvider) delete modelCacheStore.data.byProvider[req.params.id];
+  modelCacheStore.save();
   res.json({ removed: before - providerStore.data.list.length });
 });
 app.post('/api/providers/balance', async (req, res) => {
@@ -552,7 +724,7 @@ app.post('/api/providers/models', async (req, res) => {
   if (!isRecord(req.body) || (req.body.id != null && typeof req.body.id !== 'string')) return res.status(400).json({ error: '供应商请求格式无效' });
   const p = findProvider(req.body && req.body.id);
   if (!p) return res.status(404).json({ error: '供应商不存在' });
-  // codex 类供应商：直接用 cc-switch 保存的模型目录
+  // 已缓存的模型目录优先直接返回（来源可以是首次导入，也可以是 AgentHub 自己拉取）。
   if (p.models && p.models.length) return res.json({ ok: true, models: p.models, source: 'catalog' });
   let r;
   try { r = await balance.listModels(p); }
@@ -599,9 +771,12 @@ app.post('/api/fs/mkdir', async (req, res) => {
   try {
     if (host === 'wsl') {
       if (process.platform !== 'win32') return res.status(400).json({ error: 'WSL 仅在 Windows 上可用' });
-      const r = await wslExec('mkdir -p ' + wslShellPath(p) + ' && echo ok', 15000);
+      // 与 fs/files、fs/raw、fs/ls 一致：先做盘符路径转换再进 shell，否则
+      // 「C:\foo」会在 WSL 主目录里创建一个字面名为 C:\foo 的目录。
+      const wr = wslPath(p) || p;
+      const r = await wslExec('mkdir -p ' + wslShellPath(wr) + ' && echo ok', 15000);
       if (!(r.stdout || '').includes('ok')) return res.status(400).json({ error: 'WSL 创建失败' });
-      return res.json({ ok: true, path: p });
+      return res.json({ ok: true, path: wr });
     }
     if (host && host !== 'local') {
       const cfg = ssh.getHostCfg(host);
@@ -614,8 +789,9 @@ app.post('/api/fs/mkdir', async (req, res) => {
       else res.status(400).json({ error: '远程创建失败（exit ' + result.code + '）' });
       return;
     }
-    await fs.promises.mkdir(p, { recursive: true });
-    res.json({ ok: true, path: p });
+    const localPath = expandLocalPath(p);
+    await fs.promises.mkdir(localPath, { recursive: true });
+    res.json({ ok: true, path: localPath });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -623,12 +799,14 @@ app.post('/api/fs/mkdir', async (req, res) => {
 
 // ---------- 工作区文件列表（@ 引用） ----------
 app.get('/api/fs/files', async (req, res) => {
-  const root = typeof req.query.path === 'string' ? req.query.path.trim() : '';
+  let root = typeof req.query.path === 'string' ? req.query.path.trim() : '';
   const host = typeof req.query.host === 'string' ? req.query.host.trim() : '';
+  const localHost = !host || host === 'local';
   const q = typeof req.query.q === 'string' ? req.query.q.toLowerCase() : '';
   if (!root) return res.status(400).json({ error: '缺少 path' });
   const skip = new Set(['node_modules', '.git', 'dist', 'build', '.claude', '__pycache__', '.venv', 'coverage']);
   const out = [];
+  if (localHost) root = expandLocalPath(root);
   if (host === 'wsl') {
     if (process.platform !== 'win32') return res.json({ files: [] });
     try {
@@ -642,7 +820,7 @@ app.get('/api/fs/files', async (req, res) => {
     } catch (e) { return res.json({ files: [] }); }
   }
   // B1：SSH 远程会话的 @ 引用——在远程机器上 find，而不是把远程路径当本机路径读
-  if (host) {
+  if (!localHost) {
     const cfg = ssh.getHostCfg(host);
     if (!cfg) return res.status(404).json({ error: '主机不存在' });
     try {
@@ -687,34 +865,60 @@ const DOC_MIME = {
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 };
+
+// 文件事件经常只记录相对路径；它属于产生该事件的会话工作目录，不能
+// 直接按 AgentHub 服务进程的当前目录读取。~、POSIX 绝对路径、Windows
+// 盘符和 UNC 路径都保持原样，其余路径才拼到 cwd。
+function isTargetAbsolute(p) {
+  const value = String(p || '');
+  return path.isAbsolute(value) || /^\//.test(value) || /^~(?:[\\/]|$)/.test(value) || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value);
+}
+function expandLocalPath(value) {
+  const input = String(value || '').trim();
+  if (input === '~') return os.homedir();
+  if (/^~[\\/]/.test(input)) return path.join(os.homedir(), input.slice(2).replace(/[\\/]+/g, path.sep));
+  return input;
+}
+function resolveTargetPath(cwd, p, local = true) {
+  const file = local ? expandLocalPath(p) : String(p || '').trim();
+  const base = local ? expandLocalPath(cwd) : String(cwd || '').trim();
+  if (!file || !base || isTargetAbsolute(file)) return file;
+  const root = base.replace(/[\\/]+$/, '');
+  const relative = file.replace(/^[\\/]+/, '');
+  const separator = /^[A-Za-z]:[\\/]/.test(root) ? '\\' : '/';
+  return root + separator + relative;
+}
+
 app.get('/api/fs/raw', async (req, res) => {
   const p = typeof req.query.path === 'string' ? req.query.path.trim() : '';
   const host = typeof req.query.host === 'string' ? req.query.host.trim() : '';
+  const cwd = typeof req.query.cwd === 'string' ? req.query.cwd.trim() : '';
   const mode = typeof req.query.mode === 'string' ? req.query.mode.trim() : '';
   if (!p || !(IMAGE_EXT.test(p) || DOC_EXT.test(p) || TEXT_EXT.test(p))) return res.status(400).json({ error: '仅支持图片与 pdf/docx/xlsx/pptx/md/txt' });
+  const targetPath = resolveTargetPath(cwd, p, !host || host === 'local');
   try {
     let buf = null;
     if (host === 'wsl') {
       if (process.platform !== 'win32') return res.status(400).json({ error: 'WSL 仅在 Windows 上可用' });
       // WSL 内路径 cat 回来。异步执行，不能让一次大文件预览阻塞整个服务；
       // 12MB 文件经过 base64 后约 16MB，因此单独提高 stdout 上限。
-      const wr = wslPath(p) || p;
+      const wr = wslPath(targetPath) || targetPath;
       const r = await wslExec('base64 -w0 ' + wslShellPath(wr) + ' 2>/dev/null', 30000, 20 * 1024 * 1024);
       if (r.code !== 0 || !r.stdout) return res.status(404).json({ error: '读不到文件（不存在或无权限）' });
       buf = Buffer.from(r.stdout.replace(/\s/g, ''), 'base64');
-    } else if (host) {
+    } else if (host && host !== 'local') {
       const cfg = ssh.getHostCfg(host);
       if (!cfg) return res.status(404).json({ error: '主机不存在' });
       // 不使用 GNU 专属的 `-w0`，也不把 base64 放进管道隐藏其失败码；
       // 输出换行由本机统一去掉，Linux、macOS、BSD 都能工作。
-      const result = await collectRemoteOutput(ssh.execStream(cfg, 'base64 ' + shq(p) + ' 2>/dev/null', ''), 30000, 20 * 1024 * 1024);
+      const result = await collectRemoteOutput(ssh.execStream(cfg, 'base64 ' + wslShellPath(targetPath) + ' 2>/dev/null', ''), 30000, 20 * 1024 * 1024);
       if (result.code !== 0) return res.status(404).json({ error: '读不到文件（不存在或无权限）' });
       buf = Buffer.from(result.stdout.replace(/\s/g, ''), 'base64');
     } else {
       try {
-        buf = await fs.promises.readFile(p);
+        buf = await fs.promises.readFile(targetPath);
       } catch (e) {
-        if (e && e.code === 'ENOENT') return res.status(404).json({ error: '文件不存在: ' + p });
+        if (e && e.code === 'ENOENT') return res.status(404).json({ error: '文件不存在: ' + targetPath });
         throw e;
       }
     }
@@ -726,7 +930,7 @@ app.get('/api/fs/raw', async (req, res) => {
       return res.send(buf);
     }
     if (IMAGE_EXT.test(p)) {
-      const mime = ext === 'jpg' ? 'jpeg' : ext;
+      const mime = ext === 'jpg' ? 'jpeg' : ext === 'svg' ? 'svg+xml' : ext;
       return res.json({ ok: true, dataUrl: 'data:image/' + mime + ';base64,' + buf.toString('base64'), bytes: buf.length });
     }
     if (TEXT_EXT.test(p)) {
@@ -749,7 +953,40 @@ const PAGE_MAX_BYTES = 6 * 1024 * 1024;
 
 function validPageUrl(url) {
   if (!/^https?:\/\//i.test(url) || url.length > 2048) return null;
-  try { return new URL(url); } catch { return null; }
+  try {
+    const u = new URL(url);
+    if (u.username || u.password) return null;
+    return u;
+  } catch { return null; }
+}
+
+function pageServerIsLoopback() {
+  return ['127.0.0.1', 'localhost', '::1'].includes(String(process.env.AGENTHUB_HOST || '127.0.0.1').toLowerCase());
+}
+function pageSecurityError(message) {
+  const error = new Error(message);
+  error.code = 'PAGE_SECURITY';
+  return error;
+}
+
+async function safePageTarget(url) {
+  const u = validPageUrl(url);
+  if (!u) throw pageSecurityError('仅支持不含账号信息的 http(s) 链接');
+  // 默认只绑定本机时，网页代理本来就只有当前用户可调用；开放局域网时，
+  // 必须阻止 localhost、私网和云元数据地址，避免把代理变成 SSRF 跳板。
+  if (pageServerIsLoopback()) return { url: u, addresses: null };
+  const hostname = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) {
+    throw pageSecurityError('局域网模式下不允许访问本机地址');
+  }
+  const addresses = net.isIP(hostname)
+    ? [hostname]
+    : (await dns.lookup(hostname, { all: true, verbatim: true })).map(x => x.address);
+  if (!addresses.length || addresses.some(privatePageAddress)) throw pageSecurityError('局域网模式下不允许访问内网或保留地址');
+  return { url: u, hostname, addresses: addresses.map(address => ({ address, family: net.isIP(address) })) };
+}
+async function safePageUrl(url) {
+  return (await safePageTarget(url)).url;
 }
 
 function pageBlockedBy(r) {
@@ -757,17 +994,31 @@ function pageBlockedBy(r) {
   if (xfo) return true;
   const csp = String(r.headers.get('content-security-policy') || '');
   const m = /frame-ancestors([^;]*)/i.exec(csp);
-  // frame-ancestors * 才是允许任意内嵌；列了具体源或 'none' 都按禁止处理
-  if (m && !/[*]/.test(m[1])) return true;
+  // 只有裸 `frame-ancestors *` 才是允许任意内嵌。形如 `frame-ancestors
+  // 'self' https://*.foo.com` 的列表虽然含有 * 字符，但并不允许本应用源
+  // 内嵌——按含 * 放行会让浏览器拦下 iframe、用户看到空白框。
+  if (m && m[1].trim() !== '*') return true;
   return false;
 }
 
-function pageFetch(url, extra) {
-  return fetch(url, {
-    redirect: 'follow',
-    signal: AbortSignal.timeout(20000),
-    headers: { 'User-Agent': PAGE_FETCH_UA, 'Accept': 'text/html,application/xhtml+xml,image/*;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8', ...(extra || {}) },
-  });
+async function pageFetch(url, extra) {
+  let current = url;
+  const redirects = new Set([301, 302, 303, 307, 308]);
+  for (let i = 0; i <= 5; i++) {
+    const target = await safePageTarget(current);
+    const safe = target.url;
+    const headers = { 'User-Agent': PAGE_FETCH_UA, 'Accept': 'text/html,application/xhtml+xml,image/*;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8', ...(extra || {}) };
+    const r = target.addresses
+      ? await requestPinned({ href: safe.href, hostname: target.hostname, addresses: target.addresses }, { headers })
+      : await fetch(safe.href, { redirect: 'manual', signal: AbortSignal.timeout(20000), headers });
+    if (!redirects.has(r.status)) return r;
+    const location = r.headers.get('location');
+    if (!location) return r;
+    if (r.body) { try { if (typeof r.body.cancel === 'function') await r.body.cancel(); else if (typeof r.body.destroy === 'function') r.body.destroy(); } catch {} }
+    if (i === 5) throw new Error('页面重定向次数过多');
+    current = new URL(location, safe.href).href;
+  }
+  throw new Error('页面重定向失败');
 }
 
 function pageErrorPage(message, url, scheme) {
@@ -804,7 +1055,11 @@ app.get('/api/page/check', async (req, res) => {
     await readLimitedBody(r, 16 * 1024);
     res.json({ ok: r.ok, status: r.status, finalUrl: r.url, framable: r.ok && !pageBlockedBy(r), contentType: r.headers.get('content-type') || '' });
   } catch (e) {
-    res.json({ ok: false, status: 0, finalUrl: u.href, framable: false, error: e.message });
+    if (e && e.code === 'PAGE_SECURITY') return res.status(403).json({ error: e.message, blocked: true, framable: false });
+    // 服务端探测失败不等于目标站点禁止 iframe：代理网络可能访问不到
+    // Google/内网/需要浏览器 Cookie 的站点，但用户浏览器仍可能正常打开。
+    // 用 null 表示“未知”，让前端保留直连 iframe，而不是误走必然失败的代理。
+    res.json({ ok: false, status: 0, finalUrl: u.href, framable: null, error: e.message });
   }
 });
 
@@ -837,7 +1092,13 @@ app.get('/api/page/proxy', async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.send(html);
   } catch (e) {
-    res.status(502).type('html').send(pageErrorPage(e.message, u.href, sch));
+    // 安全策略拦截（内网/保留地址/本机地址）与网络失败是两件事：
+    // page/check 用 403 + blocked 表达"被本应用策略拒绝"，proxy 必须保持一致，
+    // 否则 502 会让调用方误以为目标站点不可达，也掩盖了这是一次主动拦截。
+    const blocked = !!(e && e.code === 'PAGE_SECURITY');
+    if (blocked) res.status(403);
+    else res.status(502);
+    res.type('html').send(pageErrorPage(e && e.message || '网页读取失败', u.href, sch));
   }
 });
 
@@ -845,7 +1106,8 @@ async function readLimitedBody(r, maxBytes) {
   // 不能直接 r.body.cancel()：响应体正被异步迭代器锁定，cancel() 会抛
   // ERR_INVALID_STATE 并以未处理拒绝把进程带崩。走 Node Readable 包装，
   // 超限时 destroy() 优雅断流。
-  const stream = Readable.fromWeb(r.body);
+  if (!r || !r.body) return Buffer.alloc(0);
+  const stream = typeof r.body.getReader === 'function' ? Readable.fromWeb(r.body) : r.body;
   const chunks = [];
   let len = 0;
   try {
@@ -1045,6 +1307,7 @@ function fmtRelS(ts) {
 app.get('/api/fs/ls', async (req, res) => {
   const os = require('os');
   const host = typeof req.query.host === 'string' ? req.query.host.trim() : '';
+  const localHost = !host || host === 'local';
   const queryPath = typeof req.query.path === 'string' ? req.query.path : '';
   // WSL 目录浏览
   if (host === 'wsl') {
@@ -1084,7 +1347,7 @@ app.get('/api/fs/ls', async (req, res) => {
     }
   }
   // 远程目录浏览
-  if (host) {
+  if (!localHost) {
     const cfg = ssh.getHostCfg(host);
     if (!cfg) return res.status(404).json({ error: '主机不存在' });
     const rp = queryPath.trim();
@@ -1098,7 +1361,7 @@ app.get('/api/fs/ls', async (req, res) => {
     ssh.listRemoteDirs(cfg, rp).then(r => res.json(r)).catch(e => res.status(400).json({ error: e.message }));
     return;
   }
-  let p = queryPath.trim();
+  let p = expandLocalPath(queryPath.trim());
   const home = os.homedir();
   if (!p) {
     // 根视图：驱动器（Windows）+ 常用目录
@@ -1134,7 +1397,7 @@ app.get('/api/fs/ls', async (req, res) => {
 
 // ---------- 设置 / agents ----------
 app.get('/api/agents', async (req, res) => {
-  res.json(await agents.detectAgentsAsync(settings.data));
+  res.json(await agents.detectAgentsCached(settings.data));
 });
 app.get('/api/settings', (req, res) => {
   const s = { ...settings.data };
@@ -1178,7 +1441,7 @@ app.put('/api/settings', (req, res) => {
     for (const c of body.customAgents) {
       if (!isRecord(c) || typeof c.id !== 'string' || typeof c.name !== 'string' || typeof c.bin !== 'string') return invalid('自定义 Agent 必须包含名称和命令');
       const id = c.id.trim();
-      if (!/^[A-Za-z0-9:_-]{1,128}$/.test(id) || seen.has(id)) return invalid('自定义 Agent ID 无效或重复');
+      if (!/^[A-Za-z0-9:_-]{1,128}$/.test(id) || seen.has(id) || agents.DEFS[id] || id.startsWith('acp:')) return invalid('自定义 Agent ID 无效、重复或占用保留名称');
       seen.add(id);
       if (c.args != null && typeof c.args !== 'string') return invalid('自定义 Agent 参数格式无效');
       if (c.color != null && typeof c.color !== 'string') return invalid('自定义 Agent 颜色格式无效');
@@ -1240,14 +1503,22 @@ app.put('/api/settings', (req, res) => {
     }
     clean.contextWindows = windows;
   }
+  if (has('customAgents')) {
+    const nextIds = new Set(clean.customAgents.map(c => c.id));
+    const removedIds = settings.data.customAgents.filter(c => c && !nextIds.has(c.id)).map(c => c.id);
+    const affected = sessionsStore.data.sessions.concat(readArchivedSessions()).filter(s => removedIds.includes(s.agent));
+    if (affected.length) return res.status(409).json({ error: `不能删除仍被 ${affected.length} 个会话使用的 Agent，请先删除这些会话` });
+    settings.data.customAgents = clean.customAgents;
+  }
   if (has('agents')) { settings.data.agents = clean.agents; agents.clearNativeRouteCache(); }
-  if (has('customAgents')) settings.data.customAgents = clean.customAgents;
   if (has('currentProvider')) settings.data.currentProvider = clean.currentProvider;
   if (has('sound')) settings.data.sound = clean.sound;
   if (has('terminalShell')) settings.data.terminalShell = clean.terminalShell;
   if (has('recentModels')) settings.data.recentModels = clean.recentModels;
   if (has('contextWindows')) settings.data.contextWindows = clean.contextWindows;
   settings.save();
+  // Agent 的 bin/自定义列表可能变了，缓存里的探测结果立即失效
+  agents.clearAgentsCache();
   res.json(settings.data);
 });
 app.get('/api/ccswitch', (req, res) => {
@@ -1300,8 +1571,13 @@ app.post('/api/sessions/:id/restore', (req, res) => {
   if (!restored) return res.status(400).json({ error: '归档会话数据无效，无法恢复' });
   delete restored.archived;
   delete restored.archivedAt;
+  // 恢复即视为刚被使用：保留归档时的旧 updatedAt 会让 maybeArchiveSessions
+  // 立刻把这条「最旧」的会话再归档回去——接口返回成功但会话又消失，恢复
+  // 永远不生效。
+  restored.updatedAt = Date.now();
   sessionsStore.data.sessions.unshift(restored);
   sessionsStore.save();
+  maybeArchiveSessions();
   res.json(restored);
 });
 app.post('/api/sessions', (req, res) => {
@@ -1326,14 +1602,19 @@ app.post('/api/sessions', (req, res) => {
   const chosenProvider = providerKey ? findProvider(providerKey) : null;
   if (providerKey && !chosenProvider) return res.status(404).json({ error: '供应商不存在' });
   if (providerKey && !providerFitsAgent(agentId, chosenProvider)) return res.status(400).json({ error: '该供应商不适用于当前 Agent' });
-  if (body.permMode && !["auto", "edits", "plan", "ask"].includes(body.permMode)) return res.status(400).json({ error: '权限模式无效' });
+  if (body.permMode && !PERM_MODES.includes(body.permMode)) return res.status(400).json({ error: '权限模式无效' });
   if (body.effort && !['minimal', 'low', 'medium', 'high', 'max'].includes(body.effort)) return res.status(400).json({ error: '推理强度无效' });
-  const permMode = body.permMode || undefined;
+  const hasBodyMode = Object.prototype.hasOwnProperty.call(body, 'permMode');
+  const hasBodyAuto = Object.prototype.hasOwnProperty.call(body, 'autoPerms');
+  const permission = normalizePermissionState(
+    hasBodyAuto ? body.autoPerms : (hasBodyMode && body.permMode === 'auto'),
+    hasBodyMode ? body.permMode : '',
+  );
   const effort = body.effort || '';
   const s = {
     id: 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     agent: agentId, title: String(title || '新会话').trim().slice(0, 200) || '新会话', model: String(model || '').trim().slice(0, 256), providerId: providerKey,
-    remoteHostId: remoteKey, cwd: cwdText, autoPerms: body.autoPerms === true, permMode, effort, titled: false, cliSessionId: '', createdAt: Date.now(), updatedAt: Date.now(),
+    remoteHostId: remoteKey, cwd: cwdText, autoPerms: permission.autoPerms, permMode: permission.permMode, effort, titled: false, cliSessionId: '', createdAt: Date.now(), updatedAt: Date.now(),
     messages: [],
   };
   sessionsStore.data.sessions.unshift(s);
@@ -1367,8 +1648,27 @@ app.patch('/api/sessions/:id', (req, res) => {
     if (!providerFitsAgent(s.agent, p)) return res.status(400).json({ error: '该供应商不适用于当前 Agent' });
   }
   if ('remoteHostId' in normalized && !validRemoteHost(normalized.remoteHostId)) return res.status(404).json({ error: '远程主机不存在' });
-  if ('permMode' in normalized && normalized.permMode && !['auto', 'edits', 'plan', 'ask'].includes(normalized.permMode)) return res.status(400).json({ error: '权限模式无效' });
+  if ('permMode' in normalized && normalized.permMode && !PERM_MODES.includes(normalized.permMode)) return res.status(400).json({ error: '权限模式无效' });
   if ('effort' in normalized && normalized.effort && !['minimal', 'low', 'medium', 'high', 'max'].includes(normalized.effort)) return res.status(400).json({ error: '推理强度无效' });
+  if (Object.prototype.hasOwnProperty.call(normalized, 'permMode') || Object.prototype.hasOwnProperty.call(normalized, 'autoPerms')) {
+    const hasMode = Object.prototype.hasOwnProperty.call(normalized, 'permMode');
+    const hasAuto = Object.prototype.hasOwnProperty.call(normalized, 'autoPerms');
+    // An explicit mode is authoritative when the legacy autoPerms flag is
+    // omitted. This keeps PATCH {permMode:'auto'} useful for API clients while
+    // still resolving an explicitly contradictory pair safely.
+    const permission = normalizePermissionState(
+      hasAuto ? normalized.autoPerms : (hasMode && normalized.permMode === 'auto'),
+      hasMode ? normalized.permMode : '',
+    );
+    normalized.autoPerms = permission.autoPerms;
+    normalized.permMode = permission.permMode;
+  }
+  // 运行中的原生会话已经把 cwd/主机/模型/供应商等配置绑定到当前
+  // 回合；允许此时修改会让网页显示的设置与 CLI 实际使用的设置分叉。
+  const runLockedKeys = ['model', 'providerId', 'remoteHostId', 'cwd', 'autoPerms', 'permMode', 'effort'];
+  if (running.has(s.id) && runLockedKeys.some(k => Object.prototype.hasOwnProperty.call(normalized, k))) {
+    return res.status(409).json({ error: '会话正在运行中，暂不能修改运行配置' });
+  }
   // #23：已经问过话的会话锁定工作目录/运行主机——中途换目录会让 CLI 上下文与界面错位
   const locked = (s.messages || []).length > 0;
   for (const k of allow) {
@@ -1390,6 +1690,11 @@ app.delete('/api/sessions/:id', (req, res) => {
   }
   if (!sessionsStore.data.sessions.some(s => s.id === req.params.id)) {
     return res.status(404).json({ error: '会话不存在' });
+  }
+  try {
+    removeArchivedSession(req.params.id);
+  } catch (e) {
+    return res.status(500).json({ error: '清理会话归档失败：' + (e.message || '无法写入归档文件') });
   }
   // 空闲的原生桥也要一起回收；否则删除会话后 app-server 会继续占用进程，
   // 直到十分钟 idle timer 才退出。
@@ -1432,7 +1737,7 @@ app.post('/api/files/undo', async (req, res) => {
     }
   }
   const cwd = s.cwd || process.cwd();
-  const p = path.isAbsolute(f.path) ? f.path : path.join(cwd, f.path);
+  const p = resolveTargetPath(cwd, f.path, true);
   if (!fs.existsSync(p)) return res.status(400).json({ error: '文件不存在: ' + p });
   let content;
   try { content = fs.readFileSync(p, 'utf8'); } catch (e) { return res.status(400).json({ error: '读取失败: ' + e.message }); }
@@ -1482,8 +1787,9 @@ async function validateWorkspaceForSession(s, remoteCfg) {
   const cwd = String((s && s.cwd) || '').trim();
   if (!cwd) return;
   if (!s.remoteHostId) {
+    const localCwd = expandLocalPath(cwd);
     let stat;
-    try { stat = await fs.promises.stat(cwd); } catch { throw new Error('工作目录不存在或无法访问：' + cwd); }
+    try { stat = await fs.promises.stat(localCwd); } catch { throw new Error('工作目录不存在或无法访问：' + cwd); }
     if (!stat.isDirectory()) throw new Error('工作目录不是文件夹：' + cwd);
     return;
   }
@@ -1537,7 +1843,8 @@ function remoteUndoScript(targetPath) {
 
 const MAX_REMOTE_UNDO_BYTES = 12 * 1024 * 1024;
 function remoteUndoTarget(s, f) {
-  return s.remoteHostId === 'wsl' ? (wslPath(f.path) || f.path) : f.path;
+  const joined = resolveTargetPath(s && s.cwd, f.path, false);
+  return s.remoteHostId === 'wsl' ? (wslPath(joined) || joined) : joined;
 }
 
 async function readRemoteUndoFile(s, f) {
@@ -1582,7 +1889,7 @@ async function runRemoteUndo(s, f) {
     removeFile = true;
     replacement = Buffer.alloc(0);
   } else {
-    if (!newBuffer.length) return { code: 4, stdout: 'AGENTHUB_UNDO_UNLOCATABLE', stderr: '' };
+    if (!newBuffer.length) return { code: 4, stdout: 'AGENTHUB_UNLOCATABLE', stderr: '' };
     const at = currentBuffer.indexOf(newBuffer);
     if (at < 0) return { code: 4, stdout: 'AGENTHUB_UNDO_CHANGED', stderr: '' };
     if (currentBuffer.indexOf(newBuffer, at + newBuffer.length) >= 0) return { code: 4, stdout: 'AGENTHUB_UNLOCATABLE', stderr: '' };
@@ -1661,14 +1968,14 @@ app.post('/api/ssh/hosts', (req, res) => {
   try {
     const out = ssh.saveHost(req.body || {});
     agents.clearNativeRouteCache();
-    res.json(out);
+    res.json(ssh.maskHost(out));
   } catch (e) { res.status(400).json({ error: e.message || 'SSH 主机配置无效' }); }
 });
 app.delete('/api/ssh/hosts/:id', (req, res) => {
   // 删除主机不会自动把已有会话迁移到本机；继续允许删除会制造一个
   // 看起来仍可用、实际每次发送都失败的会话。先阻止删除，用户可先
   // 处理相关会话或保留主机配置。
-  const affected = sessionsStore.data.sessions.filter(s => s && s.remoteHostId === req.params.id);
+  const affected = sessionsStore.data.sessions.concat(readArchivedSessions()).filter(s => s && s.remoteHostId === req.params.id);
   if (affected.length) {
     return res.status(409).json({ error: `该主机仍被 ${affected.length} 个会话使用，请先处理这些会话后再删除` });
   }
@@ -1699,12 +2006,25 @@ app.post('/api/ssh/test', async (req, res) => {
 
 // ---------- ACP 权限审批响应 ----------
 const acp = require('./lib/acp-agent');
+const apiAgent = require('./lib/api-agent');
 app.post('/api/acp/respond', (req, res) => {
   if (!isRecord(req.body)) return res.status(400).json({ error: 'ACP 应答请求格式无效' });
   const { agentId, pid, optionId } = req.body;
   if (typeof agentId !== 'string' || typeof pid !== 'string' || typeof optionId !== 'string') return res.status(400).json({ error: 'ACP 应答参数无效' });
   const ok = acp.respondPermission(agentId, pid, optionId);
   if (!ok) return res.status(404).json({ ok: false, error: '该 ACP 审批请求不存在或已失效' });
+  res.json({ ok: true });
+});
+
+// ---------- 内置 Agent 工具权限审批响应 ----------
+app.post('/api/api-agent/respond', (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '内置 Agent 应答请求格式无效' });
+  const { sessionId, pid, action } = req.body;
+  if (typeof sessionId !== 'string' || !sessionId.trim() || sessionId.length > 256
+    || typeof pid !== 'string' || !pid || pid.length > 256
+    || !['allow', 'deny'].includes(action)) return res.status(400).json({ error: '内置 Agent 应答参数无效' });
+  const ok = apiAgent.respondPermission(sessionId.trim(), pid, action);
+  if (!ok) return res.status(404).json({ ok: false, error: '该内置 Agent 审批请求不存在或已失效' });
   res.json({ ok: true });
 });
 
@@ -1760,7 +2080,7 @@ app.get('/api/bridge/pending', (req, res) => {
       : [],
   })) : [];
   const sessionId = req.query.sessionId || '';
-  const cards = zcodeBridge.getPending(sessionId).concat(codexBridge.getPending(sessionId), claudeCards, acp.pendingFor(sessionId));
+  const cards = zcodeBridge.getPending(sessionId).concat(codexBridge.getPending(sessionId), claudeCards, acp.pendingFor(sessionId), apiAgent.pendingPermissions(sessionId));
   res.json({ pending: cards.length, cards });
 });
 
@@ -1773,14 +2093,16 @@ scheduledStore.data.tasks = scheduledStore.data.tasks.filter(isRecord).filter(t 
   const time = typeof t.time === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(t.time) ? t.time : '09:00';
   const lastRunAt = Number(t.lastRunAt);
   const createdAt = Number(t.createdAt);
+  const safeCreatedAt = Number.isFinite(createdAt) && createdAt >= 0 ? createdAt : Date.now();
+  const storedLastDay = typeof t.lastDay === 'string' ? t.lastDay.slice(0, 16) : '';
   return {
     ...t,
     id: String(t.id).slice(0, 128), sessionId: String(t.sessionId).slice(0, 256), prompt: String(t.prompt).slice(0, 4000),
     kind: t.kind === 'daily' ? 'daily' : 'interval', minutes, time,
     enabled: typeof t.enabled === 'boolean' ? t.enabled : true,
     lastRunAt: Number.isFinite(lastRunAt) && lastRunAt >= 0 ? lastRunAt : 0,
-    lastDay: typeof t.lastDay === 'string' ? t.lastDay.slice(0, 16) : '',
-    createdAt: Number.isFinite(createdAt) && createdAt >= 0 ? createdAt : Date.now(),
+    lastDay: storedLastDay || (t.kind === 'daily' && safeCreatedAt >= scheduleTargetAt(time, safeCreatedAt) ? scheduleDayKey(safeCreatedAt) : ''),
+    createdAt: safeCreatedAt,
   };
 });
 
@@ -1788,9 +2110,16 @@ function schedSummary(t) {
   return t.kind === 'daily' ? ('每天 ' + t.time) : ('每 ' + t.minutes + ' 分钟');
 }
 const scheduledActive = new Set();
+const SCHEDULE_TIMEOUT_MS = 15 * 60 * 1000;
 function scheduleDayKey(now) {
   const d = new Date(now);
   return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0')].join('-');
+}
+function scheduleTargetAt(time, now) {
+  const d = new Date(now);
+  const [hour, minute] = String(time || '09:00').split(':').map(Number);
+  d.setHours(Number.isFinite(hour) ? hour : 0, Number.isFinite(minute) ? minute : 0, 0, 0);
+  return d.getTime();
 }
 function schedDue(t, now) {
   if (!t.enabled) return false;
@@ -1798,15 +2127,10 @@ function schedDue(t, now) {
     const last = t.lastRunAt || 0;
     return now - last >= (t.minutes || 60) * 60000;
   }
-  const d = new Date(now);
-  const hhmm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
   const today = scheduleDayKey(now);
-  const [hour, minute] = String(t.time || '09:00').split(':').map(Number);
-  const target = new Date(now);
-  target.setHours(hour || 0, minute || 0, 0, 0);
   // 不要求定时器恰好落在那一分钟；服务忙、电脑唤醒或系统调度延迟
   // 时，只要当天尚未执行且已经过了目标时间，就补执行一次。
-  return now >= target.getTime() && t.lastDay !== today;
+  return now >= scheduleTargetAt(t.time, now) && t.lastDay !== today;
 }
 async function schedFire(t) {
   if (!t || scheduledActive.has(t.id)) return;
@@ -1818,6 +2142,13 @@ async function schedFire(t) {
     return;
   }
   const runAt = Date.now();
+  if (s.autoPerms !== true) {
+    t.lastRunAt = runAt;
+    if (t.kind === 'daily') t.lastDay = scheduleDayKey(runAt);
+    t.lastResult = '跳过：会话需要人工授权或提问';
+    scheduledStore.save();
+    return;
+  }
   if (running.has(t.sessionId)) {
     // “跳过”必须推进下次到期时间；否则间隔任务会每 30 秒重复尝试，
     // 每日任务也会在忙闲切换时重复或错过。
@@ -1832,17 +2163,68 @@ async function schedFire(t) {
   if (t.kind === 'daily') t.lastDay = scheduleDayKey(runAt);
   t.lastResult = '运行中…';
   scheduledStore.save();
-  const fakeWs = { send: () => {} }; // 定时触发不需要向前端推流，消息照常落库
+  let interactionDenied = false;
+  const fakeWs = {
+    // 定时运行没有浏览器可以点击审批卡。自动权限通常已经绕过审批，
+    // 但原生 Agent 仍可能发起提问/权限请求；明确拒绝它，避免 Promise 永久挂起。
+    send(raw) {
+      try {
+        const packet = JSON.parse(String(raw));
+        const ev = packet && packet.ev;
+        if (!ev || ev.kind !== 'permission') return;
+        interactionDenied = true;
+        if (ev.bridge) {
+          const body = { sessionId: t.sessionId, requestId: ev.pid, action: 'deny', denyMessage: '定时任务不支持交互式确认或提问' };
+          const result = zcodeBridge.hasSession(t.sessionId)
+            ? zcodeBridge.respond(t.sessionId, ev.pid, body)
+            : codexBridge.hasSession(t.sessionId)
+              ? codexBridge.respond(t.sessionId, ev.pid, body)
+              : claudeBridge.respond(t.sessionId, ev.pid, body);
+          if (!result || result.ok === false) throw new Error(result && result.error || '原生审批请求已失效');
+          return;
+        }
+        if (ev.apiAgent) {
+          if (!apiAgent.respondPermission(t.sessionId, ev.pid, 'deny')) throw new Error('内置 Agent 审批请求已失效');
+          return;
+        }
+        const opts = Array.isArray(ev.options) ? ev.options : [];
+        const reject = opts.find(o => /deny|reject|decline|cancel|拒绝/i.test([o && o.kind, o && o.optionId, o && o.name].filter(Boolean).join(' ')));
+        if (reject && reject.optionId != null) {
+          if (!acp.respondPermission(t.sessionId, ev.pid, reject.optionId)) throw new Error('ACP 审批请求已失效');
+        } else {
+          const run = running.get(t.sessionId);
+          if (run) run.cancel();
+        }
+      } catch {
+        const run = running.get(t.sessionId);
+        if (run) run.cancel();
+      }
+    },
+  };
+  let timeoutId = null;
   try {
-    const result = await handleChat(fakeWs, { sessionId: t.sessionId, text: t.prompt, images: [] });
-    t.lastResult = result && result.ok === false
+    const chatPromise = handleChat(fakeWs, { sessionId: t.sessionId, text: t.prompt, images: [] });
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        const run = running.get(t.sessionId);
+        if (run) run.cancel();
+        reject(new Error('定时任务超过 15 分钟，已自动取消；请检查是否需要人工回答'));
+      }, SCHEDULE_TIMEOUT_MS);
+      if (timeoutId && typeof timeoutId.unref === 'function') timeoutId.unref();
+    });
+    const result = await Promise.race([chatPromise, timeoutPromise]);
+    t.lastResult = interactionDenied
+      ? '失败：任务触发了交互请求，已自动拒绝'
+      : result && result.ok === false
       ? '失败: ' + (result.error || '任务未执行')
       : '上次运行成功 · ' + new Date().toLocaleTimeString();
   } catch (e) {
     t.lastResult = '失败: ' + e.message;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    scheduledActive.delete(t.id);
+    scheduledStore.save();
   }
-  scheduledActive.delete(t.id);
-  scheduledStore.save();
 }
 setInterval(() => {
   const now = Date.now();
@@ -1862,12 +2244,15 @@ app.post('/api/scheduled', (req, res) => {
   const { sessionId, prompt, kind, minutes, time } = req.body;
   if (typeof sessionId !== 'string' || !sessionId.trim() || typeof prompt !== 'string' || !prompt.trim()) return res.status(400).json({ error: '会话与提示词必填' });
   if (prompt.length > 4000) return res.status(400).json({ error: '提示词不能超过 4000 字符' });
-  if (!sessionsStore.data.sessions.some(s => s.id === sessionId)) return res.status(404).json({ error: '会话不存在' });
+  const session = sessionsStore.data.sessions.find(s => s.id === sessionId);
+  if (!session) return res.status(404).json({ error: '会话不存在' });
+  if (session.autoPerms !== true || !supportsManagedPermissions(session.agent)) return res.status(400).json({ error: '定时任务仅支持有统一自动权限控制的会话；请使用 Claude/Codex/ZCode、ACP 或内置 Agent 的自动权限模式' });
   if (kind !== 'interval' && kind !== 'daily') return res.status(400).json({ error: '频率类型错误' });
   if (kind === 'interval' && (!(typeof minutes === 'number' || (typeof minutes === 'string' && minutes.trim())) || !(+minutes >= 1) || +minutes > 10080)) return res.status(400).json({ error: '分钟数应为 1 到 10080' });
   if (kind === 'daily' && (typeof time !== 'string' || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time))) return res.status(400).json({ error: '时间格式 HH:MM' });
   const createdAt = Date.now();
-  const t = { id: 't' + createdAt.toString(36) + Math.random().toString(36).slice(2, 5), sessionId: sessionId.trim(), prompt: prompt.trim().slice(0, 4000), kind, minutes: +minutes || 60, time: time || '09:00', enabled: true, lastRunAt: createdAt, lastDay: '', createdAt };
+  const normalizedTime = time || '09:00';
+  const t = { id: 't' + createdAt.toString(36) + Math.random().toString(36).slice(2, 5), sessionId: sessionId.trim(), prompt: prompt.trim().slice(0, 4000), kind, minutes: +minutes || 60, time: normalizedTime, enabled: true, lastRunAt: createdAt, lastDay: kind === 'daily' && createdAt >= scheduleTargetAt(normalizedTime, createdAt) ? scheduleDayKey(createdAt) : '', createdAt };
   scheduledStore.data.tasks.push(t);
   scheduledStore.save();
   res.json(t);
@@ -1891,7 +2276,9 @@ app.delete('/api/scheduled/:id', (req, res) => {
 app.post('/api/scheduled/:id/run', (req, res) => {
   const t = scheduledStore.data.tasks.find(x => x.id === req.params.id);
   if (!t) return res.status(404).json({ error: '任务不存在' });
-  if (!sessionsStore.data.sessions.some(s => s.id === t.sessionId)) return res.status(404).json({ error: '关联会话不存在' });
+  const session = sessionsStore.data.sessions.find(s => s.id === t.sessionId);
+  if (!session) return res.status(404).json({ error: '关联会话不存在' });
+  if (session.autoPerms !== true || !supportsManagedPermissions(session.agent)) return res.status(400).json({ error: '定时任务仅支持有统一自动权限控制的会话；请使用 Claude/Codex/ZCode、ACP 或内置 Agent 的自动权限模式' });
   if (scheduledActive.has(t.id)) return res.status(409).json({ error: '定时任务正在运行中' });
   if (running.has(t.sessionId)) return res.status(409).json({ error: '会话正在运行中' });
   // 任务可能要运行数分钟；HTTP 只负责确认已入队，不能让前端在这里
@@ -2137,6 +2524,7 @@ async function handleChatUnsafe(ws, msg) {
   const clientMeta = clientId ? { clientId } : {};
   const s = sessionsStore.data.sessions.find(x => x.id === msg.sessionId);
   if (!s) return send(ws, { type: 'chat.event', sessionId: msg.sessionId, ...clientMeta, ev: { kind: 'error', text: '会话不存在' } });
+  const chatOnly = s.agent === 'chatgpt-web';
   if (running.has(s.id)) return send(ws, { type: 'chat.event', sessionId: s.id, ...clientMeta, ev: { kind: 'error', text: '该会话正在运行中' } });
   const inputText = typeof msg.text === 'string' ? msg.text : String(msg.text == null ? '' : msg.text);
   const imgs = (Array.isArray(msg.images) ? msg.images : [])
@@ -2147,7 +2535,6 @@ async function handleChatUnsafe(ws, msg) {
   if (!inputText.trim() && !imgs.length) {
     return send(ws, { type: 'chat.event', sessionId: s.id, ...clientMeta, ev: { kind: 'error', text: '消息不能为空' } });
   }
-
   // Reserve the session before any remote probe/upgrade await.  Otherwise two
   // quick messages can both pass the running check and enter the same native
   // conversation concurrently.  The reservation is also cancellable while a
@@ -2181,11 +2568,23 @@ async function handleChatUnsafe(ws, msg) {
 
   // 内置 Agent 是运行在 AgentHub Node 进程里的 API Agent；它没有 WSL/SSH
   // 入口。旧会话可能仍保存了远程位置，不能把那个远程路径拿来做本机 cwd。
-  const builtinLocal = s.agent === 'builtin';
-  const acpLocal = String(s.agent || '').startsWith('acp:');
+  const builtinLocal = s.agent === 'builtin' || chatOnly;
+  const customAgentCfg = Array.isArray(settings.data.customAgents)
+    ? settings.data.customAgents.find(c => c && c.id === s.agent)
+    : null;
+  const acpLocal = String(s.agent || '').startsWith('acp:') || !!(customAgentCfg && customAgentCfg.acp);
   const localOnly = builtinLocal || acpLocal;
   const isWsl = !localOnly && s.remoteHostId === 'wsl';
   const remoteCfg = !localOnly && s.remoteHostId && !isWsl ? ssh.getHostCfg(s.remoteHostId) : null;
+  if (!s.remoteHostId && s.cwd) {
+    const expanded = expandLocalPath(s.cwd);
+    if (expanded !== s.cwd) {
+      s.cwd = expanded;
+      s.updatedAt = Date.now();
+      sessionsStore.save();
+    }
+  }
+  if (acpLocal && s.remoteHostId) return failBeforeRun('ACP Agent 当前只支持本机运行，请新建本机会话');
   if (isWsl && process.platform !== 'win32') return failBeforeRun('WSL 仅在 Windows 上可用');
   if (!localOnly && s.remoteHostId && !isWsl && !remoteCfg) return failBeforeRun('远程主机不存在');
   const selectedProvider = s.providerId ? findProvider(s.providerId) : null;
@@ -2222,7 +2621,7 @@ async function handleChatUnsafe(ws, msg) {
   }
   if (runSlot.cancelled) return failBeforeRun('本轮已取消');
   const roundStart = Date.now(); // 回合起点（含 CLI 启动），"已工作 X"从这算起
-  const userMsg = { role: 'user', text: inputText, ts: Date.now(), images: imgs.map(i => i.url).filter(Boolean), ...clientMeta };
+  const userMsg = { role: 'user', text: inputText, ts: Date.now(), images: imgs.map(i => ({ path: i.path, url: i.url })).filter(i => i.url), ...clientMeta };
   currentUserMsg = userMsg;
   s.messages.push(userMsg);
   if (!s.titled) { s.title = (inputText || '图片会话').slice(0, 30) || s.title || '新会话'; s.titled = true; titleChanged = true; }
@@ -2238,9 +2637,9 @@ async function handleChatUnsafe(ws, msg) {
   let prompt = inputText;
   // 远程/WSL 的能力必须以目标 CLI 探测结果为准；不能因为 Windows 本机
   // 安装了新 Claude，就误判旧远程 CLI 支持流式图片/权限桥。
-  const claudeStream = s.remoteHostId ? nativeRemote : await agents.claudeUsesStreamAsync(s.agent, settings.data);
+  const claudeStream = chatOnly ? false : (s.remoteHostId ? nativeRemote : await agents.claudeUsesStreamAsync(s.agent, settings.data));
   const remoteNotWsl = !!(s.remoteHostId && !localOnly && s.remoteHostId !== 'wsl');
-  if (imgs.length) {
+  if (imgs.length && !chatOnly) {
     if (s.agent === 'codex') {
       if (remoteNotWsl) {
         send(ws, { type: 'chat.event', sessionId: s.id, ...clientMeta, ev: { kind: 'error', text: '远程 codex 会话暂不支持图片附件（图片在本机），已忽略图片' } });
@@ -2263,7 +2662,7 @@ async function handleChatUnsafe(ws, msg) {
   }
 
   let provider = selectedProvider;
-  // 未显式选供应商时，实际使用本地"默认供应商"（★ 或 cc-switch 当前）。
+  // 未显式选供应商时，实际使用本地“默认供应商”（★ 或导入时保留的当前标记）。
   // 之前这里只对远程生效，导致本机界面显示的默认供应商没有真正注入；
   // 远程/WSL 仍复用同一映射，避免远端沿用自己的旧配置。
   let providerMappedNote = '';
@@ -2286,10 +2685,10 @@ async function handleChatUnsafe(ws, msg) {
   const replayPrompt = contextReplay(s, prompt);
   // 首轮没有原生 id 时，直接使用回放；有 id 时先保持原始输入，只有
   // app-server/CLI 的原生 resume 明确失败后，桥才会使用 replayPrompt。
-  if (!s.cliSessionId) prompt = replayPrompt;
+  if (!chatOnly && !s.cliSessionId) prompt = replayPrompt;
 
   const agentSettings = (settings.data.agents || {})[s.agent] || null;
-  const customCfg = (settings.data.customAgents || []).find(c => c.id === s.agent);
+  const customCfg = customAgentCfg;
 
   let assistant = null;
   const genStats = { first: 0, last: 0 }; // 实际生成时间窗（首个/最后一个输出字符）
@@ -2299,6 +2698,30 @@ async function handleChatUnsafe(ws, msg) {
   const ensureAssistant = () => {
     if (!assistant) { assistant = { role: 'assistant', ts: Date.now(), blocks: [], _runStart: Date.now() }; s.messages.push(assistant); }
     return assistant;
+  };
+  // reasoning_delta/thinkdelta 只有增量，没有最终整段事件；先合并到助手消息，
+  // 这样回合完成后重新拉取会话时，思考内容仍然存在且可以再次展开。
+  const appendThinkBlock = (value, finalize = false) => {
+    const text = String(value == null ? '' : value);
+    if (!text) return null;
+    const a = ensureAssistant();
+    let b = a.blocks[a.blocks.length - 1];
+    if (!b || b.type !== 'think' || b._t1) {
+      closeOpenBlk();
+      b = { type: 'think', text: '', _t0: Date.now() };
+      a.blocks.push(b);
+    }
+    const current = String(b.text || '');
+    if (finalize) {
+      // ACP/Claude 可能在增量后再发一次完整 thinking；避免重复拼接。
+      b.text = text.startsWith(current) ? text.slice(0, 4000) : (current + text).slice(0, 4000);
+      if (!b._t1) b._t1 = Date.now();
+      if (openBlk === b) openBlk = null;
+    } else {
+      b.text = (current + text).slice(0, 4000);
+      openBlk = b;
+    }
+    return b;
   };
   const usageSum = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, model: s.model || null };
   let resultUsage = null;
@@ -2337,7 +2760,7 @@ async function handleChatUnsafe(ws, msg) {
           const { oldStr, newStr, ...rest } = f;
           return { ...rest, snapshotUnavailable: true };
         }
-        const target = path.isAbsolute(f.path) ? f.path : path.resolve(s.cwd || process.cwd(), f.path);
+        const target = resolveTargetPath(s.cwd || process.cwd(), f.path, true);
         let existed = true;
         try { existed = fs.existsSync(target); } catch {}
         if (existed) {
@@ -2366,6 +2789,8 @@ async function handleChatUnsafe(ws, msg) {
       outEv.pid = safeText(ev.pid).slice(0, 256);
       outEv.title = safeText(ev.title).slice(0, 500);
       outEv.reason = safeText(ev.reason).slice(0, 4000);
+      outEv.bridge = ev.bridge === true;
+      outEv.apiAgent = ev.apiAgent === true;
       outEv.options = Array.isArray(ev.options) ? ev.options.filter(isRecord).slice(0, 32) : [];
       outEv.questions = Array.isArray(ev.questions) ? ev.questions.filter(isRecord).slice(0, 32).map(q => ({
         ...q,
@@ -2377,10 +2802,15 @@ async function handleChatUnsafe(ws, msg) {
         })) : [],
       })) : [];
     }
-    // 流式增量事件不落存储，但要确保 assistant 消息体尽早创建（elapsed 从第一个 token 起算）
+    // 文本增量事件本身不重复落盘，但要确保 assistant 消息体尽早创建；
+    // 思考增量会合并到 assistant.blocks，回合结束后随会话一起保存。
     if (kind === 'delta' || kind === 'text') { const now = Date.now(); if (!genStats.first) genStats.first = now; genStats.last = now; }
-    if (kind === 'delta' || kind === 'thinkdelta') ensureAssistant();
-    if (kind === 'text') {
+    if (kind === 'delta') ensureAssistant();
+    if (kind === 'thinkdelta') {
+      // 增量仍实时推送给前端；同时合并进内存中的 assistant.blocks，
+      // 回合结束时统一保存，避免每个 token 都写磁盘。
+      appendThinkBlock(outEv.text);
+    } else if (kind === 'text') {
       const a = ensureAssistant();
       const last = a.blocks[a.blocks.length - 1];
       const text = outEv.text;
@@ -2392,12 +2822,7 @@ async function handleChatUnsafe(ws, msg) {
         a.blocks.push(b); openBlk = b;
       }
     } else if (kind === 'think') {
-      const a = ensureAssistant();
-      if (a.blocks.filter(b => b.type === 'think').length < 40) {
-        closeOpenBlk();
-        const b = { type: 'think', text: outEv.text.slice(0, 4000), _t0: Date.now() };
-        a.blocks.push(b); openBlk = b;
-      }
+      appendThinkBlock(outEv.text, true);
       sessionsStore.save();
     } else if (kind === 'tool') {
       const a = ensureAssistant();
@@ -2466,6 +2891,13 @@ async function handleChatUnsafe(ws, msg) {
       outEv.url = url;
       if (url && !a.pages.includes(url) && a.pages.length < 8) a.pages.push(url);
       sessionsStore.save();
+    } else if (kind === 'stopped') {
+      // 手动停止的回合：显式落一条「已停止」块（即使此前没有任何输出，
+      // 也要通过 ensureAssistant 建出助手消息，保证刷新后仍有痕迹）。
+      const a = ensureAssistant();
+      const last = a.blocks[a.blocks.length - 1];
+      if (!last || last.type !== 'stopped') { closeOpenBlk(); a.blocks.push({ type: 'stopped' }); }
+      sessionsStore.save();
     } else if (kind === 'stderr' || kind === 'error') {
       const a = ensureAssistant();
       const last = a.blocks[a.blocks.length - 1];
@@ -2519,9 +2951,11 @@ async function handleChatUnsafe(ws, msg) {
   };
   if (providerMappedNote) emit({ kind: 'status', text: providerMappedNote });
 
-  // ===== 内置 Agent（无需 CLI，直连供应商 API） =====
-  if (s.agent === 'builtin') {
-    if (s.remoteHostId) {
+  // ===== 内置 API 对话（无需 CLI，直连供应商 API） =====
+  // builtin 可以调用 AgentHub 工具；chatgpt-web 只是普通聊天，使用同一
+  // 协议适配但明确不发送工具定义，也不会进入任何工具执行分支。
+  if (s.agent === 'builtin' || chatOnly) {
+    if (s.remoteHostId && !chatOnly) {
       emit({ kind: 'status', text: '内置 Agent 在本机服务运行，忽略远程主机设置' });
     }
     if (!provider) {
@@ -2530,20 +2964,22 @@ async function handleChatUnsafe(ws, msg) {
         s.providerId = provider.id;
         s.updatedAt = Date.now();
         sessionsStore.save();
-        emit({ kind: 'status', text: '未选供应商，内置 Agent 使用「' + provider.name + '」' });
+        emit({ kind: 'status', text: '未选供应商，' + (chatOnly ? '普通聊天' : '内置 Agent') + ' 使用「' + provider.name + '」' });
       }
     }
     if (!provider) {
-      releaseRun();
-      send(ws, { type: 'chat.event', sessionId: s.id, ...clientMeta, ev: { kind: 'error', text: '内置 Agent 需要一个供应商：请在发送栏选择，或在 cc-switch 添加' } });
-      send(ws, { type: 'chat.done', sessionId: s.id, ...clientMeta, code: 1, title: s.title, providerId: s.providerId || '', cliSessionId: '', msgCount: (s.messages || []).length });
-      return { ok: false, error: '内置 Agent 需要一个供应商' };
+      return failBeforeRun((chatOnly ? '普通聊天' : '内置 Agent') + ' 需要一个供应商：请在 API 管理中添加或选择');
     }
     if (!s.model) {
-      releaseRun();
-      send(ws, { type: 'chat.event', sessionId: s.id, ...clientMeta, ev: { kind: 'error', text: '内置 Agent 需要指定模型：请在「模型」菜单中选择该供应商目录下的模型' } });
-      send(ws, { type: 'chat.done', sessionId: s.id, ...clientMeta, code: 1, title: s.title, providerId: s.providerId || '', cliSessionId: '', msgCount: (s.messages || []).length });
-      return { ok: false, error: '内置 Agent 需要指定模型' };
+      const fallbackModel = provider && (provider.model || (Array.isArray(provider.models) ? provider.models[0] : ''));
+      if (fallbackModel) {
+        s.model = String(fallbackModel).slice(0, 256);
+        s.updatedAt = Date.now();
+        sessionsStore.save();
+        emit({ kind: 'status', text: '未指定模型，使用供应商默认模型「' + s.model + '」' });
+      } else {
+        return failBeforeRun((chatOnly ? '普通聊天' : '内置 Agent') + ' 需要指定模型：请在「模型」菜单中选择该供应商目录下的模型');
+      }
     }
     const history = (s.messages || []).slice(0, -1).slice(-16).map(m => {
       let text = '';
@@ -2552,7 +2988,7 @@ async function handleChatUnsafe(ws, msg) {
       else text = m.text || '';
       return { role: m.role, text: String(text).slice(0, 6000) };
     }).filter(m => m.text);
-    const { runApiAgent } = require('./lib/api-agent');
+    const { runApiAgent, runApiChat } = require('./lib/api-agent');
     // 多模态：图片附件转 base64（仅本地路径）
     const b64Images = (await Promise.all(imgs.map(async i => {
       try {
@@ -2566,12 +3002,14 @@ async function handleChatUnsafe(ws, msg) {
     }))).filter(Boolean);
     let handle;
     try {
-      handle = runApiAgent({
+      const runDirect = chatOnly ? runApiChat : runApiAgent;
+      handle = runDirect({
         prompt, model: s.model, provider,
         // 选择 WSL/SSH 后，内置 Agent 明确回到 AgentHub 本机默认目录；
         // 否则远程 /home/... 会被误当成 Windows 本地路径而启动失败。
         cwd: localOnly && s.remoteHostId ? undefined : (s.cwd || undefined),
-        history, images: b64Images, sessionKey: s.id,
+         history, images: b64Images, sessionKey: s.id,
+         autoPerms: s.autoPerms === true, permMode: s.permMode || '', effort: s.effort || '',
       }, emit);
     } catch (e) {
       emit({ kind: 'error', text: e.message || '内置 Agent 启动失败' });
@@ -2581,6 +3019,7 @@ async function handleChatUnsafe(ws, msg) {
       return failBeforeRun('内置 Agent 没有返回有效的执行句柄');
     }
     runSlot.handle = handle;
+    if (runSlot.cancelled) { try { handle.cancel && handle.cancel(); } catch {} }
     let code0 = 0;
     try { code0 = await handle.done; } catch (e) { code0 = 1; emit({ kind: 'error', text: e.message }); }
     releaseRun();
@@ -2588,6 +3027,8 @@ async function handleChatUnsafe(ws, msg) {
     if (assistant) {
       for (const b of assistant.blocks) { if (b.type === 'tool' && b.status === 'running') b.status = 'done'; }
     }
+    // 与 CLI 路径一致：手动停止的回合显式留一条「已停止」痕迹并实时下发。
+    if (handle.cancelled) emit({ kind: 'stopped' });
     const u0 = usageSum;
     if (u0.input || u0.output) {
       usage.record({ agent: s.agent, model: u0.model || s.model || 'unknown', provider: provider ? provider.name : '', input: u0.input, output: u0.output, cacheRead: u0.cacheRead, cacheCreate: u0.cacheCreate, sessionId: s.id, source: 'live' });
@@ -2654,9 +3095,10 @@ async function handleChatUnsafe(ws, msg) {
     for (const b of assistant.blocks) {
       if (b.type === 'tool' && b.status === 'running') b.status = 'done';
     }
-    // 被手动停止的回合留一条「已停止」痕迹（前端有对应的步骤行渲染）
-    if (handle.cancelled) assistant.blocks.push({ type: 'stopped' });
   }
+  // 被手动停止的回合：显式下发「已停止」事件（原生桥不发 exit，前端无法据退出码判断）。
+  // 走 emit 既落盘、又实时推给页面；即使本轮尚无任何输出也会建出助手消息留痕。
+  if (handle.cancelled) emit({ kind: 'stopped' });
 
   // 记录用量：codex 只报一次/轮；claude 的 result.usage 为整轮合计，优先用
   // claude：done.usage 为整轮合计（不与各消息重复）；codex：usageSum 为当轮唯一一次
@@ -2721,6 +3163,10 @@ if (process.platform === 'win32') {
   } catch {}
 }
 agents.preWarm(settings.data).catch(() => {});
+// 后台预热 /api/agents 的探测缓存，让服务启动后的首次刷新也不必等 --version 探测
+agents.detectAgentsCached(settings.data).catch(() => {});
+// 清扫上次进程异常退出遗留的会话级临时配置（含供应商凭据），避免无限累积。
+sweepTmpSettings();
 // 启动后把历史会话从主 sessions.json 移到可恢复的 JSONL 归档，避免
 // 活跃索引随年份线性膨胀；放到下一轮事件循环，确保所有路由/状态表已初始化。
 setImmediate(() => maybeArchiveSessions());

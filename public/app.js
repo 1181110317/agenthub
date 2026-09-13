@@ -116,6 +116,18 @@ function toast(msg, type = '') {
 // 会话级保存之外,再按 agent 各自记住上次选择(切 agent 时各带各的默认)
 function permAgentKey() { return 'ah.perm.' + (S.curAgent || 'claude'); }
 function curPermMode() { return ($('#selPerm') && $('#selPerm').value) || 'auto'; }
+function effectivePermMode(session) {
+  if (!session) return curPermMode();
+  const mode = ['auto', 'edits', 'plan', 'ask'].includes(session.permMode) ? session.permMode : '';
+  if (mode === 'auto' && session.autoPerms !== true) return 'ask';
+  return mode || (session.autoPerms === true ? 'auto' : 'ask');
+}
+function permissionModeSupported(agent) {
+  if (agent === 'builtin' || String(agent || '').startsWith('acp:')) return true;
+  const custom = ((S.settings && S.settings.customAgents) || []).find(c => c && c.id === agent);
+  if (custom) return custom.acp === true;
+  return ['claude', 'codex', 'zcode'].includes(agent);
+}
 function setPermMode(mode) {
   mode = ['auto', 'edits', 'plan', 'ask'].includes(mode) ? mode : 'auto';
   $('#selPerm').value = mode;
@@ -125,7 +137,7 @@ function setPermMode(mode) {
 function loadPermMode(session) {
   // 会话显式设置 > 该 agent 上次使用 > 默认自动
   const remembered = storageGet(permAgentKey(), null);
-  setPermMode((session && session.permMode) || remembered || 'auto');
+  setPermMode(session ? effectivePermMode(session) : remembered || 'auto');
 }
 
 async function api(url, opts = {}) {
@@ -268,7 +280,9 @@ function md(src) {
 }
 
 function renderMermaids(rootEl) {
-  if (!rootEl || !window.mermaid) return;
+  if (!rootEl) return;
+  // mermaid 3.3MB，按需加载；首次调用先触发加载，加载完再回来渲染
+  if (!window.mermaid) { ensureMermaid().then(() => renderMermaids(rootEl)).catch(() => {}); return; }
   rootEl.querySelectorAll('.mermaid-box[data-mermaid]:not([data-done])').forEach(box => {
     const src = box.querySelector('.mm-src');
     const dst = box.querySelector('.mm-render');
@@ -291,6 +305,43 @@ function highlightIn(rootEl) {
   });
 }
 
+// ---------------- 重组件按需加载（mermaid / echarts / xterm） ----------------
+// 这些库只在渲染 mermaid 图、统计图表或打开终端时才需要，不该在每次刷新时
+// 都阻塞主线程解析执行（mermaid 解压后 3.3MB，冷解析可达数秒）。
+const _lazyScripts = new Map();
+function loadScriptOnce(src) {
+  if (!_lazyScripts.has(src)) {
+    _lazyScripts.set(src, new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = () => { _lazyScripts.delete(src); reject(new Error('加载失败: ' + src)); };
+      document.head.appendChild(s);
+    }));
+  }
+  return _lazyScripts.get(src);
+}
+function initMermaidTheme() {
+  if (!window.mermaid) return;
+  try {
+    const t = document.body.dataset.theme;
+    window.mermaid.initialize({ startOnLoad: false, theme: (t === 'cottage' || t === 'paper' || t === 'forest') ? 'default' : 'dark', securityLevel: 'antiscript' });
+  } catch {}
+}
+function ensureMermaid() {
+  if (window.mermaid) return Promise.resolve();
+  return loadScriptOnce('/vendor/mermaid.min.js').then(initMermaidTheme);
+}
+function ensureEcharts() {
+  if (window.echarts) return Promise.resolve();
+  return loadScriptOnce('/vendor/echarts.min.js');
+}
+function ensureXterm() {
+  if (window.Terminal && window.FitAddon) return Promise.resolve();
+  const p = window.Terminal ? Promise.resolve() : loadScriptOnce('/vendor/xterm.js');
+  return p.then(() => (window.FitAddon ? null : loadScriptOnce('/vendor/addon-fit.js')));
+}
+
 // ---------------- 主题（#8：多主题切换） ----------------
 const THEMES = [
   { id: 'aionui', name: 'AionUi 亮', dot: '#17171b' },
@@ -305,11 +356,7 @@ function applyTheme(t) {
   if (!THEMES.some(x => x.id === t)) t = 'cottage';
   document.body.dataset.theme = t;
   storageSet('ah.theme', t);
-  if (window.mermaid) {
-    try {
-      window.mermaid.initialize({ startOnLoad: false, theme: (t === 'cottage' || t === 'paper' || t === 'forest') ? 'default' : 'dark', securityLevel: 'loose' });
-    } catch {}
-  }
+  initMermaidTheme();
   refreshTermThemes();
 }
 function openThemeMenu(anchor) {
@@ -324,7 +371,8 @@ function openThemeMenu(anchor) {
 const S = {
   agents: [], settings: null, providers: [], hosts: [], sessions: [],
   curAgent: storageGet('ah.agent') || 'claude',
-  curSessionId: null,
+  // 刷新页面后回到上次打开的会话；boot 会验证它仍属于当前 Agent。
+  curSessionId: storageGet('ah.session') || null,
   ws: null, wsReady: false,
   streams: new Map(),   // sessionId -> 直播状态（支持多会话并行）
   running: new Set(),   // 正在运行的会话 id
@@ -419,6 +467,9 @@ async function syncRunning() {
   } catch {}
 }
 function wsConnect() {
+  // 某些内嵌浏览器/受限 WebView 没有 WebSocket。实时连接不可用时，
+  // 仍应完成其余界面初始化，不能让 boot 在这里抛异常而导致所有按钮失效。
+  if (typeof WebSocket !== 'function') return;
   if (S.ws && (S.ws.readyState === WebSocket.OPEN || S.ws.readyState === WebSocket.CONNECTING)) return;
   // 访问令牌：页面 URL 带 ?token=… 时记住，WS 一并携带
   let wsToken = storageGet('ah.token');
@@ -427,7 +478,13 @@ function wsConnect() {
     if (t) { storageSet('ah.token', t); wsToken = t; }
   }
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${scheme}://${location.host}/ws${wsToken ? '?token=' + encodeURIComponent(wsToken) : ''}`);
+  let ws;
+  try {
+    ws = new WebSocket(`${scheme}://${location.host}/ws${wsToken ? '?token=' + encodeURIComponent(wsToken) : ''}`);
+  } catch {
+    S.wsReady = false;
+    return;
+  }
   S.ws = ws;
   ws.onopen = () => {
     S.wsReady = true;
@@ -500,18 +557,33 @@ async function boot() {
   applyTheme(stored || auto);
   applyZoom();
   await refreshData();
-  renderAgents(); renderSessions(); renderComposer(); renderHeader(); renderMessages();
-  wsConnect();
-  window.addEventListener('resize', () => { const t = S.terms.get(S.termActiveKey); if (!$('#termPanel').classList.contains('hidden') && t) try { t.fit.fit(); } catch {} });
-  // B7：运行中关闭页面前提醒
-  window.addEventListener('beforeunload', (e) => {
-    if (S.running.size > 0) { e.preventDefault(); e.returnValue = '有任务正在运行，确定离开？'; return e.returnValue; }
-  });
   try {
     const parsedQueue = JSON.parse(storageGet('ah.queue', '{}'));
     S.queue = parsedQueue && typeof parsedQueue === 'object' && !Array.isArray(parsedQueue) ? parsedQueue : {};
   } catch { S.queue = {}; }
+  const rememberedId = storageGet('ah.session');
+  const remembered = S.sessions.find(s => s.id === rememberedId && s.agent === S.curAgent);
+  if (remembered) {
+    await openSession(remembered.id).catch(() => {
+      S.curSessionId = null;
+      storageSet('ah.session', '');
+    });
+  } else {
+    S.curSessionId = null;
+    storageSet('ah.session', '');
+  }
+  renderAgents(); renderSessions(); renderComposer(); renderHeader(); renderMessages();
+  wsConnect();
+  window.addEventListener('resize', () => {
+    if (!$('#termPanel').classList.contains('hidden')) syncTermSize(S.termActiveKey);
+    toggleSidebar(document.body.classList.contains('sidebar-open'));
+  });
+  // B7：运行中关闭页面前提醒
+  window.addEventListener('beforeunload', (e) => {
+    if (S.running.size > 0) { e.preventDefault(); e.returnValue = '有任务正在运行，确定离开？'; return e.returnValue; }
+  });
   bindEvents();
+  toggleSidebar(document.body.classList.contains('sidebar-open'));
   refreshHdrUsage();
   setInterval(refreshHdrUsage, 5 * 60 * 1000);
 }
@@ -526,8 +598,24 @@ async function refreshData() {
     api('/api/wsl').catch(() => ({ available: false, distros: [] })),
   ]);
   S.wsl = wsl;
-  S.agents = agents; S.settings = settings; S.providers = providers; S.sessions = sessions; S.hosts = hosts;
-  if (!agents.find(a => a.id === S.curAgent)) S.curAgent = agents[0] ? agents[0].id : 'claude';
+  const detectedAgents = Array.isArray(agents) ? agents : [];
+  const sessionList = Array.isArray(sessions) ? sessions : [];
+  const knownIds = new Set(detectedAgents.map(a => a && a.id).filter(Boolean));
+  const customSettings = Array.isArray(settings && settings.customAgents) ? settings.customAgents : [];
+  const missingIds = [...new Set(sessionList.map(s => s && s.agent).filter(id => id && !knownIds.has(id)))];
+  const unavailable = missingIds.map(id => {
+    const custom = customSettings.find(c => c && c.id === id);
+    const known = { claude: 'Claude Code', codex: 'Codex', zcode: 'ZCode', gemini: 'Gemini CLI', opencode: 'OpenCode', builtin: '内置 Agent', 'chatgpt-web': '普通聊天' };
+    const short = String(id).startsWith('acp:') ? String(id).slice(4) : id;
+    return {
+      id,
+      name: custom ? custom.name : (known[id] || short.replace(/^acp_/, 'ACP ')),
+      color: custom && custom.color || '#94a3b8', style: 'raw', models: [],
+      found: false, unavailable: true, version: '当前不可用',
+    };
+  });
+  S.agents = detectedAgents.concat(unavailable); S.settings = settings; S.providers = providers; S.sessions = sessionList; S.hosts = hosts;
+  if (!S.agents.find(a => a.id === S.curAgent)) S.curAgent = S.agents[0] ? S.agents[0].id : 'claude';
 }
 
 // ---------------- Agent 网格 ----------------
@@ -535,13 +623,13 @@ function agentMeta(id) {
   const a = S.agents.find(x => x.id === id);
   if (a) return a;
   // 兜底：从缓存名字库给个可读名（Agent 可能被卸载但会话还在）
-  const known = { claude: 'Claude Code', codex: 'Codex', zcode: 'ZCode', gemini: 'Gemini CLI', opencode: 'OpenCode', builtin: '内置 Agent' };
+  const known = { claude: 'Claude Code', codex: 'Codex', zcode: 'ZCode', gemini: 'Gemini CLI', opencode: 'OpenCode', builtin: '内置 Agent', 'chatgpt-web': '普通聊天' };
   const short = String(id).startsWith('acp:') ? String(id).slice(4) : id;
   return { id, name: known[id] || short.replace(/^acp_/, 'ACP '), color: '#94a3b8', models: [] };
 }
-function avatarHtml(a, size) {
-  return `<div class="agent-avatar" style="background:${a.color}${size ? ';width:' + size + 'px;height:' + size + 'px' : ''}">${esc(a.name[0] || '?')}</div>`;
-}
+// 旧会话沿用 chatgpt-web 这个 ID；它现在表示 AgentHub 内的普通聊天，
+// 直接调用当前选择的模型 API，但不调用任何 Agent 工具。
+function isChatOnlyAgent(agent) { return String(agent || '') === 'chatgpt-web'; }
 // 单色线性图标（stroke: currentColor，随选中态变色）
 const AGENT_ICONS = {
   claude: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 3v18M3 12h18M5.8 5.8l12.4 12.4M18.2 5.8L5.8 18.2"/></svg>',
@@ -549,35 +637,49 @@ const AGENT_ICONS = {
   zcode: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 2.5l8.2 4.75v9.5L12 21.5l-8.2-4.75v-9.5L12 2.5z"/></svg>',
   gemini: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 2.5l2.3 7.2 7.2 2.3-7.2 2.3-2.3 7.2-2.3-7.2-7.2-2.3 7.2-2.3L12 2.5z"/></svg>',
   opencode: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 6.5L3 12l5.5 5.5M15.5 6.5L21 12l-5.5 5.5"/></svg>',
+  'chatgpt-web': '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5.5h10A4.5 4.5 0 0 1 21.5 10v3a4.5 4.5 0 0 1-4.5 4.5h-4.2L8 20.3v-2.8H7A4.5 4.5 0 0 1 2.5 13v-3A4.5 4.5 0 0 1 7 5.5Z"/><path d="M8.5 12h.01M12 12h.01M15.5 12h.01"/></svg>',
 };
 function agentGlyph(id) {
   return AGENT_ICONS[id] || '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/></svg>';
+}
+function bindKeyboardAction(el, handler, role = 'button') {
+  if (!el) return el;
+  el.setAttribute('role', role);
+  el.tabIndex = 0;
+  el.addEventListener('click', handler);
+  el.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      handler(e);
+    }
+  });
+  return el;
 }
 
 function renderAgents() {
   // 主列表固定为日常核心：Claude/Codex/OpenCode；ZCode/Gemini/ACP/其他统一收进更多
   // 避免一个 Claude 被 CLI/ACP/适配器重复铺满侧栏
-  const mainIds = new Set(['claude', 'codex', 'opencode', 'acp:workbuddy']);
+  const mainIds = new Set(['claude', 'codex', 'opencode', 'builtin', 'chatgpt-web', 'acp:workbuddy']);
   const main = S.agents.filter(a => mainIds.has(a.id));
   const more = S.agents.filter(a => !mainIds.has(a.id));
   const cur = S.curAgent;
   const curInMore = more.some(a => a.id === cur);
   let html = main.map(a => `
-    <div class="agent-card ${a.id === cur ? 'active' : ''}" data-agent="${esc(a.id)}" title="${esc(a.version || (a.found ? '' : '未安装'))}">
+    <div class="agent-card ${a.id === cur ? 'active' : ''}" data-agent="${esc(a.id)}" title="${esc(a.unavailable ? '会话历史中的 Agent 当前不可用，请恢复安装或配置后继续' : (a.version || (a.found ? '' : '未安装')))}">
       <span class="ag-glyph">${agentGlyph(a.id)}</span>
       <span class="ag-name">${esc(a.name)}</span>
       <span class="ag-dot ${a.found ? 'on' : 'off'}" title="${a.found ? '就绪' : '未安装'}"></span>
     </div>`).join('');
   if (more.length || curInMore) {
     const expanded = S.agentMoreOpen;
-    html += `<div class="agent-card more-toggle ${expanded ? 'open' : ''}" id="agentMoreBtn" title="未安装/未使用的 Agent">
+    html += `<div class="agent-card more-toggle ${expanded ? 'open' : ''}" id="agentMoreBtn" title="未安装/未使用的 Agent" aria-expanded="${expanded ? 'true' : 'false'}">
       <span class="ag-glyph">${UI_ICONS.plus}</span>
       <span class="ag-name">${expanded ? '收起' : '更多 Agent'}</span>
       <span class="ag-count">${more.length}</span>
     </div>`;
     if (expanded) {
       html += more.map(a => `
-        <div class="agent-card dim ${a.id === cur ? 'active' : ''}" data-agent="${esc(a.id)}" title="${esc(a.version || '未安装——可先建会话，运行时会提示')}">
+        <div class="agent-card dim ${a.id === cur ? 'active' : ''}" data-agent="${esc(a.id)}" title="${esc(a.unavailable ? '会话历史中的 Agent 当前不可用，请恢复安装或配置后继续' : (a.version || '未安装——可先建会话，运行时会提示'))}">
           <span class="ag-glyph">${agentGlyph(a.id)}</span>
           <span class="ag-name">${esc(a.name)}</span>
           <span class="ag-dot ${a.found ? 'on' : 'off'}" title="${a.found ? '就绪' : '未安装'}"></span>
@@ -585,14 +687,15 @@ function renderAgents() {
     }
   }
   $('#agentGrid').innerHTML = html;
-  $$('.agent-card[data-agent]').forEach(el => el.onclick = () => switchAgent(el.dataset.agent));
+  $$('.agent-card[data-agent]').forEach(el => bindKeyboardAction(el, () => switchAgent(el.dataset.agent)));
   const moreBtn = document.getElementById('agentMoreBtn');
-  if (moreBtn) moreBtn.onclick = () => { S.agentMoreOpen = !S.agentMoreOpen; renderAgents(); };
+  if (moreBtn) bindKeyboardAction(moreBtn, () => { S.agentMoreOpen = !S.agentMoreOpen; renderAgents(); });
 }
 
 async function switchAgent(id) {
   S.curAgent = id; storageSet('ah.agent', id);
   S.curSessionId = null;
+  storageSet('ah.session', '');
   renderAgents(); renderSessions(); renderComposer(); renderHeader(); renderMessages();
   setSendBtn(S.running.has(S.curSessionId));
   refreshHdrUsage();
@@ -617,7 +720,10 @@ function groupInfo(s) {
   const isWsl = s.remoteHostId === 'wsl';
   const host = !isWsl && s.remoteHostId ? S.hosts.find(h => h.id === s.remoteHostId) : null;
   const addr = isWsl ? '本机 WSL' : host ? (host.user + '@' + host.host) : '';
-  const key = (s.remoteHostId || 'local') + '|' + (cwd || '~none');
+  const keyPath = /^[A-Za-z]:[\\/]|^\\\\/.test(cwd)
+    ? cwd.replace(/[\\/]+/g, '\\').replace(/\\+$/, '').toLowerCase()
+    : cwd.replace(/[\\/]+$/, '');
+  const key = (s.remoteHostId || 'local') + '|' + (keyPath || '~none');
   const name = cwd ? (baseName(cwd) || cwd) : (s.remoteHostId ? '未指定目录' : '默认项目');
   return {
     key, name,
@@ -665,18 +771,19 @@ function renderSessions() {
     const head = document.createElement('div');
     head.className = 'proj-head';
     head.title = g.tip;
+    head.setAttribute('aria-expanded', String(!isCollapsed));
         head.innerHTML = `
       <span class="proj-chev${isCollapsed ? '' : ' open'}">${UI_ICONS.chevron}</span>
       <span class="proj-ico">${kindIcon(g.kind)}</span>
       <span class="proj-name">${esc(g.name)}</span>
       <span class="proj-count">${g.sessions.length}</span>
       <button class="proj-new" data-pnew="1" title="在此项目下新建任务">${UI_ICONS.plus}</button>`;
-    head.onclick = (e) => {
+    bindKeyboardAction(head, (e) => {
       if (e.target.closest('.proj-new')) { newTaskInProject(g); return; }
       if (isCollapsed) collapsed.delete(g.key); else collapsed.add(g.key);
       storageSet('ah.projCollapsed', JSON.stringify([...collapsed]));
       renderSessions();
-    };
+    });
     wrap.appendChild(head);
     if (isCollapsed) continue;
     const shown = isExpanded ? g.sessions : g.sessions.slice(0, 4);
@@ -685,13 +792,13 @@ function renderSessions() {
       const more = document.createElement('div');
       more.className = 'proj-more';
       more.textContent = '展开显示 ' + (g.sessions.length - shown.length) + ' 条…';
-      more.onclick = () => { expanded.add(g.key); storageSet('ah.projExpanded', JSON.stringify([...expanded])); renderSessions(); };
+      bindKeyboardAction(more, () => { expanded.add(g.key); storageSet('ah.projExpanded', JSON.stringify([...expanded])); renderSessions(); });
       wrap.appendChild(more);
     } else if (isExpanded && g.sessions.length > 4) {
       const less = document.createElement('div');
       less.className = 'proj-more';
       less.textContent = '收起';
-      less.onclick = () => { expanded.delete(g.key); storageSet('ah.projExpanded', JSON.stringify([...expanded])); renderSessions(); };
+      bindKeyboardAction(less, () => { expanded.delete(g.key); storageSet('ah.projExpanded', JSON.stringify([...expanded])); renderSessions(); });
       wrap.appendChild(less);
     }
   }
@@ -700,6 +807,7 @@ function sessionItemEl(s, inPinned) {
   const el = document.createElement('div');
   el.className = 'session-item' + (s.id === S.curSessionId ? ' active' : '');
   el.dataset.sid = s.id;
+  el.setAttribute('aria-current', s.id === S.curSessionId ? 'true' : 'false');
   const metaBits = [];
   if (inPinned) {
     if (s.remoteHostId) metaBits.push(hostBadge(s) + ' ' + hostName(s));
@@ -711,9 +819,9 @@ function sessionItemEl(s, inPinned) {
       ${S.running.has(s.id) ? '<span class="si-run" title="运行中"></span>' : ''}
       <span class="si-title">${esc(s.title)}</span>
       <span class="si-time">${fmtRel(s.updatedAt)}</span>
-      <button class="si-pin" title="${s.pinned ? '取消置顶' : '置顶'}">${UI_ICONS2.pin}</button>
-      <button class="si-del" title="删除">✕</button>`;
-  el.onclick = (ev) => { if (ev.target.closest('.si-del')) return; openSession(s.id).catch(e => toast(e.message, 'err')); };
+      <button class="si-pin" title="${s.pinned ? '取消置顶' : '置顶'}" aria-label="${s.pinned ? '取消置顶' : '置顶'}">${UI_ICONS2.pin}</button>
+      <button class="si-del" title="删除" aria-label="删除会话">✕</button>`;
+  bindKeyboardAction(el, (ev) => { if (ev.target.closest('.si-del,.si-pin')) return; openSession(s.id).catch(e => toast(e.message, 'err')); });
   el.querySelector('.si-del').onclick = async (ev) => {
     ev.stopPropagation();
     if (!confirm('删除该会话？')) return;
@@ -725,7 +833,7 @@ function sessionItemEl(s, inPinned) {
       delete S.queue[s.id];
       saveQueue();
     }
-    if (S.curSessionId === s.id) { S.curSessionId = null; renderHeader(); renderMessages(); }
+    if (S.curSessionId === s.id) { S.curSessionId = null; storageSet('ah.session', ''); renderHeader(); renderMessages(); }
     if (!S.curSessionId) renderQueueTray(null);
     renderSessions();
   };
@@ -756,7 +864,9 @@ async function openSession(id, focusTs) {
   const i = S.sessions.findIndex(x => x.id === id);
   if (i >= 0) S.sessions[i] = { ...S.sessions[i], ...s, messages: s.messages }; else S.sessions.unshift(s);
   S.curSessionId = id;
+  storageSet('ah.session', id);
   S.curAgent = s.agent;
+  if (window.innerWidth <= 900) toggleSidebar(false);
   // B2：该会话正在直播时，服务端内存里最后一条 assistant 是实时增长的半成品，
   // 直接渲染会与直播元素重复 → 渲染时去掉最后一条 assistant，把直播元素接回来
   const st = S.streams.get(id);
@@ -812,6 +922,7 @@ async function newSession() {
     } });
     S.sessions.unshift(s);
     S.curSessionId = s.id;
+    storageSet('ah.session', s.id);
     renderSessions(); renderComposer(s); renderHeader(s); renderMessages([]);
     $('#inpText').focus();
     return s;
@@ -855,6 +966,27 @@ function sessionTokTotal(s) {
 
 function renderHeader(s) {
   s = s || curSession();
+  const chatOnly = isChatOnlyAgent(S.curAgent) || isChatOnlyAgent(s && s.agent);
+  if (chatOnly) {
+    $('#hdrTitle').textContent = s ? s.title : '普通聊天 · 新会话';
+    $('#wsChip').style.display = 'none';
+    $('#btnExport').style.display = '';
+    $('#btnSessUsage').style.display = '';
+    const providerId = s && s.providerId || $('#selProvider') && $('#selProvider').value || '';
+    const p = S.providers.find(x => x.id === providerId) || defaultProviderFor('chatgpt-web');
+    const model = s && s.model || $('#inpModel') && $('#inpModel').value || (p && p.model) || '';
+    const badges = ['<span class="badge acc">只聊天 · 不调用 Agent 工具</span>'];
+    if (p) badges.push(`<span class="badge">${esc(p.name)}</span>`);
+    if (model) badges.push(`<span class="badge">${esc(model)}</span>`);
+    $('#hdrBadges').innerHTML = badges.join('');
+    const tot = sessionTokTotal(s);
+    $('#btnSessUsage').textContent = tot ? `Σ ${fmtTok(tot)} tok` : 'Σ 会话用量';
+    updateCtxMeter();
+    return;
+  }
+  $('#wsChip').style.display = '';
+  $('#btnExport').style.display = '';
+  $('#btnSessUsage').style.display = '';
   $('#hdrTitle').textContent = s ? s.title : agentMeta(S.curAgent).name + ' · 新会话';
   const badges = [];
   if (s) {
@@ -867,11 +999,14 @@ function renderHeader(s) {
     const p = S.providers.find(p => p.id === s.providerId);
     if (p) badges.push(`<span class="badge acc">${esc(p.name)}</span>`);
     if (s.model) badges.push(`<span class="badge">${esc(s.model)}</span>`);
-    if (s.permMode && s.permMode !== 'auto') badges.push(`<span class="badge dimbadge" title="权限模式：${{ edits: '接受编辑（命令等仍被拒）', plan: '计划模式（只读）', ask: '询问（不跳过权限）' }[s.permMode] || s.permMode}">${{ edits: '编辑', plan: '计划', ask: '询问' }[s.permMode]}</span>`);
-    else if (s.autoPerms) badges.push(`<span class="badge dimbadge" title="自动权限已开启（跳过命令确认）">自动权限</span>`);
+    const permissionMode = effectivePermMode(s);
+    if (permissionMode !== 'auto') badges.push(`<span class="badge dimbadge" title="权限模式：${{ edits: '接受编辑（命令等仍被拒）', plan: '计划模式（只读）', ask: '询问（不跳过权限）' }[permissionMode] || permissionMode}">${{ edits: '编辑', plan: '计划', ask: '询问' }[permissionMode]}</span>`);
+    else badges.push(`<span class="badge dimbadge" title="自动权限已开启（跳过命令确认）">自动权限</span>`);
   } else {
     const a = agentMeta(S.curAgent);
-    badges.push(`<span class="badge ${a.found ? 'acc' : 'warn'}">${a.found ? 'CLI 就绪' + (a.version ? ' · ' + esc(a.version) : '') : '未检测到 CLI'}</span>`);
+    const isAcp = String(S.curAgent || '').startsWith('acp:') || (S.settings && (S.settings.customAgents || []).some(c => c && c.id === S.curAgent && c.acp));
+    const readyLabel = S.curAgent === 'builtin' ? 'API 就绪' : isAcp ? 'ACP 就绪' : permissionModeSupported(S.curAgent) ? 'CLI 就绪' : 'Agent 自控';
+    badges.push(`<span class="badge ${a.found || S.curAgent === 'builtin' ? 'acc' : 'warn'}">${a.found || S.curAgent === 'builtin' ? readyLabel + (a.version ? ' · ' + esc(a.version) : '') : readyLabel}</span>`);
   }
   $('#hdrBadges').innerHTML = badges.join('');
   const tot = sessionTokTotal(s);
@@ -881,7 +1016,7 @@ function renderHeader(s) {
 
 async function refreshHdrUsage() {
   try {
-    const u = await api(`/api/usage?days=1&agent=${S.curAgent}&source=all`);
+    const u = await api(`/api/usage?days=1&agent=${S.curAgent}&source=local`);
     const t = u.totals;
     $('#hdrUsage').textContent = `今日 ${fmtTok(t.input + t.output + t.cacheRead + t.cacheCreate)} tok`;
   } catch { $('#hdrUsage').textContent = ''; }
@@ -925,7 +1060,11 @@ function filesRowHtml(files, sessionId, msgTs) {
   }).join('')}</div>`;
 }
 function imagesHtml(imgs) {
-  const list = Array.isArray(imgs) ? imgs.filter(isSafeImageUrl) : [];
+  const list = Array.isArray(imgs) ? imgs.map(item => {
+    if (typeof item === 'string') return isSafeImageUrl(item) ? item : '';
+    const url = item && typeof item === 'object' ? item.url : '';
+    return isSafeImageUrl(url) ? url : '';
+  }).filter(Boolean) : [];
   if (!list.length) return '';
   return `<div class="msg-images">${list.map((d, i) => `<img src="${esc(assetUrl(d))}" data-img="${i}" loading="lazy">`).join('')}</div>`;
 }
@@ -978,7 +1117,7 @@ function stepHeadHtml(b) {
   return `<span class="st-ico">${ico}</span>
     <span class="st-title">${title}</span>
     ${sum ? `<span class="sep"></span><span class="st-sum${err ? ' err-sum' : ''}" title="${esc(sum)}">${esc(sum.slice(0, 160))}</span>` : ''}
-    ${dur ? `<span class="st-dur">${fmtDur(dur)}</span>` : ''}`;
+    ${/* 已结束的步骤即使 0ms 也显示「0 秒」；运行中/无计时的历史块不显示 */ (b._t1 && (dur || b.status !== 'running')) ? `<span class="st-dur">${fmtDur(dur)}</span>` : ''}`;
 }
 
 // 工具展开正文:IN/OUT 卡(harness ToolRow .ioCard 逐值复刻)
@@ -1028,7 +1167,7 @@ function msgHtml(m, isLast) {
     const imgs = imagesHtml(m.images);
     return `<div class="msg msg-user">
       <div class="who">我 <span>${fmtTime(m.ts)}</span></div>
-      <div class="bubble">${esc(m.text)}</div>
+      <div class="bubble">${esc(m.text) || (m.images && m.images.length ? '（图片）' : '')}</div>
       ${imgs}
       <div class="msg-foot"><button class="copy-btn" data-copy="1">复制</button><button class="copy-btn" data-edit="${m.ts}" title="回退到此消息并重新编辑">编辑重发</button><button class="copy-btn" data-fork="${m.ts}" title="以此消息为终点创建分叉会话">⑂ 分叉</button></div>
     </div>`;
@@ -1052,17 +1191,18 @@ function msgHtml(m, isLast) {
   }
 
   // 摘要行（完成后折叠过程；点击展开/收起，#15）。标签规则 = harness TurnProcessNodeView：
-  // 工具数 → "N 次工具调用"；有思考 → 追加 "已思考"；报错 → "出了问题"；全无 → "已思考"
+  // 工具数 → "N 次工具调用"；有思考 → 追加 "思考过程"；报错 → "出了问题"。
+  // 过程默认折叠，文案直接告诉用户这里可以展开查看。
   const toolCount = blocks.filter(b => b.type === 'tool').length;
   const thinkCount = blocks.filter(b => b.type === 'think').length;
   const errCount = blocks.filter(b => b.type === 'error').length;
   const summaryLabel = [
     toolCount ? `${toolCount} 次工具调用` : '',
-    thinkCount ? '已思考' : '',
+    thinkCount ? '思考过程' : '',
     errCount ? '出了问题' : '',
-  ].filter(Boolean).join(' · ') || '已思考';
+  ].filter(Boolean).join(' · ') || '工作过程';
   const summary = hasSteps ? `
-    <button class="turn-summary" data-turntoggle="1" title="展开 / 收起工作过程">
+    <button class="turn-summary" data-turntoggle="1" aria-expanded="false" title="展开 / 收起工作过程">
       <span class="ts-text">${esc(summaryLabel)}</span>
       <span class="ts-chev">${UI_ICONS.chevDown}</span>
     </button>
@@ -1105,15 +1245,23 @@ const SUGGESTIONS = [
 ];
 
 function renderMessages(msgs) {
+  const chatOnly = isChatOnlyAgent(S.curAgent);
+  document.body.classList.toggle('chatonly-mode', chatOnly);
   document.body.classList.toggle('center-empty', !(msgs && msgs.length));
   const box = $('#messages');
   if (!msgs || !msgs.length) {
     const a = agentMeta(S.curAgent);
+    const suggestions = chatOnly ? [
+      '帮我总结一下这段文字',
+      '给我讲一个有趣的知识点',
+      '帮我润色这段话',
+      '制定一个周末学习计划',
+    ] : SUGGESTIONS;
     box.innerHTML = `<div class="empty-state">
       <div class="es-logo">⬡</div>
-      <div class="es-title">有什么可以帮你？</div>
-      <div class="es-sub">${esc(a.name)} · 流式输出 · 多会话并行 · 多轮续接${a.found ? '' : ' · 未检测到 CLI，请到「设置」配置路径'}</div>
-      <div class="es-chips">${SUGGESTIONS.map(s => `<span class="es-chip">${esc(s)}</span>`).join('')}</div>
+      <div class="es-title">${chatOnly ? '有什么想聊的？' : '有什么可以帮你？'}</div>
+      <div class="es-sub">${chatOnly ? '普通聊天 · 直连已配置模型 API · 不调用 Agent 工具' : `${esc(a.name)} · 流式输出 · 多会话并行 · 多轮续接${a.found ? '' : ' · 未检测到 CLI，请到「设置」配置路径'}`}</div>
+      <div class="es-chips">${suggestions.map(s => `<span class="es-chip">${esc(s)}</span>`).join('')}</div>
     </div>`;
     $$('.es-chip').forEach(el => el.onclick = () => {
       $('#inpText').value = el.textContent;
@@ -1206,8 +1354,31 @@ function acpPermCardHtml(ev, sessionId) {
     (ev.options || []).map((o, i) => `<button class="perm-opt${(o.kind || '').startsWith('reject') ? ' reject' : ''}" data-pid="${esc(ev.pid)}" data-agent="${esc(sessionId)}" data-oid="${esc(o.optionId)}" data-i="${i}">${esc(o.name)}${o.kind ? ' · ' + esc(o.kind) : ''}</button>`).join('');
   card.querySelectorAll('.perm-opt').forEach(btn => btn.onclick = async () => {
     lockPermCard(card, btn);
-    try { await api('/api/acp/respond', { method: 'POST', body: { agentId: sessionId, pid: btn.dataset.pid, optionId: btn.dataset.oid } }); }
+    try {
+      await api('/api/acp/respond', { method: 'POST', body: { agentId: sessionId, pid: btn.dataset.pid, optionId: btn.dataset.oid } });
+      markPermResolved(card, '已发送');
+    }
     catch (e) { unlockPermCard(card); toast(e.message, 'err'); }
+  });
+  return card;
+}
+
+// 内置 Agent 的工具审批（走 /api/api-agent/respond）。读操作在当前权限
+// 模式下会直接执行；只有需要用户决定的工具才会产生这张卡片。
+function apiAgentPermCardHtml(ev, sessionId) {
+  const card = document.createElement('div');
+  card.className = 'perm-card';
+  card.dataset.permPid = ev.pid || '';
+  card.__agenthubSessionId = sessionId;
+  card.innerHTML = `<div class="perm-title">🔐 ${esc(ev.title || '内置 Agent 需要你的确认')}</div>`
+    + (ev.reason ? `<div class="perm-reason">${esc(ev.reason)}</div>` : '')
+    + `<button class="perm-opt" data-action="allow">✅ 允许</button><button class="perm-opt reject" data-action="deny">⛔ 拒绝</button>`;
+  card.querySelectorAll('[data-action]').forEach(btn => btn.onclick = async () => {
+    lockPermCard(card, btn);
+    try {
+      await api('/api/api-agent/respond', { method: 'POST', body: { sessionId, pid: ev.pid, action: btn.dataset.action } });
+      markPermResolved(card, btn.dataset.action === 'allow' ? '已允许' : '已拒绝');
+    } catch (e) { unlockPermCard(card); toast(e.message || '内置 Agent 审批失败', 'err'); }
   });
   return card;
 }
@@ -1337,9 +1508,11 @@ function bridgePermCardHtml(ev, sessionId) {
   const opts = Array.isArray(ev.options) ? ev.options : [];
   const sugg = Array.isArray(ev.suggestions) ? ev.suggestions : [];
   card.innerHTML = `<div class="perm-title">🔐 ${esc(ev.title || '需要你的确认')}</div>` +
-    (reason ? `<div class="perm-detail">${esc(String(reason)).slice(0, 500)}</div>` : '') +
-    (detail ? `<div class="perm-detail">${esc(String(detail)).slice(0, 400)}</div>` : '') +
-    (!detail && Object.keys(input).length ? `<details class="perm-io"><summary>请求参数</summary><pre>${esc(inputJson).slice(0, 2000)}</pre></details>` : '');
+    // 先按原文截断再转义：先转义后截断会把 &lt; 之类的实体拦腰切断，
+    // 在权限卡里显示「&l」「&#3」这类残片。
+    (reason ? `<div class="perm-detail">${esc(String(reason).slice(0, 500))}</div>` : '') +
+    (detail ? `<div class="perm-detail">${esc(String(detail).slice(0, 400))}</div>` : '') +
+    (!detail && Object.keys(input).length ? `<details class="perm-io"><summary>请求参数</summary><pre>${esc(inputJson.slice(0, 2000))}</pre></details>` : '');
   const mkBtn = (label, cls, onclick) => {
     const b = document.createElement('button');
     b.className = 'perm-opt' + (cls ? ' ' + cls : '');
@@ -1415,10 +1588,13 @@ async function fetchPendingPerms(sessionId) {
   try {
     const r = await api('/api/bridge/pending?sessionId=' + encodeURIComponent(sessionId));
     const st = S.streams.get(sessionId);
-    if (!st || !r.cards || !r.cards.length) return;
+    // 后台流状态（st.bg）没有 extra 容器；await 期间用户可能切走会话，
+    // 此时不能在这里 querySelector，否则 TypeError 会让后续会话的权限卡
+    // 恢复也一起失败。
+    if (!st || st.bg || !st.extra || !r.cards || !r.cards.length) return;
     for (const ev of r.cards) {
       if (st.extra.querySelector(`[data-perm-pid="${CSS.escape(ev.pid)}"]`)) continue;
-       st.extra.appendChild(ev.bridge ? bridgePermCardHtml(ev, sessionId) : acpPermCardHtml(ev, sessionId));
+       st.extra.appendChild(ev.bridge ? bridgePermCardHtml(ev, sessionId) : ev.apiAgent ? apiAgentPermCardHtml(ev, sessionId) : acpPermCardHtml(ev, sessionId));
     }
     syncQuestionComposerHint(sessionId);
     const b = $('#messages');
@@ -1444,14 +1620,19 @@ function handleChatEvent(sessionId, ev, meta = {}) {
   }
   // 服务端拒绝回合（如「该会话正在运行中」）只回 error、不会有 chat.started/done；
   // 不清 sendPending 会让发送键此后一直静默失效（表现为“发消息卡住”）。
-  if (ev.kind === 'error') S.sendPending.delete(sessionId);
+  let restoredOutbox = false;
+  if (ev.kind === 'error') {
+    S.sendPending.delete(sessionId);
+    // error 可能在 status/permission 之后到达，此时已经有 st，旧逻辑
+    // 不会恢复尚未收到 user-echo 的输入，导致消息看起来凭空消失。
+    if (meta && meta.clientId) restoredOutbox = restoreOutbox(meta.clientId, eventText || '消息未发送');
+  }
   let st = S.streams.get(sessionId);
   if (!st && ev.kind === 'error') {
     // 服务器可能先发 chat.started 再做远程/供应商/工作目录校验；此时
     // running 仍可能短暂为 true，但该错误表示没有真正进入 Agent 回合，
     // 必须把尚未收到 user-echo 的输入恢复出来。
-    if (meta && meta.clientId) restoreOutbox(meta.clientId, eventText || '消息未发送');
-    if (sessionId === S.curSessionId) toast(eventText || 'Agent 执行失败', 'err');
+    if (!restoredOutbox && sessionId === S.curSessionId) toast(eventText || 'Agent 执行失败', 'err');
     return;
   }
   if (!st) {
@@ -1534,7 +1715,7 @@ function handleChatEvent(sessionId, ev, meta = {}) {
         body.textContent = buf;
         if (card.hasAttribute('open')) body.scrollTop = body.scrollHeight;
         const sum = card.querySelector('.st-sum');
-        // 流式跟随最新一行(harness ReasoningRow latestLine + data-follow-end 右对齐)
+        // 流式跟随最新一行；摘要保持正常左起阅读，不把最新文字贴到右端。
         const tail = buf.trimEnd();
         if (sum) sum.textContent = tail.slice(tail.lastIndexOf('\n') + 1);
       });
@@ -1620,9 +1801,16 @@ function handleChatEvent(sessionId, ev, meta = {}) {
       scroll();
       break;
     }
-    case 'status':
-      st.extra.innerHTML += `<div class="status-line">$ ${esc(ev.text)}</div>`;
+    case 'status': {
+      // 不能用 innerHTML +=：它会重建 st.extra 的全部子节点，导致已经
+      // 显示的审批/提问卡丢失 onclick 监听器。
+      const line = document.createElement('div');
+      line.className = 'status-line';
+      line.textContent = '$ ' + eventText;
+      st.extra.appendChild(line);
+      scroll();
       break;
+    }
     // stderr/错误和 agent 输出一样走过程区步骤行（与刷新后历史渲染一致），不再藏在小字里
     case 'stderr': {
       st.stderrText = (st.stderrText || '') + eventText;
@@ -1648,7 +1836,21 @@ function handleChatEvent(sessionId, ev, meta = {}) {
         S.cancelReq.delete(sessionId);
         st.process.insertAdjacentHTML('beforeend', stepBlockHtml({ type: 'stopped' }));
         scroll();
-      } else if (ev.code !== 0 && ev.code != null) st.extra.innerHTML += `<div class="status-line">进程退出码 ${esc(ev.code)}</div>`;
+      } else if (ev.code !== 0 && ev.code != null) {
+        const line = document.createElement('div');
+        line.className = 'status-line';
+        line.textContent = '进程退出码 ' + String(ev.code);
+        st.extra.appendChild(line);
+        scroll();
+      }
+      break;
+    case 'stopped':
+      // 原生桥（claude/codex/zcode）不发 exit 事件，由服务端显式下发「已停止」。
+      // 去重：避免与上面的 exit 分支或 onChatDone 的兜底渲染重复插入。
+      if (!st.process.querySelector('.step-stopped')) {
+        st.process.insertAdjacentHTML('beforeend', stepBlockHtml({ type: 'stopped' }));
+        scroll();
+      }
       break;
     case 'auth': {
       const card = document.createElement('div');
@@ -1660,7 +1862,7 @@ function handleChatEvent(sessionId, ev, meta = {}) {
     }
     case 'permission': {
       // 两类卡片：bridge=true 是 Claude/ZCode/Codex 原生权限/提问；否则是 ACP 的选项审批
-      st.extra.appendChild(ev.bridge ? bridgePermCardHtml(ev, sessionId) : acpPermCardHtml(ev, sessionId));
+      st.extra.appendChild(ev.bridge ? bridgePermCardHtml(ev, sessionId) : ev.apiAgent ? apiAgentPermCardHtml(ev, sessionId) : acpPermCardHtml(ev, sessionId));
       syncQuestionComposerHint(sessionId);
       scroll();
       break;
@@ -1722,6 +1924,11 @@ async function onChatDone(m) {
   const qBeforeDrain = (S.queue || {})[m.sessionId];
   const forceQueueAfterCancel = !!(S.cancelReq && S.cancelReq.has(m.sessionId)
     && Array.isArray(qBeforeDrain) && qBeforeDrain[0] && qBeforeDrain[0].mode === 'now');
+  // 原生桥（claude/codex/zcode）不发 exit 事件。用户手动停止的回合在这里补一条
+  // 「已停止」步骤行：即使服务端尚未下发 stopped 事件（旧版本进程），界面也有明确反馈。
+  if (S.cancelReq && S.cancelReq.has(m.sessionId) && st && st.process && !st.process.querySelector('.step-stopped')) {
+    st.process.insertAdjacentHTML('beforeend', stepBlockHtml({ type: 'stopped' }));
+  }
   S.cancelReq && S.cancelReq.delete(m.sessionId);
   // 旧版排队弹层绑定的是这一回合；回合结束必须收起。现在排队内容
   // 直接显示在输入框上方，closeSendChoice 只负责兼容可能残留的旧弹层。
@@ -1931,8 +2138,13 @@ async function sendCurrent() {
     // 运行中：空输入时按钮仍是「停止」；输入了内容 = 想发消息 → 给排队/插入选择
     if (!hasInput) {
       if (S.curSessionId) {
-        (S.cancelReq = S.cancelReq || new Set()).add(S.curSessionId);
-        wsSend({ type: 'chat.cancel', sessionId: S.curSessionId });
+        const sent = wsSend({ type: 'chat.cancel', sessionId: S.curSessionId });
+        // WS 断开的窗口里发送是 no-op：不能把 cancelReq 留在集合里，否则
+        // 之后正常结束的回合会被渲染成「已停止」，还可能误触发队列排水。
+        if (sent === false) {
+          S.cancelReq && S.cancelReq.delete(S.curSessionId);
+          toast('连接未就绪，停止失败；回合仍在服务器上运行', 'err');
+        }
       }
       return;
     }
@@ -1950,16 +2162,27 @@ async function sendCurrent() {
   }
   if (!hasInput) return;
   if (!S.wsReady) return toast('连接未就绪', 'err');
+  // 文本已捕获，先清空输入框再进入异步窗口（建会话/PATCH）。旧实现把清空
+  // 放在两个 await 之后：等待期间用户续写的内容会被无条件清空丢掉。所有
+  // 失败路径都要把原文恢复回输入框（续写内容保留、追加在原文之后）。
+  $('#inpText').value = ''; autoGrow();
+  S._lastSendText = text;
+  const restoreInput = () => {
+    S._lastSendText = null;
+    const cur = $('#inpText').value;
+    $('#inpText').value = cur ? text + '\n' + cur : text;
+    autoGrow();
+  };
   if (!S.curSessionId) {
-    if (S.creatingSession) return toast('会话正在创建，请稍候', 'err');
+    if (S.creatingSession) { restoreInput(); return toast('会话正在创建，请稍候', 'err'); }
     S.creatingSession = true;
     let created;
     try { created = await newSession(); }
     finally { S.creatingSession = false; }
-    if (!created) return;
+    if (!created) { restoreInput(); return; }
   }
   const s = curSession();
-  if (!s) return toast('会话尚未加载完成，请重试', 'err');
+  if (!s) { restoreInput(); return toast('会话尚未加载完成，请重试', 'err'); }
   if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
   // 运行中 → 排队。正在运行时的发送默认走这一条；单条消息的立即/优先
   // 操作在输入框上方的待发送列表中完成。
@@ -1972,7 +2195,7 @@ async function sendCurrent() {
   // PATCH 配置和 WS 发送之间存在一个异步窗口；双击发送会让两个回合
   // 都通过前端的 running 检查。以会话为粒度锁住这个窗口，直到服务端
   // 回 chat.started/chat.done 或重连确认它没有运行。
-  if (S.sendPending.has(s.id)) return;
+  if (S.sendPending.has(s.id)) { restoreInput(); return; }
   S.sendPending.add(s.id);
   const previous = {
     model: s.model, providerId: s.providerId, remoteHostId: s.remoteHostId,
@@ -2000,9 +2223,9 @@ async function sendCurrent() {
     S.sendPending.delete(s.id);
     Object.assign(s, previous);
     renderComposer(s); renderHeader(s);
+    restoreInput();
     return toast(e.message || '保存会话设置失败', 'err');
   }
-  $('#inpText').value = ''; autoGrow();
   // 本地立即渲染用户消息
   const imgs = S.attachments.splice(0);
   renderAttachments();
@@ -2024,11 +2247,12 @@ async function sendCurrent() {
     S.outbox.delete(clientId);
     S.sendPending.delete(s.id);
     div.remove();
-    $('#inpText').value = text;
+    restoreInput();
     S.attachments.unshift(...imgs);
     renderAttachments();
     return toast('连接未就绪，消息已恢复到输入框', 'err');
   }
+  S._lastSendText = null;
 }
 
 // 按键/点击事件不会自动等待 async handler。即使出现未预期的 DOM 或
@@ -2038,17 +2262,25 @@ function submitCurrent() {
     const s = curSession();
     if (s && !S.running.has(s.id)) S.sendPending.delete(s.id);
     if (s) setSendBtn(S.running.has(s.id));
+    // 发送途中清空输入框之后抛出的意外异常：把原文恢复回输入框，不让用户重打
+    if (S._lastSendText != null) {
+      const cur = $('#inpText').value;
+      $('#inpText').value = cur ? S._lastSendText + '\n' + cur : S._lastSendText;
+      autoGrow();
+      S._lastSendText = null;
+    }
     toast(e && e.message || '发送失败，请重试', 'err');
   });
 }
 
 // ---------------- Composer（#11 真实值；#23 目录锁定） ----------------
 function providersFor(agent) {
+  if (isChatOnlyAgent(agent)) return S.providers;
   if (agent === 'builtin') return S.providers;
   if (agent === 'acp:workbuddy') return []; // WorkBuddy 使用自身账户/模型配置，不读 cc-switch
   return S.providers.filter(p => p.agent === agent || (agent === 'zcode' && p.agent === 'claude'));
 }
-// #11：没显式选供应商时，解析"实际默认"（本应用默认 ★ → cc-switch 当前 → 无）
+// #11：没显式选供应商时，解析“实际默认”（本应用默认 ★ → 导入记录的历史当前 → 无）
 function defaultProviderFor(agent) {
   const providerKeys = agent === 'zcode' ? ['zcode', 'claude'] : [agent];
   const current = S.settings.currentProvider || {};
@@ -2061,12 +2293,16 @@ function defaultProviderFor(agent) {
 
 function renderComposer(s) {
   s = s || curSession();
+  const chatOnly = isChatOnlyAgent(S.curAgent);
+  document.body.classList.toggle('chatonly-mode', chatOnly);
+  $('#composer').style.display = '';
   const provs = providersFor(S.curAgent);
   const providerAgent = S.curAgent === 'zcode' ? 'claude' : S.curAgent;
   const current = S.settings.currentProvider || {};
-  const cur = s ? s.providerId : current[S.curAgent] || current[providerAgent] || '';
+  const implicit = chatOnly ? defaultProviderFor(S.curAgent) : null;
+  const cur = s ? s.providerId : current[S.curAgent] || current[providerAgent] || (implicit && implicit.id) || '';
   $('#selProvider').innerHTML = (S.curAgent === 'acp:workbuddy' ? '<option value="">WorkBuddy 内置配置</option>' : '<option value="">（默认供应商）</option>') + provs.map(p =>
-    `<option value="${esc(p.id)}" ${p.id === cur ? 'selected' : ''}>${esc(p.name)}${p.source === 'ccswitch' ? '' : ' *'}</option>`).join('');
+    `<option value="${esc(p.id)}" ${p.id === cur ? 'selected' : ''}>${esc(p.name)}${p.source === 'imported' ? '' : ' *'}</option>`).join('');
   const a = agentMeta(S.curAgent);
   const models = [...new Set([...(s && s.model ? [s.model] : []), ...(a.models || [])])];
   $('#inpModel').value = s ? (s.model || '') : '';
@@ -2074,10 +2310,17 @@ function renderComposer(s) {
     `<option value="${esc(h.id)}" ${s && s.remoteHostId === h.id ? 'selected' : ''}>🖥 ${esc(h.name)} (${esc(h.user)}@${esc(h.host)})</option>`).join('');
   // 内置 Agent 和 ACP 预设都在 AgentHub 本机进程里运行，没有 WSL/SSH
   // 入口；隐藏位置选择器，避免用户选到远程目录后被本机进程当作 cwd 使用。
-  const localOnlyAgent = S.curAgent === 'builtin' || String(S.curAgent || '').startsWith('acp:');
-  $('#pillRemote').style.display = (localOnlyAgent || !(S.hosts.length || (S.wsl && S.wsl.available))) ? 'none' : '';
+  const localOnlyAgent = S.curAgent === 'builtin'
+    || String(S.curAgent || '').startsWith('acp:')
+    || !!((S.settings && S.settings.customAgents) || []).find(c => c && c.id === S.curAgent && c.acp);
+  $('#pillRemote').style.display = (chatOnly || localOnlyAgent || !(S.hosts.length || (S.wsl && S.wsl.available))) ? 'none' : '';
   $('#inpCwd').value = s ? (s.cwd || '') : '';
   updateCwdBtn();
+  // 原始自定义 CLI、Gemini/OpenCode 等没有统一的权限参数；继续显示
+  // “自动/编辑/计划”会造成安全错觉，所以明确交给 Agent 自身控制。
+  $('#pillPerm').style.display = chatOnly ? 'none' : (permissionModeSupported(S.curAgent) ? '' : 'none');
+  $('#pillEffort').style.display = chatOnly ? 'none' : '';
+  $('#wsChip').style.display = chatOnly ? 'none' : '';
   loadPermMode(s);
   $('#selEffort').value = s ? (s.effort || '') : '';
   // #23：问过话的会话锁定工作目录/主机
@@ -2266,7 +2509,7 @@ function wsRenderCrumb() {
   crumb.innerHTML = '<span class="ws-crumb-seg" data-p="">⌂</span>' + segs.map((s, i) =>
     `<span class="ws-crumb-sep">›</span><span class="ws-crumb-seg ${i === segs.length - 1 ? 'ws-crumb-last' : ''}" data-p="${esc(s.path)}">${esc(s.name)}</span>`
   ).join('');
-  $$('.ws-crumb-seg[data-p]', crumb).forEach(el => el.onclick = () => wsSelect(el.dataset.p || ''));
+  $$('.ws-crumb-seg[data-p]', crumb).forEach(el => bindKeyboardAction(el, () => wsSelect(el.dataset.p || '')));
 }
 
 function wsNodeEl(node, depth) {
@@ -2276,18 +2519,20 @@ function wsNodeEl(node, depth) {
   el.className = 'ws-node has-children' + (wsTree.selected === node.path ? ' selected' : '');
   el.style.paddingLeft = (4 + depth * 16) + 'px';
   el.dataset.path = node.path;
+  el.setAttribute('aria-expanded', String(isOpen));
+  el.setAttribute('role', 'treeitem');
   el.innerHTML = `
     <span class="ws-node-chev ${isOpen ? 'open' : ''}">${UI_ICONS.chevron}</span>
     <span class="ws-node-ico">${node.drive ? UI_ICONS.cloud : node.special ? UI_ICONS.monitor : UI_ICONS.folder}</span>
     <span class="ws-node-name">${esc(node.name)}</span>`;
-  el.onclick = (e) => {
+  bindKeyboardAction(el, (e) => {
     if (e.target.closest('.ws-node-chev') && isOpen) {
       wsTree.expanded.delete(key);
       wsRenderTree();
       return;
     }
     wsSelect(node.path);
-  };
+  }, 'treeitem');
   const wrap = document.createElement('div');
   wrap.appendChild(el);
   const childBox = document.createElement('div');
@@ -2426,15 +2671,32 @@ function autoGrow() {
 }
 
 // ---------------- 弹窗框架 ----------------
+let dlgReturnFocus = null;
+function dlgFocusable() {
+  return $$('#dlg button:not([disabled]), #dlg [href], #dlg input:not([disabled]), #dlg select:not([disabled]), #dlg textarea:not([disabled]), #dlg [tabindex]:not([tabindex="-1"])')
+    .filter(el => el.offsetParent !== null || el === document.activeElement);
+}
 function openDlg(title, bodyHtml) {
+  const overlay = $('#overlay');
+  if (overlay.classList.contains('hidden')) dlgReturnFocus = document.activeElement;
   $('#dlgTitle').textContent = title;
   $('#dlgBody').innerHTML = bodyHtml;
-  $('#overlay').classList.remove('hidden');
+  overlay.classList.remove('hidden');
+  overlay.setAttribute('aria-hidden', 'false');
+  requestAnimationFrame(() => {
+    const first = dlgFocusable()[0] || $('#dlgClose');
+    if (first) first.focus();
+  });
 }
 function closeDlg() {
-  $('#overlay').classList.add('hidden');
+  const overlay = $('#overlay');
+  overlay.classList.add('hidden');
+  overlay.setAttribute('aria-hidden', 'true');
   Object.values(S.charts).forEach(c => { try { c.dispose(); } catch {} });
   S.charts = {};
+  const restore = dlgReturnFocus;
+  dlgReturnFocus = null;
+  if (restore && restore.isConnected && typeof restore.focus === 'function') requestAnimationFrame(() => restore.focus());
 }
 
 // ---------------- 会话用量明细 ----------------
@@ -2562,7 +2824,8 @@ async function undoFile(msgTs, idx) {
 function rawFileUrl(path, mode) {
   const s = curSession();
   const host = s && s.remoteHostId ? '&host=' + encodeURIComponent(s.remoteHostId) : '';
-  let u = '/api/fs/raw?path=' + encodeURIComponent(path) + host + (mode ? '&mode=' + mode : '');
+  const cwd = s && s.cwd ? '&cwd=' + encodeURIComponent(s.cwd) : '';
+  let u = '/api/fs/raw?path=' + encodeURIComponent(path) + host + cwd + (mode ? '&mode=' + mode : '');
   const t = storageGet('ah.token');
   if (t) u += '&token=' + encodeURIComponent(t);
   return u;
@@ -2717,7 +2980,7 @@ async function previewImageFile(path) {
   let host = '';
   if (s && s.remoteHostId) host = s.remoteHostId;
   try {
-    const r = await api('/api/fs/raw?path=' + encodeURIComponent(path) + (host ? '&host=' + encodeURIComponent(host) : ''));
+    const r = await api(rawFileUrl(path));
     openDlg('图片预览 · ' + baseName(path), `
       <div class="image-preview"><img src="${esc(r.dataUrl)}"></div>
       <div class="dialog-note preview-meta">${esc(path)} · ${(r.bytes / 1024).toFixed(0)} KB${host ? ' · ' + (host === 'wsl' ? 'WSL' : '远程') : ' · 本机'}</div>`);
@@ -2737,6 +3000,10 @@ async function rewindTo(msgTs) {
     s.messages = full.messages;
     renderMessages(full.messages);
     $('#inpText').value = r.text;
+    S.attachments = (Array.isArray(r.images) ? r.images : [])
+      .filter(i => i && typeof i === 'object' && i.path && i.url)
+      .map(i => ({ path: i.path, url: i.url }));
+    renderAttachments();
     autoGrow();
     $('#inpText').focus();
     toast('已回退到该消息，编辑后重新发送', 'ok');
@@ -2756,7 +3023,13 @@ async function regenerate(msgTs) {
     const full = await api('/api/sessions/' + encodeURIComponent(s.id));
     s.messages = full.messages;
     renderMessages(full.messages);
-    if (!wsSend({ type: 'chat', sessionId: s.id, text: request.text, images: request.images })) {
+    // 与 sendCurrent 相同的 outbox/clientId 保护：没有它，WS 在发送成功与
+    // 服务器 user-echo 之间断开时，这条重试消息会无提示地消失。
+    const clientId = newClientMessageId('m');
+    const sentImages = Array.isArray(request.images) ? request.images : [];
+    rememberOutbox({ clientId, kind: 'normal', sessionId: s.id, text: request.text, images: sentImages, el: null });
+    if (!wsSend({ type: 'chat', clientId, sessionId: s.id, text: request.text, images: sentImages })) {
+      S.outbox.delete(clientId);
       throw new Error('连接未就绪，重试消息已恢复到输入框');
     }
   } catch (e) {
@@ -2775,7 +3048,7 @@ async function regenerate(msgTs) {
 function safeHttpUrl(value) {
   try {
     const u = new URL(String(value || ''), location.href);
-    return /^https?:$/i.test(u.protocol) ? u.href : '';
+    return /^https?:$/i.test(u.protocol) && !u.username && !u.password ? u.href : '';
   } catch { return ''; }
 }
 function pageTokenQs() {
@@ -2805,13 +3078,17 @@ async function openPage(url) {
   const frame = $('#pageFrame');
   frame.removeAttribute('sandbox');
   frame.src = 'about:blank';
-  let framable = true;
+  let framable = false;
   try {
     const c = await api('/api/page/check?url=' + encodeURIComponent(url), { timeoutMs: 25000 });
     if (seq !== pageSeq) return; // 用户已经打开了别的页面
     if (c && c.finalUrl) { const fu = safeHttpUrl(c.finalUrl); if (fu) { url = fu; inp.value = fu; } }
     framable = !(c && c.framable === false);
-  } catch { if (seq !== pageSeq) return; }
+  } catch {
+    if (seq !== pageSeq) return;
+    fb.textContent = '网页地址未通过安全检查，请修改地址或点击右上角「↗ 新窗口」打开';
+    return;
+  }
   if (seq !== pageSeq) return;
   fb.classList.add('hidden');
   if (framable) {
@@ -2820,8 +3097,12 @@ async function openPage(url) {
       if (seq !== pageSeq) return;
       try {
         const doc = frame.contentDocument;
-        if (!doc || !doc.body || doc.body.childElementCount === 0 || !doc.body.textContent.trim()) {
-          fb.textContent = '该站点禁止内嵌显示，请点击右上角「↗ 新窗口」打开';
+        // 跨域 iframe 的 contentDocument 按浏览器安全策略会是 null，
+        // 这不代表页面加载失败；不能因此把所有正常网站误报成“禁止内嵌”。
+        // 只有同源且确实得到空文档时，才显示回退提示。真正的
+        // X-Frame-Options / CSP 拦截已经由 /api/page/check 分流到代理。
+        if (doc && (!doc.body || doc.body.childElementCount === 0 || !doc.body.textContent.trim())) {
+          fb.textContent = '网页没有返回可显示内容，请点击右上角「↗ 新窗口」打开';
           fb.classList.remove('hidden');
         }
       } catch { /* 跨域页面无法读取 DOM，保留 iframe */ }
@@ -2845,52 +3126,120 @@ function navigatePage(rawUrl) {
 function closePage() { pageSeq++; $('#pageDrawer').classList.add('hidden'); $('#pageFrame').src = 'about:blank'; }
 
 // ---------------- 供应商弹窗 ----------------
-let provTab = 'claude';
+let provTab = 'all';
+let provQuery = '';
 async function showProviders() {
   let providers;
   try { providers = await api('/api/providers?agent=all'); }
   catch (e) { return toast(e.message || '供应商列表加载失败', 'err'); }
   S.providers = Array.isArray(providers) ? providers : [];
-  const cc = await api('/api/ccswitch').catch(e => ({ error: e.message || 'cc-switch 状态读取失败' }));
   const agents = [...new Set(S.providers.map(p => p.agent))];
-  const tabs = ['claude', 'zcode', 'codex', ...agents.filter(a => !['claude', 'zcode', 'codex'].includes(a))];
-  const rows = S.providers.filter(p => p.agent === provTab || (provTab === 'zcode' && p.agent === 'claude'));
+  const tabs = ['all', 'claude', 'zcode', 'codex', 'builtin', ...agents.filter(a => !['claude', 'zcode', 'codex', 'builtin', 'chatgpt-web'].includes(a))];
+  const uniqueTabs = [...new Set(tabs)];
+  if (!uniqueTabs.includes(provTab)) provTab = 'all';
+  const rows = provTab === 'all' || provTab === 'builtin'
+    ? S.providers
+    : S.providers.filter(p => p.agent === provTab || (provTab === 'zcode' && p.agent === 'claude'));
+  const query = provQuery.trim().toLowerCase();
+  const providerAgent = provTab === 'zcode' ? 'claude' : provTab;
+  const currentProviderId = (S.settings.currentProvider || {})[providerAgent] || '';
+  const currentProvider = provTab === 'all' || provTab === 'builtin' ? null : rows.find(p => p.id === currentProviderId);
+  const cachedModelCount = rows.reduce((n, p) => n + ((p.models || []).length || 0), 0);
+  const matchingCount = rows.filter(p => [p.name, p.baseUrl, p.agent, agentMeta(p.agent).name, p.source].filter(Boolean).join(' ').toLowerCase().includes(query)).length;
+  const providerCountLabel = query ? `${matchingCount} / ${rows.length} 个入口` : `${rows.length} 个入口`;
+  const agentLabel = provTab === 'all' ? '全部 API' : agentMeta(provTab).name || provTab;
   const zcodeNote = provTab === 'zcode' ? `<div class="dialog-note dialog-note-top">ZCode 官方 CLI 使用 Anthropic 兼容协议，与 Claude 共用供应商列表</div>` : '';
-  const ccErr = cc.error ? `<div class="err-line dialog-note-top">⚠ ${esc(cc.error)}——供应商列表可能不完整</div>` : '';
-  openDlg('供应商 / 模型', `
-    ${ccErr}
-    <div class="tabs">${tabs.map(t => `<button class="tab ${t === provTab ? 'active' : ''}" data-tab="${esc(t)}">${esc(agentMeta(t).name || t)}</button>`).join('')}</div>
-    ${zcodeNote}
-    <table class="tbl"><thead><tr>
-      <th></th><th>名称</th><th>Base URL</th><th>密钥</th><th>模型数</th><th class="align-right">操作</th>
-    </tr></thead><tbody>
-    ${rows.map(p => `<tr data-pid="${esc(p.id)}">
-      <td><span class="star ${((S.settings.currentProvider || {})[p.agent] === p.id) ? '' : 'off'}" data-star="${esc(p.id)}" title="设为该 Agent 默认供应商">★</span></td>
-      <td><b>${esc(p.name)}</b>${p.isCurrent ? '<span class="tag tag-current">cc-switch 当前</span>' : ''}${p.source === 'manual' ? '<span class="tag">手动</span>' : ''}</td>
-      <td class="mono">${esc((p.baseUrl || '—').slice(0, 42))}</td>
-      <td class="mono">${esc(p.apiKey || '—')}</td>
-      <td class="mono">${(p.models || []).length || '—'}</td>
-      <td><div class="row-actions">
-        <button class="btn-mini" data-act="balance">查余额</button><span class="balance-cell"></span>
-        <button class="btn-mini" data-act="models">模型</button>
-        ${p.source === 'manual' ? `<button class="btn-mini" data-act="edit">编辑</button><button class="btn-mini" data-act="del">删除</button>` : ''}
-      </div></td>
-    </tr>`).join('')}
-    </tbody></table>
-    <div class="dialog-note dialog-note-bottom">「模型」拉取过的列表会自动缓存，发送栏的模型菜单里可直接选用；手动添加的供应商仅保存在本应用，不会写入 cc-switch。</div>
-    <div class="dialog-section">
-      <h4 class="dialog-section-title">手动添加供应商（仅本应用使用）</h4>
+  openDlg('API 管理', `
+    <div class="provider-dialog">
+      <div class="provider-intro">
+        <div class="provider-intro-copy">
+          <div class="provider-kicker">连接与路由</div>
+          <div class="provider-intro-title">${esc(agentLabel)} 供应商</div>
+          <div class="provider-intro-sub">管理 API 入口、默认路由和可用模型目录${currentProvider ? ` · 当前默认：${esc(currentProvider.name)}` : ' · 尚未设置默认供应商'}</div>
+        </div>
+        <div class="provider-summary" title="当前 Agent 的供应商与已缓存模型数量">
+          <b>${rows.length}</b><span>个入口</span><i></i><b>${cachedModelCount}</b><span>个已缓存模型</span>
+        </div>
+      </div>
+      <div class="tabs provider-tabs" role="tablist" aria-label="选择 Agent">${uniqueTabs.map(t => `<button class="tab ${t === provTab ? 'active' : ''}" data-tab="${esc(t)}" role="tab" aria-selected="${t === provTab ? 'true' : 'false'}">${esc(t === 'all' ? '全部 API' : agentMeta(t).name || t)}</button>`).join('')}</div>
+      ${zcodeNote}
+      <div class="provider-list-toolbar">
+        <div class="provider-list-heading"><b>已配置入口</b><span id="providerVisibleCount">${providerCountLabel}</span></div>
+        <label class="provider-search"><span class="provider-search-icon" aria-hidden="true">⌕</span><input id="providerFilter" value="${esc(provQuery)}" placeholder="搜索名称、地址或 Agent" autocomplete="off"><button type="button" class="provider-search-clear ${query ? '' : 'hidden'}" id="providerFilterClear" aria-label="清除搜索">×</button></label>
+      </div>
+      <div class="provider-list">
+      ${rows.length ? rows.map(p => {
+        const isDefault = (S.settings.currentProvider || {})[p.agent] === p.id;
+        const modelCount = (p.models || []).length;
+        const baseUrl = p.baseUrl || '—';
+        const apiKey = p.maskedKey || p.apiKey || '—';
+        const searchable = [p.name, p.baseUrl, p.agent, agentMeta(p.agent).name, p.source].filter(Boolean).join(' ').toLowerCase();
+        const matches = !query || searchable.includes(query);
+        return `<article class="provider-card ${isDefault ? 'is-default' : ''}${matches ? '' : ' filter-hidden'}" data-pid="${esc(p.id)}" data-search="${esc(searchable)}">
+          <div class="provider-card-head">
+            <div class="provider-identity">
+              <button class="provider-star star ${isDefault ? '' : 'off'}" data-star="${esc(p.id)}" title="${isDefault ? '取消该 Agent 的默认供应商' : '设为该 Agent 默认供应商'}" aria-label="${isDefault ? '取消默认供应商' : '设为默认供应商'}" aria-pressed="${isDefault ? 'true' : 'false'}">★</button>
+              <div class="provider-name-wrap">
+                <div class="provider-name-line"><b>${esc(p.name)}</b>${isDefault ? '<span class="tag tag-default">默认</span>' : ''}${p.isCurrent ? '<span class="tag tag-current">导入时当前</span>' : ''}${p.source === 'imported' ? '<span class="tag tag-current">已导入</span>' : '<span class="tag tag-manual">本地</span>'}</div>
+                <div class="provider-agent-label">${esc(agentMeta(p.agent).name || p.agent || agentLabel)}</div>
+              </div>
+            </div>
+            <div class="provider-model-count"><b>${modelCount || '—'}</b><span>${modelCount ? '个模型' : '未拉取模型'}</span></div>
+          </div>
+          <div class="provider-card-grid">
+            <div class="provider-field"><span class="provider-field-label">Base URL</span><div class="provider-copy-line"><span class="provider-field-value mono" title="${esc(baseUrl)}">${esc(baseUrl)}</span>${baseUrl !== '—' ? `<button type="button" class="provider-copy" data-provider-copy="${esc(baseUrl)}" title="复制 Base URL" aria-label="复制 Base URL">⧉</button>` : ''}</div></div>
+            <div class="provider-field"><span class="provider-field-label">API Key</span><div class="provider-copy-line"><span class="provider-field-value mono" title="出于安全原因只显示脱敏值">${esc(apiKey)}</span>${apiKey !== '—' ? '<span class="provider-secret-hint">已脱敏</span>' : ''}</div></div>
+            <div class="provider-field"><span class="provider-field-label">协议</span><span class="provider-field-value">${esc(p.protocol === 'anthropic' ? 'Anthropic' : p.protocol === 'openai' ? 'OpenAI 兼容' : '自动判断')}</span></div>
+            <div class="provider-field provider-balance-field"><span class="provider-field-label">余额</span><span class="balance-cell" aria-live="polite">—</span></div>
+          </div>
+          <div class="provider-card-foot"><div class="row-actions provider-actions">
+            <button class="btn-mini provider-action" data-act="balance">查余额</button>
+            <button class="btn-mini provider-action" data-act="models">查看模型</button>
+            ${p.managed !== false ? `<button class="btn-mini provider-action" data-act="edit">编辑</button><button class="btn-mini provider-action provider-delete" data-act="del">删除</button>` : ''}
+          </div></div>
+        </article>`;
+      }).join('') : '<div class="provider-empty"><span class="provider-empty-icon">⌁</span><b>还没有可用 API 入口</b><span>可以在下方添加一个仅供本应用使用的入口</span></div>'}
+      ${rows.length ? `<div id="providerFilterEmpty" class="provider-empty filter-empty ${matchingCount ? 'hidden' : ''}"><span class="provider-empty-icon">⌕</span><b>没有匹配的 API 入口</b><span>换个名称、地址或 Agent 关键词试试</span></div>` : ''}
+      </div>
+      <div class="provider-note dialog-note"><span class="provider-note-icon">i</span><span>「查看模型」拉取过的列表会自动缓存，发送栏的模型菜单可直接选用；所有 API 入口都由 AgentHub 独立保存和管理，不依赖 cc-switch。</span></div>
+      <div class="dialog-section provider-add-section">
+        <div class="provider-section-heading"><div><div class="provider-kicker">自定义连接</div><h4 class="dialog-section-title">添加 API 入口</h4></div><span>仅本应用使用</span></div>
       <div class="form-grid">
-        <div class="fld"><label>Agent</label><select id="npAgent">${S.agents.map(a => `<option value="${esc(a.id)}" ${a.id === provTab ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></div>
+        <div class="fld"><label>Agent</label><select id="npAgent">${S.agents.filter(a => !isChatOnlyAgent(a.id)).map(a => `<option value="${esc(a.id)}" ${a.id === (provTab === 'all' ? 'builtin' : provTab) ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></div>
         <div class="fld"><label>名称</label><input id="npName" placeholder="如 My Relay"></div>
         <div class="fld full"><label>Base URL</label><input id="npBase" placeholder="https://..."></div>
-        <div class="fld"><label>API Key</label><input id="npKey" placeholder="sk-..."></div>
+        <div class="fld"><label>API Key</label><input id="npKey" type="password" placeholder="sk-..."></div>
         <div class="fld"><label>默认模型（可选）</label><input id="npModel" placeholder="如 glm-4.7"></div>
+        <div class="fld"><label>协议（可选）</label><select id="npProtocol"><option value="">自动判断</option><option value="anthropic">Anthropic Messages</option><option value="openai">OpenAI 兼容</option></select></div>
       </div>
       <div class="dialog-actions"><button class="btn" id="npSave">添加</button></div>
+      </div>
     </div>
   `);
   $$('#dlgBody [data-tab]').forEach(b => b.onclick = () => { provTab = b.dataset.tab; showProviders(); });
+  const providerFilter = $('#providerFilter');
+  const providerFilterClear = $('#providerFilterClear');
+  if (providerFilter) {
+    providerFilter.oninput = () => {
+      provQuery = providerFilter.value.trim().toLowerCase();
+      let visible = 0;
+      $$('#dlgBody .provider-card').forEach(card => {
+        const hit = !provQuery || (card.dataset.search || '').includes(provQuery);
+        card.classList.toggle('filter-hidden', !hit);
+        if (hit) visible++;
+      });
+      const count = $('#providerVisibleCount');
+      if (count) count.textContent = provQuery ? `${visible} / ${rows.length} 个入口` : `${rows.length} 个入口`;
+      const noMatch = $('#providerFilterEmpty');
+      if (noMatch) noMatch.classList.toggle('hidden', visible > 0);
+      if (providerFilterClear) providerFilterClear.classList.toggle('hidden', !provQuery);
+    };
+  }
+  if (providerFilterClear) providerFilterClear.onclick = () => {
+    providerFilter.value = '';
+    providerFilter.dispatchEvent(new Event('input'));
+    providerFilter.focus();
+  };
   $$('#dlgBody [data-star]').forEach(el => el.onclick = async () => {
     const p = S.providers.find(x => x.id === el.dataset.star);
     if (!p) return;
@@ -2907,8 +3256,10 @@ async function showProviders() {
     }
   });
   $$('#dlgBody [data-act="balance"]').forEach(el => el.onclick = async () => {
-    const pid = el.closest('tr').dataset.pid;
-    const cell = el.closest('tr').querySelector('.balance-cell');
+    const card = el.closest('[data-pid]');
+    const pid = card.dataset.pid;
+    const cell = card.querySelector('.balance-cell');
+    el.disabled = true;
     cell.textContent = '查询中…';
     try {
       const r = await api('/api/providers/balance', { method: 'POST', body: { id: pid } });
@@ -2916,6 +3267,7 @@ async function showProviders() {
         ? `<span class="balance-ok">${esc(r.total)} ${esc(r.currency)}</span>${r.used ? `<div class="balance-no">已用 ${esc(r.used)}</div>` : ''}`
         : `<span class="balance-no" title="${esc(r.reason || '')}">不支持</span>`;
     } catch (e) { cell.innerHTML = `<span class="balance-no">${esc(e.message)}</span>`; }
+    finally { if (el.isConnected) el.disabled = false; }
   });
   // B9：模型列表改为事件委托 + data 属性（原内联 onclick 有注入/破引号风险）
   const dlgBody = $('#dlgBody');
@@ -2923,7 +3275,8 @@ async function showProviders() {
   const modelClickHandler = async (e) => {
     const mEl = e.target.closest('[data-act="models"]');
     if (mEl) {
-      const pid = mEl.closest('tr').dataset.pid;
+      const pid = mEl.closest('[data-pid]').dataset.pid;
+      mEl.disabled = true;
       mEl.textContent = '获取中';
       try {
         const r = await api('/api/providers/models', { method: 'POST', body: { id: pid } });
@@ -2941,12 +3294,21 @@ async function showProviders() {
           };
         } else toast(r.error || '获取失败', 'err');
       } catch (e2) { toast(e2.message, 'err'); }
-      mEl.textContent = '模型';
+      finally { mEl.textContent = '查看模型'; mEl.disabled = false; }
       return;
     }
     const copyEl = e.target.closest('.model-item[data-model]');
     if (copyEl) {
       navigator.clipboard.writeText(copyEl.dataset.model).then(() => toast('已复制', 'ok')).catch(() => {});
+      return;
+    }
+    const providerCopy = e.target.closest('[data-provider-copy]');
+    if (providerCopy) {
+      try {
+        if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') throw new Error('当前页面不支持复制');
+        await navigator.clipboard.writeText(providerCopy.dataset.providerCopy);
+        toast('已复制', 'ok');
+      } catch (e2) { toast(e2.message || '复制失败', 'err'); }
     }
   };
   dlgBody._modelClickHandler = modelClickHandler;
@@ -2954,24 +3316,25 @@ async function showProviders() {
   $$('#dlgBody [data-act="del"]').forEach(el => el.onclick = async () => {
     if (!confirm('删除该手动供应商？')) return;
     try {
-      await api('/api/providers/' + el.closest('tr').dataset.pid, { method: 'DELETE' });
+      await api('/api/providers/' + el.closest('[data-pid]').dataset.pid, { method: 'DELETE' });
       await refreshData(); showProviders(); renderComposer();
     } catch (e) { toast(e.message || '删除供应商失败', 'err'); }
   });
   $$('#dlgBody [data-act="edit"]').forEach(el => el.onclick = () => {
-    const p = S.providers.find(x => x.id === el.closest('tr').dataset.pid);
+    const p = S.providers.find(x => x.id === el.closest('[data-pid]').dataset.pid);
     openDlg('编辑供应商', `
-      <div class="form-grid">
+      <div class="provider-edit-form"><div class="form-grid">
         <div class="fld full"><label>名称</label><input id="epName" value="${esc(p.name)}"></div>
         <div class="fld full"><label>Base URL</label><input id="epBase" value="${esc(p.baseUrl)}"></div>
-        <div class="fld"><label>API Key（留空保持不变）</label><input id="epKey" placeholder="${esc(p.apiKey)}"></div>
+        <div class="fld"><label>API Key（留空保持不变）</label><input id="epKey" type="password" placeholder="${esc(p.maskedKey || p.apiKey)}"><label class="setting-check"><input id="epClearKey" type="checkbox"> 清除已保存 API Key</label></div>
         <div class="fld"><label>默认模型</label><input id="epModel" value="${esc(p.model)}"></div>
-      </div>
+        <div class="fld"><label>协议</label><select id="epProtocol"><option value="" ${!p.protocol ? 'selected' : ''}>自动判断</option><option value="anthropic" ${p.protocol === 'anthropic' ? 'selected' : ''}>Anthropic Messages</option><option value="openai" ${p.protocol === 'openai' ? 'selected' : ''}>OpenAI 兼容</option></select></div>
+      </div></div>
       <div class="dialog-actions"><button class="btn" id="epSave">保存</button></div>`);
     $('#epSave').onclick = async () => {
       try {
         await api('/api/providers/' + p.id, { method: 'PUT', body: {
-          name: $('#epName').value, baseUrl: $('#epBase').value, apiKey: $('#epKey').value, model: $('#epModel').value,
+          name: $('#epName').value, baseUrl: $('#epBase').value, apiKey: $('#epKey').value, clearApiKey: $('#epClearKey').checked, model: $('#epModel').value, protocol: $('#epProtocol').value,
         } });
         toast('已保存', 'ok');
         await refreshData(); showProviders(); renderComposer();
@@ -2982,7 +3345,7 @@ async function showProviders() {
     if (!$('#npName').value) return toast('请填写名称', 'err');
     try {
       await api('/api/providers', { method: 'POST', body: {
-        agent: $('#npAgent').value, name: $('#npName').value, baseUrl: $('#npBase').value, apiKey: $('#npKey').value, model: $('#npModel').value,
+        agent: $('#npAgent').value, name: $('#npName').value, baseUrl: $('#npBase').value, apiKey: $('#npKey').value, model: $('#npModel').value, protocol: $('#npProtocol').value,
       } });
       toast('已添加', 'ok');
       await refreshData(); showProviders(); renderComposer();
@@ -2990,12 +3353,85 @@ async function showProviders() {
   };
 }
 
-// ---------------- 用量统计（ZCode 版式：指标卡 + 热力图 + 趋势线 + 模型环形） ----------------
+// ---------------- 用量统计（指标卡 + 热力图 + 趋势 + Agent/模型层级明细） ----------------
 let statsFilter = { days: 30, agent: 'all', source: 'all' };
 let statsRange = 30;
-const CHART_PALETTE = ['#6f7bf7', '#3fb27f', '#e08a3c', '#c07ae0', '#56b6c2', '#e5636f'];
+let statsSelectedDate = null;
+const CHART_PALETTE = ['#6f7bf7', '#3fb27f', '#e08a3c', '#c07ae0', '#56b6c2', '#e5636f', '#7aa7ff', '#d4a64a'];
 
-function dayTokens(d) { return (d.input || 0) + (d.output || 0) + (d.cacheRead || 0) + (d.cacheCreate || 0); }
+function dayTokens(d) { return (Number(d && d.input) || 0) + (Number(d && d.output) || 0) + (Number(d && d.cacheRead) || 0) + (Number(d && d.cacheCreate) || 0); }
+function statsBlank() { return { requests: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, cost: 0 }; }
+function statsMerge(dst, src) {
+  for (const k of ['requests', 'input', 'output', 'cacheRead', 'cacheCreate', 'cost']) dst[k] = (Number(dst[k]) || 0) + (Number(src[k]) || 0);
+  return dst;
+}
+function statsPercent(n, total) { return total > 0 ? (Number(n || 0) / total * 100).toFixed(1) + '%' : '—'; }
+function fmtStatsCost(n) {
+  const v = Number(n) || 0;
+  return '$' + (v >= 100 ? v.toFixed(2) : v.toFixed(4));
+}
+function statsDateLabel(date) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ''));
+  return m ? m[1] + '年' + Number(m[2]) + '月' + Number(m[3]) + '日' : String(date || '当天');
+}
+function statsTokenSort(a, b) { return dayTokens(b) - dayTokens(a); }
+function statsRowsFromMap(map) { return map && typeof map === 'object' ? Object.values(map).filter(x => x && typeof x === 'object') : []; }
+function modelsFromAgents(agents) {
+  const map = {};
+  for (const a of agents || []) for (const m of statsRowsFromMap(a.models)) {
+    const key = m.model || 'unknown';
+    if (!map[key]) map[key] = { model: key, ...statsBlank() };
+    statsMerge(map[key], m);
+  }
+  return Object.values(map).sort(statsTokenSort);
+}
+function donutDataFromRows(rows, key, max = 8) {
+  const sorted = (rows || []).slice().sort(statsTokenSort);
+  const top = sorted.slice(0, max).map(r => ({ name: r[key] || 'unknown', value: dayTokens(r) })).filter(r => r.value > 0);
+  const rest = sorted.slice(max).reduce((n, r) => n + dayTokens(r), 0);
+  if (rest > 0) top.push({ name: '其他', value: rest });
+  return top;
+}
+function renderStatsDistribution(rows, key, total, empty = '暂无数据') {
+  const list = (rows || []).slice().sort(statsTokenSort);
+  if (!list.length) return '<div class="stats-empty">' + empty + '</div>';
+  const shown = list.slice(0, 12);
+  const html = shown.map((r, i) => {
+    const rawName = r[key] || 'unknown';
+    const name = key === 'agent' ? agentMeta(rawName).name
+      : key === 'source' ? (rawName === 'ccswitch' ? 'cc-switch' : rawName === 'scan' ? '历史扫描' : rawName === 'live' ? '实时' : rawName)
+      : rawName;
+    const tok = dayTokens(r);
+    return '<div class="mu-row stats-mu-row" title="' + esc(name) + '">' +
+      '<span class="mu-dot" style="background:' + CHART_PALETTE[i % CHART_PALETTE.length] + '"></span>' +
+      '<span class="mu-name">' + esc(name) + '</span>' +
+      '<span class="mu-tok">' + fmtWan(tok) + ' tokens · ' + fmtWan(r.requests || 0) + ' 次</span>' +
+      '<span class="mu-pct">' + statsPercent(tok, total) + '</span></div>';
+  }).join('');
+  return html + (list.length > shown.length ? '<div class="stats-more">其余 ' + (list.length - shown.length) + ' 项未展开</div>' : '');
+}
+function renderAgentModelBreakdown(agents, empty = '暂无 Agent 用量') {
+  const list = (agents || []).slice().sort(statsTokenSort);
+  if (!list.length) return '<div class="stats-empty">' + empty + '</div>';
+  return '<div class="agent-breakdown-list">' + list.slice(0, 24).map((a, ai) => {
+    const models = statsRowsFromMap(a.models).sort(statsTokenSort);
+    const total = dayTokens(a);
+    const agentName = agentMeta(a.agent || 'unknown').name;
+    const modelHtml = models.length ? models.map((m, mi) => {
+      const tok = dayTokens(m);
+      return '<div class="agent-model-row"><span class="agent-model-index">' + (mi + 1) + '</span>' +
+        '<span class="mu-name" title="' + esc(m.model || 'unknown') + '">' + esc(m.model || 'unknown') + '</span>' +
+        '<span class="agent-model-count">' + fmtWan(tok) + ' tokens</span>' +
+        '<span class="agent-model-pct">' + statsPercent(tok, total) + '</span></div>';
+    }).join('') : '<div class="stats-empty">该 Agent 暂无模型明细</div>';
+    return '<details class="agent-breakdown"' + (ai < 3 ? ' open' : '') + '><summary>' +
+      '<span class="mu-dot" style="background:' + CHART_PALETTE[ai % CHART_PALETTE.length] + '"></span>' +
+      '<span class="agent-breakdown-name" title="' + esc(agentName) + '">' + esc(agentName) + '</span>' +
+      '<span class="agent-breakdown-total">' + fmtWan(total) + ' tokens</span>' +
+      '<span class="agent-breakdown-req">' + fmtWan(a.requests || 0) + ' 次</span></summary>' +
+      '<div class="agent-model-list">' + modelHtml + '</div></details>';
+  }).join('') + (list.length > 24 ? '<div class="stats-more">其余 ' + (list.length - 24) + ' 个 Agent 未展开</div>' : '') + '</div>';
+}
 function locKey(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
 function calcStreaks(byDay) {
   const days = [...new Set(byDay.filter(d => dayTokens(d) > 0).map(d => d.date))].sort();
@@ -3012,6 +3448,45 @@ function calcStreaks(byDay) {
   if (!set.has(locKey(d))) d.setDate(d.getDate() - 1);
   while (set.has(locKey(d))) { cur++; d.setDate(d.getDate() - 1); }
   return { cur, longest };
+}
+function renderDailyDetail(day, date, details) {
+  const d = day || { date, ...statsBlank(), agents: {}, modelStats: {} };
+  const agents = statsRowsFromMap(d.agents).sort(statsTokenSort);
+  const models = statsRowsFromMap(d.modelStats).sort(statsTokenSort);
+  const modelRows = models.length ? models : modelsFromAgents(agents);
+  const total = dayTokens(d);
+  const prompt = (Number(d.input) || 0) + (Number(d.cacheRead) || 0);
+  const dayRows = (details || []).filter(r => r.date === date);
+  const shownRows = dayRows.slice(0, 200);
+  const sourceName = source => source === 'ccswitch' ? 'cc-switch' : source === 'scan' ? '历史扫描' : source === 'live' ? '实时' : (source || '未知');
+  const table = shownRows.length ? '<div class="stats-detail-table-wrap"><table class="tbl stats-detail-table"><thead><tr>' +
+    '<th>时间</th><th>Agent</th><th>模型</th><th>供应商</th><th>来源</th><th>请求</th><th>输入</th><th>输出</th><th>缓存</th><th>合计</th><th>费用</th>' +
+    '</tr></thead><tbody>' + shownRows.map(r => '<tr>' +
+      '<td class="mono">' + (r.ts ? fmtTime(r.ts) : '日报') + '</td><td>' + esc(r.agent || 'unknown') + '</td><td class="mono">' + esc(r.model || 'unknown') + '</td>' +
+      '<td>' + esc(r.provider || '未标注供应商') + '</td><td><span class="stats-source-tag">' + esc(sourceName(r.source)) + '</span></td>' +
+      '<td>' + fmtWan(r.requests || 0) + '</td><td>' + fmtWan(r.input || 0) + '</td><td>' + fmtWan(r.output || 0) + '</td>' +
+      '<td>' + fmtWan((r.cacheRead || 0) + (r.cacheCreate || 0)) + '</td><td><b>' + fmtWan(dayTokens(r)) + '</b></td><td class="mono">' + fmtStatsCost(r.cost) + '</td>' +
+      '</tr>').join('') + '</tbody></table></div>' :
+    '<div class="stats-empty stats-detail-empty">没有可展开的请求行；当前来源可能只提供按日汇总。</div>';
+  return '<section class="stats-day-detail" id="statsDayDetail">' +
+    '<div class="stats-day-head"><div><div class="box-title">' + esc(statsDateLabel(date)) + ' · 当天详情</div><div class="hm-hint">已按当前 Agent / 来源筛选</div></div>' +
+    '<button class="btn-mini" id="statsDayClear">收起详情</button></div>' +
+    '<div class="stats-mini-cards">' +
+      '<div><span>总 Token</span><b>' + fmtWan(total) + '</b></div>' +
+      '<div><span>请求次数</span><b>' + fmtWan(d.requests || 0) + '</b></div>' +
+      '<div><span>输入 / 输出</span><b>' + fmtWan(d.input || 0) + ' / ' + fmtWan(d.output || 0) + '</b></div>' +
+      '<div><span>缓存命中率</span><b>' + statsPercent(d.cacheRead, prompt) + '</b></div>' +
+      '<div><span>估算费用</span><b>' + fmtStatsCost(d.cost) + '</b></div>' +
+    '</div>' +
+    '<div class="stats-day-columns">' +
+      '<div class="stats-day-panel"><div class="stats-panel-title">Agent 分布</div><div class="mu-list">' + renderStatsDistribution(agents, 'agent', total) + '</div></div>' +
+      '<div class="stats-day-panel"><div class="stats-panel-title">模型分布</div><div class="mu-list">' + renderStatsDistribution(modelRows, 'model', total) + '</div></div>' +
+    '</div>' +
+    '<div class="stats-day-panel stats-day-agent-model"><div class="stats-panel-title">Agent → 模型</div>' + renderAgentModelBreakdown(agents) + '</div>' +
+    '<div class="stats-day-panel"><div class="stats-panel-title">请求明细 <span class="stats-panel-hint">' + (dayRows.length ? '共 ' + dayRows.length + ' 行' : '暂无明细') + '</span></div>' +
+      table + (dayRows.length > shownRows.length ? '<div class="stats-more">仅显示前 ' + shownRows.length + ' 行，其余记录已汇总在统计数字中。</div>' : '') +
+    '</div>' +
+  '</section>';
 }
 function buildHeatmap(byDay) {
   const map = new Map();
@@ -3036,7 +3511,7 @@ function buildHeatmap(byDay) {
     curWeek.push({ lv: lv(t), t, key, label: (d.getMonth() + 1) + '月' + d.getDate() + '日' });
   }
   const cells = weeks.map((w, wi) => w.map(c =>
-    `<div class="hm-cell l${c.lv}" title="${c.label} · ${c.t ? fmtWan(c.t) + ' tokens' : '无使用'}" data-col="${wi}"></div>`
+    `<div class="hm-cell l${c.lv}" title="${c.label} · ${c.t ? fmtWan(c.t) + ' tokens · 点击查看详情' : '无使用 · 点击查看当天'}" data-date="${esc(c.key)}" data-col="${wi}" role="button" tabindex="0" aria-label="${esc(c.label)}"></div>`
   ).join('')).join('');
   const labels = monthMarks.map(m => `<span class="hm-label" style="left:${m.col * 14}px">${esc(m.text)}</span>`).join('');
   return `<div class="hm-scroll"><div class="hm-inner" style="width:${weeks.length * 14}px">
@@ -3045,8 +3520,15 @@ function buildHeatmap(byDay) {
   </div></div>
   <div class="hm-legend"><span>少</span><i class="hm-cell l0"></i><i class="hm-cell l1"></i><i class="hm-cell l2"></i><i class="hm-cell l3"></i><i class="hm-cell l4"></i><span>多</span></div>`;
 }
+function selectStatsDay(date) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || '')) || !S._statsData) return;
+  statsSelectedDate = date;
+  renderStatsDlg();
+  requestAnimationFrame(() => document.getElementById('statsDayDetail')?.scrollIntoView({ block: 'start' }));
+}
 
 async function showStats() {
+  disposeStatsCharts();
   openDlg('用量统计', '<div class="loading-note">加载中…</div>');
   try {
     const [u, uToday, uAll] = await Promise.all([
@@ -3063,7 +3545,7 @@ async function showStats() {
   }
 }
 
-function renderStatsDlg() {
+function renderStatsDlgLegacy() {
   const { u, uToday, uAll } = S._statsData;
   const all = uAll || u;
   const allTok = dayTokens(all.totals);
@@ -3144,18 +3626,125 @@ function renderStatsDlg() {
     $('#stScan').textContent = '扫描中…';
     try {
       const r = await api('/api/usage/scan', { method: 'POST' });
-      toast(`扫描完成，新增 ${r.added} 条记录`, 'ok');
+      toast('扫描完成，新增 ' + r.added + ' 条记录', 'ok');
       showStats();
     } catch (e) { toast(e.message || '扫描失败', 'err'); }
     finally { if (document.getElementById('stScan')) document.getElementById('stScan').textContent = '扫描本地历史'; }
   };
   $('#stRefresh').onclick = showStats;
   $$('.seg-ctl [data-range]').forEach(b => b.onclick = () => { statsRange = +b.dataset.range; re(); });
-  drawTrendChart(days, trendModels);
-  drawDonut(donutData, totalModel);
+  ensureEcharts().then(() => {
+    drawTrendChart(days, trendModels);
+    drawDonut(donutData, totalModel);
+  }).catch(() => {});
 }
 
-function drawTrendChart(days, models) {
+function renderStatsDlg() {
+  const data = S._statsData || {};
+  const u = data.u;
+  if (!u) return;
+  const uToday = data.uToday;
+  const all = data.uAll || u;
+  const rangeTotals = u.totals || statsBlank();
+  const allTotals = all.totals || statsBlank();
+  const allDays = all.byDay || [];
+  const rangeDaysData = u.byDay || [];
+  const allTok = dayTokens(allTotals);
+  const mainTok = dayTokens(rangeTotals);
+  const peak = Math.max(0, ...allDays.map(dayTokens));
+  const todayTok = uToday ? dayTokens(uToday.totals) : 0;
+  const streaks = calcStreaks(allDays);
+  const activeDays = rangeDaysData.filter(d => dayTokens(d) > 0).length;
+  const cachePrompt = (Number(rangeTotals.input) || 0) + (Number(rangeTotals.cacheRead) || 0);
+  const cachePct = statsPercent(rangeTotals.cacheRead, cachePrompt);
+  const rangeCost = rangeTotals.cost || 0;
+  const allCost = allTotals.cost || 0;
+  const card = (label, value, sub) => '<div class="stat-card"><div class="sc-value">' + value + '</div><div class="sc-sub">' + sub + '</div><div class="sc-label stat-label-bottom">' + label + '</div></div>';
+  const cards = [
+    card('当前范围 Token', fmtWan(mainTok), '近 ' + statsFilter.days + ' 天 · ' + fmtWan(rangeTotals.requests || 0) + ' 次请求'),
+    card('当前范围请求', fmtWan(rangeTotals.requests || 0), '按回合 / 日报汇总计数'),
+    card('累计 Token', fmtWan(allTok), '含全部已扫描历史'),
+    card('估算费用', fmtStatsCost(allCost), '当前范围 ' + fmtStatsCost(rangeCost)),
+    card('今日', fmtWan(todayTok), (uToday ? fmtWan(uToday.totals.requests || 0) : 0) + ' 次请求'),
+    card('峰值单日', fmtWan(peak), '历史单日最高'),
+    card('缓存命中率', cachePct, '缓存读取 / 输入与缓存读取'),
+    card('活跃天数', activeDays + ' 天', '近 ' + statsFilter.days + ' 天'),
+    card('当前连续', streaks.cur + ' 天', '连续有用量记录'),
+    card('最长连续', streaks.longest + ' 天', '历史纪录'),
+  ].join('');
+  const heat = buildHeatmap(allDays);
+  const effectiveRange = Math.min(statsRange, statsFilter.days);
+  statsRange = effectiveRange || statsFilter.days;
+  const trendDays = rangeDaysData.slice(-statsRange);
+  const modelTotals = {};
+  for (const d of trendDays) for (const [m, t] of Object.entries(d.models || {})) modelTotals[m] = (modelTotals[m] || 0) + (Number(t) || 0);
+  const trendModels = Object.entries(modelTotals).sort((a, b) => b[1] - a[1]).slice(0, 6).map(e => e[0]);
+  const modelRows = (u.byModel || []).slice().sort(statsTokenSort);
+  const agentRows = (u.byAgent || []).slice().sort(statsTokenSort);
+  const providerRows = (u.byProvider || []).slice().sort(statsTokenSort);
+  const sourceRows = (u.bySource || []).slice().sort(statsTokenSort);
+  const modelTotal = modelRows.reduce((n, r) => n + dayTokens(r), 0);
+  const agentTotal = agentRows.reduce((n, r) => n + dayTokens(r), 0);
+  const modelDonut = donutDataFromRows(modelRows, 'model');
+  const agentDonut = donutDataFromRows(agentRows, 'agent');
+  const selectedDay = statsSelectedDate ? allDays.find(d => d.date === statsSelectedDate) : null;
+  const selectedDetails = statsSelectedDate && Array.isArray(all.details) ? all.details : [];
+  const dayDetail = statsSelectedDate ? renderDailyDetail(selectedDay, statsSelectedDate, selectedDetails) : '';
+  const rangeOptions = [...new Set([7, 30, statsFilter.days].filter(d => d <= statsFilter.days))].sort((a, b) => a - b);
+  const rangeButtons = rangeOptions.map(d => '<button data-range="' + d + '" ' + (statsRange === d ? 'class="on"' : '') + '>' + (d === statsFilter.days ? '全部范围' : '近 ' + d + ' 日') + '</button>').join('');
+  disposeStatsCharts();
+  openDlg('用量统计',
+    '<div class="stat-cards stats-overview-cards">' + cards + '</div>' +
+    '<div class="hm-box stats-scope-box"><div class="hm-head"><span class="box-title">Token 活动</span><span class="hm-hint">近一年 · 点击任意日期查看当天详情</span></div>' + heat + '</div>' +
+    dayDetail +
+    '<div class="hm-box"><div class="hm-head"><span class="box-title">每日 Token 趋势</span><div class="seg-ctl">' + rangeButtons + '</div></div><div class="chart chart-tall" id="chTrend"></div></div>' +
+    '<div class="stats-distribution-grid">' +
+      '<div class="hm-box stats-dist-box"><div class="hm-head"><span class="box-title">Agent 分布</span><span class="hm-hint">当前范围</span></div><div class="stats-donut-layout"><div id="chAgentDonut" class="donut-chart stats-donut"></div><div class="mu-list stats-dist-list">' + renderStatsDistribution(agentRows, 'agent', agentTotal) + '</div></div></div>' +
+      '<div class="hm-box stats-dist-box"><div class="hm-head"><span class="box-title">模型分布</span><span class="hm-hint">当前范围</span></div><div class="stats-donut-layout"><div id="chModelDonut" class="donut-chart stats-donut"></div><div class="mu-list stats-dist-list">' + renderStatsDistribution(modelRows, 'model', modelTotal) + '</div></div></div>' +
+    '</div>' +
+    '<div class="hm-box stats-agent-model-box"><div class="hm-head"><span class="box-title">Agent → 模型分布</span><span class="hm-hint">展开 Agent 查看其内部模型比例</span></div>' + renderAgentModelBreakdown(agentRows, '当前范围暂无 Agent 用量') + '</div>' +
+    '<div class="stats-provider-grid">' +
+      '<div class="hm-box stats-provider-box"><div class="hm-head"><span class="box-title">供应商分布</span><span class="hm-hint">核对实际走的渠道</span></div><div class="mu-list">' + renderStatsDistribution(providerRows, 'provider', providerRows.reduce((n, r) => n + dayTokens(r), 0), '暂无供应商记录') + '</div></div>' +
+      '<div class="hm-box stats-provider-box"><div class="hm-head"><span class="box-title">数据来源</span><span class="hm-hint">区分实时与日报</span></div><div class="mu-list">' + renderStatsDistribution(sourceRows, 'source', sourceRows.reduce((n, r) => n + dayTokens(r), 0), '暂无来源记录') + '</div></div>' +
+    '</div>' +
+    '<div class="toolbar stats-toolbar">' +
+      '<select id="stDays">' + [1, 7, 30, 90, 365].map(d => '<option value="' + d + '" ' + (d == statsFilter.days ? 'selected' : '') + '>统计范围：' + (d === 1 ? '今天' : '近 ' + d + ' 天') + '</option>').join('') + '</select>' +
+      '<select id="stAgent"><option value="all">全部 Agent</option>' + S.agents.map(a => '<option value="' + esc(a.id) + '" ' + (a.id === statsFilter.agent ? 'selected' : '') + '>' + esc(a.name) + '</option>').join('') + '</select>' +
+      '<select id="stSource"><option value="all" ' + (statsFilter.source === 'all' ? 'selected' : '') + '>全部来源</option><option value="ccswitch" ' + (statsFilter.source === 'ccswitch' ? 'selected' : '') + '>cc-switch 代理</option><option value="local" ' + (statsFilter.source === 'local' ? 'selected' : '') + '>本机（实时 + 扫描）</option></select>' +
+      '<button class="btn-mini" id="stScan" title="扫描 ~/.claude ~/.codex ~/.zcode 的会话记录补全本地统计">扫描本地历史</button><span class="flex-spacer"></span><button class="btn ghost stats-refresh" id="stRefresh">↻ 刷新</button>' +
+    '</div>' +
+    '<div class="stats-footnote">来源：' + ((u.sources || []).join(' / ') || '无数据') + ' · 当前范围估算费用 ' + fmtStatsCost(rangeCost) + ' · Token 包含输入、输出、缓存读取、缓存写入</div>'
+  );
+  $$('.hm-cell[data-date]').forEach(cell => {
+    const pick = () => selectStatsDay(cell.dataset.date);
+    cell.onclick = pick;
+    cell.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } };
+    if (cell.dataset.date === statsSelectedDate) cell.classList.add('hm-selected');
+  });
+  const clearDay = $('#statsDayClear');
+  if (clearDay) clearDay.onclick = () => { statsSelectedDate = null; renderStatsDlg(); };
+  $('#stDays').onchange = e => { statsFilter.days = +e.target.value; statsRange = Math.min(statsRange, statsFilter.days); showStats(); };
+  $('#stAgent').onchange = e => { statsFilter.agent = e.target.value; showStats(); };
+  $('#stSource').onchange = e => { statsFilter.source = e.target.value; showStats(); };
+  $('#stScan').onclick = async () => {
+    $('#stScan').textContent = '扫描中…';
+    try {
+      const r = await api('/api/usage/scan', { method: 'POST' });
+      toast('扫描完成，新增 ' + r.added + ' 条记录', 'ok');
+      showStats();
+    } catch (e) { toast(e.message || '扫描失败', 'err'); }
+    finally { if (document.getElementById('stScan')) document.getElementById('stScan').textContent = '扫描本地历史'; }
+  };
+  $('#stRefresh').onclick = showStats;
+  $$('.seg-ctl [data-range]').forEach(b => b.onclick = () => { statsRange = +b.dataset.range; renderStatsDlg(); });
+  ensureEcharts().then(() => {
+    drawTrendChart(trendDays, trendModels);
+    drawDonut('chAgentDonut', agentDonut, agentTotal || mainTok);
+    drawDonut('chModelDonut', modelDonut, modelTotal || mainTok);
+  }).catch(() => {});
+}
+
+function drawTrendChartLegacy(days, models) {
   const el = $('#chTrend');
   if (!el || !window.echarts) return;
   Object.values(S.charts).forEach(c => { try { c.dispose(); } catch {} });
@@ -3178,7 +3767,7 @@ function drawTrendChart(days, models) {
   });
 }
 
-function drawDonut(data, total) {
+function drawDonutLegacy(data, total) {
   const el = $('#chDonut');
   if (!el || !window.echarts) return;
   const c = echarts.init(el); S.charts.donut = c;
@@ -3190,6 +3779,70 @@ function drawDonut(data, total) {
       label: { show: false },
       itemStyle: { borderRadius: 4, borderWidth: 2, borderColor: 'transparent' },
       data: data.map((r, i) => ({ ...r, itemStyle: { color: CHART_PALETTE[i % CHART_PALETTE.length] } })),
+    }],
+    graphic: [{
+      type: 'text', left: 'center', top: '42%',
+      style: { text: fmtWan(total), textAlign: 'center', fill: '#9ba1ad', fontSize: 20, fontWeight: 700 },
+    }, {
+      type: 'text', left: 'center', top: '54%',
+      style: { text: 'tokens', textAlign: 'center', fill: '#9ba1ad', fontSize: 11 },
+    }],
+  });
+}
+
+function disposeStatsCharts() {
+  for (const c of Object.values(S.charts || {})) { try { c.dispose(); } catch {} }
+  S.charts = {};
+}
+function drawTrendChart(days, models) {
+  const el = $('#chTrend');
+  const list = models || [];
+  if (!el) return;
+  if (!window.echarts || !list.length) {
+    el.innerHTML = '<div class="stats-chart-empty">暂无趋势数据</div>';
+    return;
+  }
+  if (S.charts && S.charts.trend) { try { S.charts.trend.dispose(); } catch {} }
+  const c = echarts.init(el); S.charts.trend = c;
+  const axisColor = '#9ba1ad';
+  const splitColor = 'rgba(128,128,160,.15)';
+  c.setOption({
+    backgroundColor: 'transparent',
+    tooltip: { trigger: 'axis', valueFormatter: v => fmtWan(v) },
+    legend: { top: 0, type: 'scroll', textStyle: { color: axisColor, fontSize: 11 }, icon: 'circle', itemWidth: 8, itemHeight: 8 },
+    grid: { left: 50, right: 12, top: 32, bottom: 26 },
+    xAxis: { type: 'category', boundaryGap: false, data: (days || []).map(d => (d.date || '').slice(5)), axisLine: { lineStyle: { color: splitColor } }, axisLabel: { color: axisColor, fontSize: 10.5 } },
+    yAxis: { type: 'value', splitLine: { lineStyle: { color: splitColor } }, axisLabel: { color: axisColor, fontSize: 10.5, formatter: v => fmtWan(v) } },
+    series: list.map((m, i) => ({
+      name: m, type: 'line', smooth: true, showSymbol: false, lineStyle: { width: 2.2 },
+      itemStyle: { color: CHART_PALETTE[i % CHART_PALETTE.length] },
+      data: (days || []).map(d => (d.models || {})[m] || 0),
+    })),
+  });
+  c.on('click', p => {
+    const point = Array.isArray(p) ? p[0] : p;
+    const d = (days || [])[point && point.dataIndex];
+    if (d && d.date) selectStatsDay(d.date);
+  });
+}
+function drawDonut(id, data, total) {
+  const el = $('#' + id);
+  const list = data || [];
+  if (!el) return;
+  if (S.charts && S.charts[id]) { try { S.charts[id].dispose(); } catch {} delete S.charts[id]; }
+  if (!window.echarts || !list.length) {
+    el.innerHTML = '<div class="stats-chart-empty">暂无数据</div>';
+    return;
+  }
+  const c = echarts.init(el); S.charts[id] = c;
+  c.setOption({
+    backgroundColor: 'transparent',
+    tooltip: { valueFormatter: v => fmtWan(v) + ' tokens' },
+    series: [{
+      type: 'pie', radius: ['62%', '82%'], center: ['50%', '50%'],
+      label: { show: false },
+      itemStyle: { borderRadius: 4, borderWidth: 2, borderColor: 'transparent' },
+      data: list.map((r, i) => ({ ...r, itemStyle: { color: CHART_PALETTE[i % CHART_PALETTE.length] } })),
     }],
     graphic: [{
       type: 'text', left: 'center', top: '42%',
@@ -3238,9 +3891,10 @@ async function showSSH() {
         <div class="fld"><label>主机</label><input id="shHost" placeholder="1.2.3.4"></div>
         <div class="fld"><label>端口</label><input id="shPort" value="22"></div>
         <div class="fld"><label>用户名</label><input id="shUser"></div>
-        <div class="fld"><label>认证方式</label><select id="shAuth"><option value="password">密码</option><option value="key">私钥</option><option value="agent">SSH Agent</option></select></div>
-        <div class="fld"><label>密码</label><input id="shPass" type="password"></div>
-        <div class="fld full"><label>私钥内容（选择私钥认证时填写）</label><textarea id="shKey" rows="3" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></div>
+         <div class="fld"><label>认证方式</label><select id="shAuth"><option value="password">密码</option><option value="key">私钥</option><option value="agent">SSH Agent</option></select></div>
+         <div class="fld"><label>密码</label><input id="shPass" type="password"></div>
+         <div class="fld"><label>私钥口令</label><input id="shPhrase" type="password" placeholder="可选"></div>
+         <div class="fld full"><label>私钥内容（选择私钥认证时填写）</label><textarea id="shKey" rows="3" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></div>
       </div>
       <div class="dialog-actions"><button class="btn" id="shSave">添加</button></div>
     </div>
@@ -3303,8 +3957,9 @@ async function showSSH() {
   $$('#dlgBody [data-act="edit"]').forEach(el => el.onclick = () => {
     const h = S.hosts.find(x => x.id === el.closest('tr').dataset.hid);
     $('#shName').value = h.name; $('#shHost').value = h.host; $('#shPort').value = h.port || 22;
-    $('#shUser').value = h.user; $('#shAuth').value = h.authType;
-    $('#shPass').value = h.password || '';
+     $('#shUser').value = h.user; $('#shAuth').value = h.authType;
+     $('#shPass').value = h.password || '';
+     $('#shPhrase').value = h.passphrase || '';
     // 私钥和密码一样，编辑其它字段时必须把“已保存”标记传回服务端；
     // 之前把私钥掩码改成空字符串，会在保存主机时意外清掉现有私钥。
     $('#shKey').value = h.privateKey === '(已存)' ? '(已存)' : (h.privateKey || '');
@@ -3313,7 +3968,7 @@ async function showSSH() {
       try {
         await api('/api/ssh/hosts', { method: 'POST', body: {
           id: h.id, name: $('#shName').value, host: $('#shHost').value, port: $('#shPort').value,
-          user: $('#shUser').value, authType: $('#shAuth').value, password: $('#shPass').value, privateKey: $('#shKey').value,
+           user: $('#shUser').value, authType: $('#shAuth').value, password: $('#shPass').value, passphrase: $('#shPhrase').value, privateKey: $('#shKey').value,
         } });
         toast('已保存', 'ok');
         await refreshData(); showSSH(); renderComposer();
@@ -3325,7 +3980,7 @@ async function showSSH() {
     try {
       await api('/api/ssh/hosts', { method: 'POST', body: {
         name: $('#shName').value || $('#shHost').value, host: $('#shHost').value, port: $('#shPort').value,
-        user: $('#shUser').value, authType: $('#shAuth').value, password: $('#shPass').value, privateKey: $('#shKey').value,
+         user: $('#shUser').value, authType: $('#shAuth').value, password: $('#shPass').value, passphrase: $('#shPhrase').value, privateKey: $('#shKey').value,
       } });
       toast('已添加', 'ok');
       await refreshData(); showSSH(); renderComposer();
@@ -3349,8 +4004,7 @@ function initTermResize() {
     const up = () => {
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
-      const t = S.terms.get(S.termActiveKey);
-      if (t) try { t.fit.fit(); } catch {}
+      syncTermSize(S.termActiveKey);
     };
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
@@ -3379,6 +4033,15 @@ function refreshTermThemes() {
 S.terms = new Map();
 let termActiveKey = null;
 
+function syncTermSize(key) {
+  const t = S.terms.get(key);
+  if (!t) return;
+  try { t.fit.fit(); } catch {}
+  if (t.term && Number.isFinite(t.term.cols) && Number.isFinite(t.term.rows)) {
+    wsSend({ type: 'term.resize', hostId: key, cols: t.term.cols, rows: t.term.rows });
+  }
+}
+
 function hideTermPanel() { document.getElementById('termPanel').classList.add('hidden'); }
 function termPanelShow(show) {
   document.getElementById('termPanel').classList.toggle('hidden', !show);
@@ -3406,16 +4069,21 @@ function activateTerm(key) {
   S.termActiveKey = key;
   $$('#termContainer .term-pane').forEach(p => p.classList.add('hidden'));
   t.pane.classList.remove('hidden');
-  try { t.fit.fit(); } catch {}
+  syncTermSize(key);
   t.term.focus();
   renderTermTabs();
   wsSend({ type: 'term.active', key });
 }
 
-function openTerm(key, name) {
+let _termLibPending = null;
+async function openTerm(key, name) {
   document.getElementById('termPanel').classList.remove('hidden');
   const savedH = Number(storageGet('ah.termH'));
   if (savedH) document.getElementById('termPanel').style.height = savedH + 'px';
+  if (S.terms.has(key)) { activateTerm(key); return; }
+  // xterm 按需加载；加载未完成时重复点击不能创建出重复终端
+  if (!_termLibPending) _termLibPending = ensureXterm().finally(() => { _termLibPending = null; });
+  try { await _termLibPending; } catch { toast('终端组件加载失败', 'err'); return; }
   if (S.terms.has(key)) { activateTerm(key); return; }
   const pane = document.createElement('div');
   pane.className = 'term-pane';
@@ -3627,17 +4295,42 @@ function updateCtxMeter() {
 
 function editCtxWindow() {
   const c = effectiveCtx();
+  const currentK = Math.max(1, Math.round(c.max / 1000));
+  const presets = [...new Set([32, 64, 128, 200, 256, 512, currentK])].sort((a, b) => a - b);
   openDlg('上下文窗口大小', `
-    <div class="dialog-note dialog-note-top">模型：${esc(c.model || '（未指定）')} · 当前窗口按 ${fmtTok(c.max)} tokens 估算</div>
-    <div class="form-grid">
-      <div class="fld"><label>窗口大小（K tokens）</label><input id="cwK" value="${Math.round(c.max / 1000)}" inputmode="numeric"></div>
+    <div class="ctx-edit-dialog">
+      <div class="ctx-edit-summary">
+        <div class="ctx-edit-glyph">↗</div>
+        <div class="ctx-edit-copy">
+          <div class="ctx-edit-kicker">CONTEXT WINDOW</div>
+          <div class="ctx-edit-model" title="${esc(c.model || '（未指定）')}">${esc(c.model || '（未指定模型）')}</div>
+          <div class="ctx-edit-sub">当前按 ${fmtTok(c.max)} tokens 估算 · 仅影响本应用的容量显示</div>
+        </div>
+        <div class="ctx-edit-stat"><b>${fmtWan(c.max)}</b><span>tokens</span></div>
+      </div>
+      <div class="ctx-edit-field">
+        <div class="ctx-edit-field-head"><label for="cwK">窗口大小</label><span>以 K tokens 为单位</span></div>
+        <div class="ctx-input-wrap"><input id="cwK" value="${currentK}" inputmode="numeric" type="number" min="1" step="1" aria-describedby="cwHint"><span>K tokens</span></div>
+        <div class="ctx-presets" aria-label="常用窗口大小">${presets.map(k => `<button type="button" class="ctx-preset ${k === currentK ? 'active' : ''}" data-cwpreset="${k}">${k}K</button>`).join('')}</div>
+        <div id="cwHint" class="ctx-edit-hint">如果 Agent 没有返回窗口上限，可以在这里填写该模型的实际容量，用于进度和占用估算。</div>
+      </div>
+      <div class="dialog-actions ctx-edit-actions"><span>修改后会立即更新当前会话顶部的上下文指示器</span><button class="btn" id="cwSave">保存</button></div>
     </div>
-    <div class="dialog-actions"><button class="btn" id="cwSave">保存</button></div>
   `);
-  $('#cwK').focus(); $('#cwK').select();
+  const input = $('#cwK');
+  input.focus(); input.select();
+  $$('#dlgBody [data-cwpreset]').forEach(btn => btn.onclick = () => {
+    input.value = btn.dataset.cwpreset;
+    $$('#dlgBody [data-cwpreset]').forEach(x => x.classList.toggle('active', x === btn));
+    input.focus();
+  });
+  input.oninput = () => $$('#dlgBody [data-cwpreset]').forEach(btn => btn.classList.toggle('active', btn.dataset.cwpreset === input.value));
   const save = async () => {
-    const k = Number($('#cwK').value);
+    if (save.busy) return;
+    const k = Number(input.value);
     if (!k || k <= 0) return toast('请输入有效的 K 数值', 'err');
+    save.busy = true;
+    const saveBtn = $('#cwSave'); if (saveBtn) saveBtn.disabled = true;
     S.settings.contextWindows = S.settings.contextWindows || {};
     if (c.model) S.settings.contextWindows[c.model] = k * 1000;
     try {
@@ -3647,6 +4340,10 @@ function editCtxWindow() {
       updateCtxMeter();
       renderHeader();
     } catch (e) { toast(e.message, 'err'); }
+    finally {
+      save.busy = false;
+      if (saveBtn && saveBtn.isConnected) saveBtn.disabled = false;
+    }
   };
   $('#cwSave').onclick = save;
   $('#cwK').addEventListener('keydown', e => { if (e.key === 'Enter') save(); });
@@ -3729,13 +4426,18 @@ function openFlyMenu(anchor, items, onItem) {
       if (!e.target.closest('#flyMenu') && !e.target.closest('.ctrl-menu')) flyMenuEl.classList.add('hidden');
     });
   }
+  flyMenuEl.setAttribute('role', 'menu');
   flyMenuEl.innerHTML = items.map((it, i) =>
     it.header ? '<div class="fly-group">' + esc(it.label) + '</div>'
     : '<div class="fly-item' + (it.on ? ' dd-on' : '') + '" data-i="' + i + '">' + esc(it.label) + '</div>'
   ).join('');
   const real = items.filter(it => !it.header);
   Array.from(flyMenuEl.querySelectorAll('.fly-item')).forEach((el, idx) => {
-    el.onclick = () => { closeFlyMenu(); onItem && onItem(real[idx]); };
+    el.setAttribute('role', 'menuitem');
+    el.tabIndex = 0;
+    const choose = () => { closeFlyMenu(); onItem && onItem(real[idx]); };
+    el.onclick = choose;
+    el.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choose(); } };
   });
   flyMenuEl.classList.remove('hidden');
   const r = anchor.getBoundingClientRect();
@@ -3750,6 +4452,7 @@ function openFlyMenu(anchor, items, onItem) {
     flyMenuEl.style.top = Math.max(8, top) + 'px';
     flyMenuEl.style.bottom = 'auto';
     flyMenuEl.style.visibility = 'visible';
+    flyMenuEl.querySelector('.fly-item')?.focus();
   });
 }
 function selText(sel) {
@@ -3777,17 +4480,17 @@ function syncMenuChips() {
   if (permLbl) permLbl.textContent = { auto: '自动', edits: '编辑', plan: '计划', ask: '询问' }[curPermMode()] || '自动';
   const inp = document.getElementById('inpModel');
   const ml = document.getElementById('modelLabel');
-  if (ml) ml.textContent = inp.value || 'CLI 默认';
+  if (ml) ml.textContent = inp.value || (S.curAgent === 'builtin' || isChatOnlyAgent(S.curAgent) ? 'API 默认' : 'CLI 默认');
   // #11：没显式选供应商时，芯片显示真实默认供应商名（而不是"跟随系统配置"）
   const s = curSession();
   const selP = document.getElementById('selProvider');
-  if (S.curAgent === 'acp:workbuddy') {
+    if (S.curAgent === 'acp:workbuddy') {
     const lab = document.getElementById('providerLabel');
     if (lab) lab.textContent = 'WorkBuddy 内置';
   } else if ((!s || !s.providerId) && selP && !selP.value) {
     const dp = defaultProviderFor(S.curAgent);
     const lab = document.getElementById('providerLabel');
-    if (lab) lab.textContent = dp ? dp.name + ' ·默认' : '未配置（cc-switch）';
+    if (lab) lab.textContent = dp ? dp.name + ' ·默认' : '未配置 API';
   }
 }
 
@@ -3817,6 +4520,7 @@ function newTaskInContext() {
     remoteHostId: cur ? (cur.remoteHostId || '') : '',
     cwd: cur ? (cur.cwd || '') : '',
     autoPerms: cur ? !!cur.autoPerms : true,
+    permMode: cur ? effectivePermMode(cur) : curPermMode(),
     effort: cur ? (cur.effort || '') : '',
   };
   api('/api/sessions', { method: 'POST', body }).then(async (s) => {
@@ -3977,8 +4681,14 @@ async function showScheduled() {
     toast(e.message || '定时任务加载失败', 'err');
     return;
   }
+  const currentSessionId = S.curSessionId;
+  const eligibleSessions = S.sessions.filter(s => effectivePermMode(s) === 'auto' && permissionModeSupported(s.agent));
+  const sessionOptions = eligibleSessions.map(s => {
+    const location = s.remoteHostId ? hostName(s) : '本机';
+    return `<option value="${esc(s.id)}"${s.id === currentSessionId ? ' selected' : ''}>${esc(s.title)}（${esc(agentMeta(s.agent).name)} · ${esc(location)} · 自动权限）</option>`;
+  }).join('') || '<option value="">暂无自动权限会话</option>';
   openDlg('定时任务', `
-    <div class="dialog-note dialog-note-top">到点后自动向指定会话发送提示词（会话忙时自动跳过）。</div>
+    <div class="dialog-note dialog-note-top">到点后自动向指定会话发送提示词（会话忙时自动跳过）。仅支持自动权限会话；需要人工授权或提问的会话会被拒绝并记录结果。</div>
     ${tasks.length ? `<table class="tbl"><thead><tr><th>状态</th><th>频率</th><th>提示词</th><th>会话</th><th>上次</th><th></th></tr></thead><tbody>${tasks.map(t => `
       <tr data-tid="${esc(t.id)}">
         <td><input type="checkbox" data-tenable="${esc(t.id)}" ${t.enabled ? 'checked' : ''}></td>
@@ -3994,7 +4704,7 @@ async function showScheduled() {
     <div class="dialog-section">
       <h4 class="dialog-section-title">新建任务</h4>
       <div class="form-grid">
-        <div class="fld full"><label>会话</label><select id="stSess">${S.sessions.map(s => `<option value="${esc(s.id)}">${esc(s.title)}（${esc(agentMeta(s.agent).name)}）</option>`).join('')}</select></div>
+        <div class="fld full"><label>会话</label><select id="stSess">${sessionOptions}</select></div>
         <div class="fld"><label>频率</label><select id="stKind"><option value="interval">每隔 N 分钟</option><option value="daily">每天定时</option></select></div>
         <div class="fld"><label>数值</label><input id="stVal" placeholder="如 30 或 09:00"></div>
         <div class="fld full"><label>提示词</label><textarea id="stPrompt" rows="3" placeholder="到点发送给该会话的内容"></textarea></div>
@@ -4032,8 +4742,10 @@ async function showScheduled() {
   };
   document.getElementById('stAdd').onclick = async () => {
     try {
+      const sessionId = document.getElementById('stSess').value;
+      if (!sessionId || !eligibleSessions.some(s => s.id === sessionId)) throw new Error('请选择自动权限会话');
       await api('/api/scheduled', { method: 'POST', body: {
-        sessionId: document.getElementById('stSess').value,
+        sessionId,
         prompt: document.getElementById('stPrompt').value,
         kind: document.getElementById('stKind').value,
         minutes: document.getElementById('stKind').value === 'interval' ? +document.getElementById('stVal').value : undefined,
@@ -4052,7 +4764,7 @@ function paletteCommandsFor() {
     { key: 'Alt+N', label: '新建任务（继承当前项目）', run: () => newTaskInContext() },
     { key: 'Ctrl+K', label: '搜索会话 / 消息', run: () => { $('#searchBox').focus(); $('#searchBox').select(); } },
     { label: '打开 用量统计', run: () => showStats() },
-    { label: '打开 供应商 / 模型', run: () => showProviders() },
+    { label: '打开 API 管理', run: () => showProviders() },
     { label: '打开 SSH 主机', run: () => showSSH() },
     { label: '打开 定时任务', run: () => showScheduled() },
     { label: '打开 归档会话', run: () => showArchivedSessions() },
@@ -4060,10 +4772,8 @@ function paletteCommandsFor() {
     { label: '打开 设置', run: () => showSettings() },
     { label: '打开 终端', run: () => openTerm('local', '本机终端') },
     { label: '导出当前会话 Markdown', run: () => exportSession() },
-    { label: '切换主题：墨夜', run: () => applyTheme('ink') },
-    { label: '切换主题：纸白', run: () => applyTheme('paper') },
-    { label: '切换主题：暖阳', run: () => applyTheme('cottage') },
-    { label: '切换主题：晨林', run: () => applyTheme('forest') },
+    // 与主题菜单（THEMES）保持同一份列表，避免面板里少列主题
+    ...THEMES.map(t => ({ label: '切换主题：' + t.name, run: () => applyTheme(t.id) })),
   ];
   for (const ag of S.agents) cmds.push({ label: '切换到 ' + ag.name, run: () => switchAgent(ag.id) });
   return cmds;
@@ -4072,16 +4782,27 @@ function toggleSidebar(force) {
   const open = force === undefined ? !document.body.classList.contains('sidebar-open') : !!force;
   document.body.classList.toggle('sidebar-open', open);
   const btn = document.getElementById('sbToggle');
-  if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (btn) {
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    btn.setAttribute('aria-label', open ? '隐藏侧栏' : '打开侧栏');
+  }
+  const sidebar = document.getElementById('sidebar');
+  if (sidebar) {
+    const narrow = window.innerWidth <= 900;
+    sidebar.setAttribute('aria-hidden', narrow && !open ? 'true' : 'false');
+    sidebar.inert = narrow && !open;
+  }
 }
 function openPalette() {
   paletteCommands = paletteCommandsFor();
   closePalette();
   const el = document.createElement('div');
   el.id = 'palette';
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-label', '命令面板');
   el.innerHTML = `<div class="pal-box">
     <input id="palInput" placeholder="输入命令…" autocomplete="off">
-    <div class="pal-list" id="palList"></div>
+    <div class="pal-list" id="palList" role="listbox"></div>
   </div>`;
   document.body.appendChild(el);
   let sel = 0;
@@ -4092,6 +4813,9 @@ function openPalette() {
     box.innerHTML = list.length ? list.map((c, i) => `<div class="pal-item${i === sel ? ' sel' : ''}" data-i="${i}">${esc(c.label)}${c.key ? `<span class="pal-key">${esc(c.key)}</span>` : ''}</div>`).join('') : '<div class="pal-empty">无匹配命令</div>';
     box.dataset.count = list.length;
     $$('#palList .pal-item').forEach(item => {
+      item.setAttribute('role', 'option');
+      item.setAttribute('aria-selected', item.classList.contains('sel') ? 'true' : 'false');
+      item.tabIndex = -1;
       item.onclick = () => { const l = paletteCommands.filter(c => !q || c.label.toLowerCase().includes(q.toLowerCase())); closePalette(); l[+item.dataset.i] && l[+item.dataset.i].run(); };
     });
     return list;
@@ -4206,18 +4930,25 @@ function bindEvents() {
   $('#wsChip').onclick = () => {
     const s = curSession();
     if (s && sessionLocked(s)) return toast('已开始对话，工作目录不可更改（新建任务可以选别的目录）', 'err');
-    if (s && s.remoteHostId && s.remoteHostId !== 'wsl') return showWorkspacePicker({ hostId: s.remoteHostId, onPick: async (p) => {
+    const applyRemoteCwd = async (p) => {
+      if (!s) return;
       const previous = s.cwd;
       s.cwd = p;
+      $('#inpCwd').value = p;
       try {
         await api('/api/sessions/' + encodeURIComponent(s.id), { method: 'PATCH', body: { cwd: p } });
         updateCwdBtn();
-        toast('远程工作目录已设为 ' + baseName(p), 'ok');
+        toast((s.remoteHostId === 'wsl' ? 'WSL' : '远程') + '工作目录已设为 ' + baseName(p), 'ok');
       } catch (e) {
         s.cwd = previous;
+        $('#inpCwd').value = previous || '';
         updateCwdBtn();
         toast(e.message || '保存远程工作目录失败', 'err');
       }
+    };
+    if (s && s.remoteHostId === 'wsl') return showWorkspacePicker({ hostId: 'wsl', onPick: applyRemoteCwd });
+    if (s && s.remoteHostId && s.remoteHostId !== 'wsl') return showWorkspacePicker({ hostId: s.remoteHostId, onPick: async (p) => {
+      await applyRemoteCwd(p);
     } });
     showWorkspacePicker();
   };
@@ -4229,7 +4960,7 @@ function bindEvents() {
   };
   $('#searchBox').addEventListener('input', onSearchInput);
   // 会话重命名
-  $('#hdrTitle').ondblclick = async () => {
+  const renameCurrentSession = async () => {
     const s = curSession();
     if (!s) return toast('请先打开一个会话', 'err');
     const t = prompt('重命名会话：', s.title);
@@ -4245,6 +4976,12 @@ function bindEvents() {
       toast(e.message || '重命名失败', 'err');
     }
   };
+  const hdrTitle = $('#hdrTitle');
+  hdrTitle.setAttribute('role', 'button');
+  hdrTitle.tabIndex = 0;
+  hdrTitle.title = '双击重命名，按 Enter 重命名';
+  hdrTitle.ondblclick = renameCurrentSession;
+  hdrTitle.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); renameCurrentSession(); } };
   // 粘贴图片
   $('#inpText').addEventListener('paste', (e) => {
     const items = [...((e.clipboardData || {}).items || [])];
@@ -4275,6 +5012,12 @@ function bindEvents() {
       e.preventDefault();
       const p = document.getElementById('palette');
       if (p) closePalette(); else openPalette();
+    } else if (e.key === 'Tab' && !$('#overlay').classList.contains('hidden')) {
+      const items = dlgFocusable();
+      if (!items.length) { e.preventDefault(); return; }
+      const first = items[0], last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
     } else if (e.key === 'Escape') {
       if (!$('#overlay').classList.contains('hidden')) closeDlg();
       else if (!$('#pageDrawer').classList.contains('hidden')) closePage();
@@ -4343,7 +5086,9 @@ function bindEvents() {
       const proc = turnBtn.closest('.turn').querySelector('.turn-process');
       if (proc) {
         proc.hidden = !proc.hidden;
-        turnBtn.classList.toggle('open', !proc.hidden);
+        const open = !proc.hidden;
+        turnBtn.classList.toggle('open', open);
+        turnBtn.setAttribute('aria-expanded', String(open));
       }
       return;
     }

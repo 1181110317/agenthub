@@ -17,6 +17,9 @@ data/settings.json
 data/model-cache.json
 data/uploads/
 data/tmp-settings/
+data/providers.json
+data/sessions-archive.jsonl
+data/sessions-archive.jsonl.*
 
 # 万一以后还有别的运行时数据落进 data/，整目录兜底
 # 如果未来需要提交某些示例/种子数据，再单独 !data/xxx.json 放行
@@ -37,6 +40,10 @@ data/tmp-settings/
 /scan_after.txt
 /do_cleanup.ps1
 /scan_cleanup.ps1
+/_run-server.bat
+
+# AgentHub 中文项目说明（仅本机阅读；如需对外发布另开英文版）
+/agent.md
 
 # =========================
 # Logs
@@ -66,6 +73,9 @@ desktop.ini
 .vscode/
 .idea/
 *.iml
+
+# Agent 本地记忆 / 项目笔记（只在本机留存，不入库）
+.workbuddy/
 
 # =========================
 # Secrets (兜底)
