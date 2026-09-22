@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AgentHub · 聚合 Agent 工作台</title>
 <link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/workspace.css">
 <link rel="stylesheet" href="/vendor/xterm.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⬡</text></svg>">
 </head>
@@ -27,6 +28,7 @@
     </button>
     
 
+    <div class="side-label">工作助手</div>
     <div class="agent-grid" id="agentGrid"></div>
 
     <div class="side-search">
@@ -43,6 +45,16 @@
         <button class="btn-mini" id="btnNewChat" title="新建会话">＋ 新会话</button>
       </div>
       <div class="session-list" id="sessionList"></div>
+      <!-- 多选批量操作条：进入多选后出现，Esc 或「取消」退出 -->
+      <div id="multiBar" class="multi-bar hidden" role="toolbar" aria-label="批量操作">
+        <span class="mb-count">已选 0 个</span>
+        <button type="button" class="btn-mini" data-mb="archive" title="移出活跃列表，可在归档里恢复">归档</button>
+        <button type="button" class="btn-mini" data-mb="settle" title="收起（可随时恢复）">收起</button>
+        <button type="button" class="btn-mini" data-mb="pin" title="批量置顶">置顶</button>
+        <button type="button" class="btn-mini" data-mb="read" title="标记为已读">已读</button>
+        <button type="button" class="btn-mini" data-mb="delete" title="删除（不可恢复）">删除</button>
+        <button type="button" class="btn-mini" data-mb="cancel">取消</button>
+      </div>
     </div>
 
     <div class="side-footer">
@@ -80,56 +92,96 @@
         <button id="sbToggle" class="sb-toggle" title="侧栏" aria-label="打开或隐藏侧栏" aria-expanded="false">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
         </button>
+        <div class="hdr-heading">
         <div class="hdr-title" id="hdrTitle" title="双击重命名">新会话</div>
-        <button class="badge ws-chip" id="wsChip" title="选择工作目录">📁 目录</button>
-        <div class="hdr-badges" id="hdrBadges"></div>
+        <div class="hdr-context">
+          <button class="badge ws-chip" id="wsChip" title="选择工作目录">📁 目录</button>
+          <button type="button" class="badge ws-chip" id="assistantChip" title="会话助手：系统提示词与默认运行参数" aria-haspopup="menu">✦ 助手</button>
+          <button type="button" class="hdr-remote ctrl-pill ctrl-menu" id="pillRemote" aria-haspopup="listbox" title="运行位置：本机 / WSL / SSH 主机">
+            <span class="ctrl-label config-label">位置</span><span class="dd-value" id="remoteLabel">本机</span><span class="dd-caret">▾</span>
+          </button>
+          <div class="hdr-badges" id="hdrBadges"></div>
+        </div>
+        </div>
       </div>
       <div class="hdr-right">
+        <button type="button" class="btn-mini ctrl-menu" id="btnHeaderMore" aria-label="更多会话操作" aria-haspopup="menu" aria-expanded="false" title="更多会话操作"><svg class="header-action-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg></button>
         <span class="hdr-usage" id="hdrUsage" title="本机累计 token（不含 cc-switch 代理记录）"></span>
-        <button class="btn-mini" id="btnExport" title="导出当前会话为 Markdown">⤓ 导出</button>
-        <button class="btn-mini" id="btnSessUsage" title="本会话 token 明细">Σ 会话用量</button>
+        <button class="btn-mini header-action" id="btnExport" title="导出当前会话为 Markdown">
+          <svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 20h14"/></svg>
+          <span>导出</span>
+        </button>
+        <button class="btn-mini" id="btnFiles" title="工作区文件：浏览 / 新建 / 重命名 / 编辑（Ctrl+E）" style="display:none"><svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4l1.6 2H19.5A1.5 1.5 0 0 1 21 8.5v9A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5v-11Z"/></svg><span>文件</span></button>
+        <button class="btn-mini header-action" id="btnGit" title="项目变更中心：改动 / 会话记录 / 快照 / 提交" style="display:none"><svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="6" r="2.4"/><path d="M6 8.4v7.2M18 8.4a9 9 0 0 1-9 9.2"/></svg><span>变更</span></button>
+        <button class="btn-mini header-action" id="btnCompare" title="从同一 Git 快照并行运行两个 Agent" style="display:none"><svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 4 4 8l4 4"/><path d="M4 8h13a3 3 0 0 1 3 3v1"/><path d="M16 20l4-4-4-4"/><path d="M20 16H7a3 3 0 0 1-3-3v-1"/></svg><span>对比</span></button>
+        <button class="btn-mini header-action" id="btnSessUsage" title="本会话 token 明细">
+          <svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19h16M6 16v-4M10 16V8M14 16V5M18 16v-7"/></svg>
+          <span id="sessUsageLabel">会话用量</span>
+        </button>
         <button class="btn-mini" id="btnTheme" title="切换主题">
-          <svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><circle cx="8.5" cy="10" r="1" fill="currentColor" stroke="none"/><circle cx="12" cy="8" r="1" fill="currentColor" stroke="none"/><circle cx="15.5" cy="10" r="1" fill="currentColor" stroke="none"/><path d="M12 13.5c-2 0-3.5 1.2-3.8 3h7.6c-.3-1.8-1.8-3-3.8-3z" fill="currentColor" stroke="none"/></svg>
+          <svg class="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.5 14.4A8.5 8.5 0 1 1 9.6 3.5a6.8 6.8 0 0 0 10.9 10.9Z"/></svg>
         </button>
       </div>
     </header>
+
+    <!-- T3 Code 式工作区标签：多个会话可以同时打开，切换时不丢上下文。 -->
+    <nav id="sessionTabs" class="session-tabs" aria-label="已打开会话标签"></nav>
 
     <div id="contentWrap">
       <div id="messages"></div>
       <button id="scrollBtn" class="hidden" title="回到底部">↓</button>
 
+      <!-- 会话内搜索：Ctrl+F 打开，Enter / Shift+Enter 上下跳，Esc 关闭 -->
+      <div id="msgSearch" class="hidden" role="search" aria-label="会话内搜索">
+        <span class="ms-ico" aria-hidden="true">⌕</span>
+        <input id="msgSearchInput" placeholder="在本会话中查找…" autocomplete="off" spellcheck="false" aria-label="查找内容">
+        <span id="msgSearchCount" class="ms-count" aria-live="polite">0/0</span>
+        <button type="button" class="ms-btn" id="msgSearchPrev" title="上一个（Shift+Enter）" aria-label="上一个匹配">↑</button>
+        <button type="button" class="ms-btn" id="msgSearchNext" title="下一个（Enter）" aria-label="下一个匹配">↓</button>
+        <button type="button" class="ms-btn" id="msgSearchClose" title="关闭（Esc）" aria-label="关闭搜索">✕</button>
+      </div>
+
+      <!-- 回合导航导轨：每个用户回合一个刻度，点击直达；位置随滚动高亮 -->
+      <div id="msgRail" class="hidden" role="navigation" aria-label="回合导航"></div>
+
       <div id="composer">
       <div class="composer-inner">
         <div id="queueTray" class="queue-tray hidden" aria-live="polite"></div>
         <div class="composer-panel">
-          <textarea id="inpText" rows="1" placeholder="继续输入，Enter 发送 / Shift+Enter 换行；可直接粘贴截图"></textarea>
+          <textarea id="inpText" rows="1" aria-label="消息内容" placeholder="描述任务，输入 @@ 引用会话，或 /btw 旁问…"></textarea>
+          <div id="mentionMenu" class="mention-menu hidden" role="listbox" aria-label="引用其它会话"></div>
           <div id="attachStrip" class="attach-strip hidden"></div>
           <div class="composer-controls">
-            <button type="button" class="ctrl-pill ctrl-menu" id="pillPerm" aria-haspopup="listbox" title="权限模式：自动=跳过全部确认；接受编辑=文件编辑自动批准；计划=只读调研；询问=不跳过（无头运行下需要确认的操作会被拒绝，读/搜索不受影响）">
-              <span class="ctrl-label">权限</span><span class="dd-value" id="permLabel">自动</span><span class="dd-caret">▾</span>
-            </button>
             <button class="composer-icon" id="btnAttach" title="添加图片附件">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+            <button class="composer-icon mic-btn" id="btnMic" title="语音输入（浏览器语音识别，Chrome/Edge 可用）">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z"/><path d="M19 11a7 7 0 0 1-14 0M12 18v3"/></svg>
             </button>
             <button type="button" id="ctxMeter" class="ctx-meter hidden" aria-label="查看上下文容量" title="查看上下文容量">
               <div class="ctx-track"><i class="ctx-fill"></i></div>
               <span class="ctx-text"></span>
             </button>
             <span class="ctrl-spacer"></span>
-            <div class="ctrl-config" role="group" aria-label="运行配置">
-              <span class="config-caption">运行配置</span>
+            <button type="button" class="ctrl-pill ctrl-menu" id="pillModel" aria-haspopup="listbox" title="模型（点击选择）">
+              <span class="ctrl-label config-label">模型</span><span class="dd-value" id="modelLabel">默认</span><span class="dd-caret">▾</span>
+            </button>
+            <button type="button" class="composer-config-toggle" id="btnComposerConfig" aria-label="运行配置" aria-expanded="false" aria-controls="composerConfig" title="供应商、权限与推理设置">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h9m4 0h3M4 17h3m4 0h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></svg><span>配置</span>
+            </button>
+            <div id="composerConfig" class="ctrl-config hidden" role="group" aria-label="运行配置">
+              <button type="button" class="ctrl-pill ctrl-menu" id="pillPerm" aria-haspopup="listbox" title="权限模式：自动=跳过确认；接受编辑=编辑自动批准；计划=只读调研；询问=逐项授权">
+                <span class="ctrl-label">权限</span><span class="dd-value" id="permLabel">自动</span><span class="dd-caret">▾</span>
+              </button>
               <button type="button" class="ctrl-pill ctrl-menu" id="pillProvider" aria-haspopup="listbox" title="API 入口（来自 AgentHub 本地配置，点击切换）">
                 <span class="ctrl-label config-label">供应商</span><span class="dd-value" id="providerLabel">跟随系统配置</span><span class="dd-caret">▾</span>
               </button>
-              <button type="button" class="ctrl-pill ctrl-menu" id="pillRemote" aria-haspopup="listbox" title="运行位置：本机 / WSL / SSH 主机">
-                <span class="ctrl-label config-label">位置</span><span class="dd-value" id="remoteLabel">本机</span><span class="dd-caret">▾</span>
-              </button>
-              <button type="button" class="ctrl-pill ctrl-menu" id="pillEffort" aria-haspopup="listbox" title="推理强度（思考预算）">
-                <span class="ctrl-label config-label">推理</span><span class="dd-value" id="effortLabel">默认</span><span class="dd-caret">▾</span>
-              </button>
-              <button type="button" class="ctrl-pill ctrl-menu" id="pillModel" aria-haspopup="listbox" title="模型（点击选择）">
-                <span class="ctrl-label config-label">模型</span><span class="dd-value" id="modelLabel">默认</span><span class="dd-caret">▾</span>
-              </button>
+            <button type="button" class="ctrl-pill ctrl-menu" id="pillEffort" aria-haspopup="listbox" title="推理强度（思考预算）">
+              <span class="ctrl-label config-label">推理</span><span class="dd-value" id="effortLabel">默认</span><span class="dd-caret">▾</span>
+            </button>
+            <button type="button" class="think-toggle" id="btnThink" aria-pressed="false" title="切换深度思考：使用更高推理预算">
+              <span class="think-glyph">✦</span><span>深度思考</span>
+            </button>
             </div>
             <input id="fileAttach" class="hidden" type="file" accept="image/*" multiple>
             <input id="inpCwd" class="hidden">
@@ -138,10 +190,13 @@
             <select id="selRemote" class="hidden"></select>
             <select id="selEffort" class="hidden">
               <option value="">默认</option>
-              <option value="minimal">最低</option>
-              <option value="low">低</option>
-              <option value="medium">中</option>
-              <option value="high">高</option>
+              <option value="minimal">minimal · 最低</option>
+              <option value="low">low · 低</option>
+              <option value="medium">medium · 中</option>
+              <option value="high">high · 高</option>
+              <option value="xhigh">xhigh · 超高</option>
+              <option value="max">max · 最大</option>
+              <option value="ultra">ultra · 极高</option>
             </select>
             <select id="selPerm" class="hidden">
               <option value="auto">自动权限 · 跳过全部确认</option>
@@ -151,17 +206,19 @@
             </select>
             <input type="checkbox" id="chkAuto" class="hidden" checked>
             
-            <button id="btnSend" title="发送">
+            <button id="btnSend" title="发送" aria-label="发送消息">
               <svg viewBox="0 0 24 24"><path d="M12 20V5M5.5 11.5L12 5l6.5 6.5" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
           </div>
         </div>
+        <div class="composer-hint">Enter 发送 <span>·</span> Shift + Enter 换行 <span>·</span> @@ 引用会话 <span>·</span> /btw 旁问</div>
       </div>
     </div>
 
     <!-- ================= 底部终端面板 ================= -->
     <div id="termPanel" class="hidden">
-      <div id="termResize" title="拖拽调整高度"></div>
+      <div id="termResize" title="拖拽调整高度" role="separator" aria-orientation="horizontal"
+        aria-label="调整终端高度" aria-valuemin="120" aria-valuemax="890" aria-valuenow="300" tabindex="0"></div>
       <div class="term-head">
         <span class="term-label">终端</span>
         <div id="termTabs" class="term-tabs"></div>
@@ -175,6 +232,36 @@
       </div>
       <div id="termContainer"></div>
     </div>
+
+    <!-- ================= 右侧代码审查面板 ================= -->
+    <aside id="reviewPanel" class="hidden" aria-label="审查改动文件">
+      <div id="reviewResize" class="review-resize" role="separator" aria-orientation="vertical"
+        aria-label="调整右侧预览宽度" aria-valuemin="460" aria-valuemax="1100" aria-valuenow="820"
+        tabindex="0" title="拖动调整预览宽度"></div>
+      <div class="review-head">
+        <div class="review-head-main">
+          <span id="reviewHeadIcon" class="review-head-icon">⌘</span>
+          <div class="review-head-copy">
+            <b>审查</b>
+            <span id="reviewTitle">改动文件</span>
+            <small id="reviewPath" class="review-head-path"></small>
+          </div>
+        </div>
+        <div class="review-head-actions">
+          <button class="btn-mini hidden" id="reviewEdit" title="在内置编辑器中打开（可保存）">编辑</button>
+          <button class="btn-mini hidden" id="reviewDownload" title="下载 / 另存为">下载</button>
+          <button class="btn-mini hidden" id="reviewSystem" title="用系统默认应用打开">系统打开</button>
+          <button class="btn-mini hidden" id="reviewReveal" title="在文件管理器中显示">定位</button>
+          <button class="btn-mini" id="reviewClose" title="关闭审查面板">✕</button>
+        </div>
+      </div>
+      <div class="review-tabs" id="reviewTabs" role="tablist" aria-label="审查标签页"></div>
+      <div class="review-summary" id="reviewSummary"></div>
+      <div class="review-file-list" id="reviewFiles"></div>
+      <div class="review-diff" id="reviewDiff">
+        <div class="review-empty">点击左侧回答里的「查看改动」或「预览」开始查看</div>
+      </div>
+    </aside>
   </main>
 </div>
 
@@ -206,12 +293,58 @@
   </div>
 </div>
 
+<!-- ================= 确认/输入层 =================
+     原生 confirm/prompt 会冻结整页 JS（直播中的会话也停更），
+     统一换成自绘层；独立于 #dlg，可在任意弹窗之上二次确认。 -->
+<div id="confirmWrap" class="hidden" aria-hidden="true">
+  <div id="confirmBox" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmMsg">
+    <div class="cf-head" id="confirmTitle">确认</div>
+    <div class="cf-msg" id="confirmMsg"></div>
+    <div class="cf-input hidden"><input id="confirmInput" autocomplete="off" spellcheck="false"></div>
+    <div class="cf-actions">
+      <button type="button" class="btn ghost" id="confirmCancel">取消</button>
+      <button type="button" class="btn" id="confirmOk">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= 登录层（启用账户认证后出现） ================= -->
+<div id="authLayer" class="hidden" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+  <form id="authBox" autocomplete="on">
+    <div class="auth-logo">⬡</div>
+    <div class="auth-title" id="authTitle">AgentHub</div>
+    <div class="auth-sub">输入用户名与密码访问本工作台</div>
+    <label class="auth-fld"><span>用户名</span><input id="authUser" autocomplete="username" spellcheck="false"></label>
+    <label class="auth-fld"><span>密码</span><input id="authPass" type="password" autocomplete="current-password"></label>
+    <label class="auth-remember"><input id="authRemember" type="checkbox" checked> 记住我（180 天）</label>
+    <div class="auth-error hidden" id="authError"></div>
+    <button type="submit" class="btn" id="authLogin">登录</button>
+  </form>
+</div>
+
+<!-- ================= /btw 旁问浮层 ================= -->
+<section id="btwPanel" class="btw-panel hidden" role="dialog" aria-modal="false" aria-labelledby="btwTitle">
+  <div class="btw-head">
+    <div><span class="btw-glyph">?</span><b id="btwTitle">旁问</b><small>不写入当前会话</small></div>
+    <button type="button" class="btn-mini" id="btwClose" aria-label="关闭旁问">✕</button>
+  </div>
+  <div class="btw-context" id="btwContext">使用当前会话最近的上下文</div>
+  <textarea id="btwInput" rows="2" placeholder="想快速确认什么？"></textarea>
+  <div class="btw-actions">
+    <span id="btwStatus" aria-live="polite"></span>
+    <button type="button" class="btn" id="btwAsk">询问</button>
+  </div>
+  <div id="btwAnswer" class="btw-answer hidden"></div>
+</section>
+
 <div id="toastWrap"></div>
 
 <!-- mermaid(3.3MB)/echarts/xterm 只在真正渲染图表或打开终端时按需加载，
      见 app.js 的 ensureMermaid/ensureEcharts/ensureXterm；hljs 每条消息都要用，保留但 defer -->
 <link rel="stylesheet" href="/vendor/hljs/styles/github.css" id="hljsCss">
 <script defer src="/vendor/hljs/highlight.min.js"></script>
+<script defer src="/image-compression.js"></script>
+<script defer src="/office-preview.js"></script>
 <script defer src="/app.js"></script>
 </body>
 </html>

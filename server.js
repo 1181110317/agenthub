@@ -9,6 +9,7 @@ const dns = require('dns').promises;
 const net = require('net');
 const { Readable } = require('stream');
 const { WebSocketServer } = require('ws');
+const JSZip = require('jszip');
 
 // 内置 fetch 不认 HTTP(S)_PROXY 环境变量；配了系统代理的机器（公司网/国内）
 // 直连外站会间歇性 fetch failed。装了 undici 就让全局 fetch 走环境代理，
@@ -18,7 +19,13 @@ try {
   setGlobalDispatcher(new EnvHttpProxyAgent());
 } catch {}
 
-const { Store } = require('./lib/store');
+const { Store, DATA_DIR, flushAllStores, pauseStoreWrites } = require('./lib/store');
+let restoreState = '';
+let activeWrites = 0;
+const sessionFiles = require('./lib/session-files');
+const db = require('./lib/db');
+const { defaultWorkspaceDir } = require('./lib/workspace');
+const { zipEntryBuffer } = require('./lib/zip-entry');
 const agents = require('./lib/agents');
 const ccswitch = require('./lib/ccswitch');
 const usage = require('./lib/usage');
@@ -26,14 +33,35 @@ const balance = require('./lib/balance');
 const ssh = require('./lib/ssh');
 const { PERM_MODES, normalizePermissionState } = require('./lib/session-policy');
 const { privatePageAddress } = require('./lib/page-security');
-const { requestPinned } = require('./lib/api-agent');
+const { requestPinned, runApiChat } = require('./lib/api-agent');
+const events = require('./lib/events');
+const receipts = require('./lib/receipts');
+const importSessions = require('./lib/import-sessions');
+const browserCdp = require('./lib/browser-cdp');
+const rank = require('./lib/search-ranking');   // 移植自 t3code（MIT，见 THIRD-PARTY-NOTICES.md）
+const mcpTools = require('./lib/mcp-tools');
+const mcpServers = require('./lib/mcp-servers');
+const assistants = require('./lib/assistants');
+const cron = require('./lib/cron');
+const providerPresets = require('./lib/provider-presets');
+const auth = require('./lib/auth');
+const git = require('./lib/git');
+const { collectProjectChanges } = require('./lib/project-changes');
+const quota = require('./lib/quota');
+const logring = require('./lib/logring');
+const modelCapabilities = require('./lib/model-capabilities');
+const messageFeatures = require('./lib/message-features');
+const permissionMemory = require('./lib/permission-memory');
 // 本机终端（可选依赖，缺失时降级提示）
 let pty = null;
 try { pty = require('node-pty'); } catch { pty = null; }
 
 const PORT = Number(process.env.AGENTHUB_PORT || 7261);
-const MAX_FILE_SNAPSHOT_BYTES = 2 * 1024 * 1024;
+const BOOT_TS = Date.now();
 const MAX_EVENT_DIFF_BYTES = 2 * 1024 * 1024;
+// 推理档位的唯一定义在 lib/model-capabilities.js：会话记录校验的必须就是请求层
+// 真正认的同一份，否则能存下一个发不出去、也显示不出来的档位。
+const EFFORT_LEVELS = modelCapabilities.REASONING_LEVELS;
 const settings = new Store('settings', {
   agents: {},            // { claude: {bin:'...'}, codex: {bin:'...'} ... }
   customAgents: [],      // {id,name,bin,args,argPrompt,color}
@@ -41,11 +69,145 @@ const settings = new Store('settings', {
   sound: true,
   terminalShell: 'auto', // auto / pwsh / powershell / cmd
   recentModels: {},
+  recentModelsByProvider: {},
   contextWindows: {},
+  projectProfiles: [],   // 项目配置档案：可复用权限/供应商/模型/推理设置
+  disabledSkills: [],    // 技能库中明确停用的技能名
+  workflowDefaults: { queueMode: 'queue', notify: 'done' },
+  providerLimits: {},    // { [providerId]: { monthlyUsd?, windowUsd?, windowHours? } } 手动限额（T1-5 无接口兜底）
+  modelPricing: {},      // { [model]: { in, out } } 自定义单价（$ / 1M tokens），覆盖 cc-switch 定价表
+  mcpTools: true,        // 注入型 MCP：把 git/额度/用量工具挂进 Claude/Codex 会话
+  mcpDisabledTools: [],  // 注入型 MCP 里单独停用的工具名（lib/mcp-tools.js 注册表子集）
+  autoSettleDays: 3,     // 会话自动收起：闲置天数（0 = 不自动收起）
+  browserTools: true,    // 受控浏览器（CDP）：给 agent 的 browser_* 工具与 /api/browser/*
 });
-const sessionsStore = new Store('sessions', { sessions: [] });
+// 自定义单价注入用量估算（避免 usage ←→ server 循环依赖）
+usage.setPricingOverrides(() => settings.data.modelPricing || null);
+// 注入型 MCP 的回连参数：端口 + 令牌 + 停用清单在会话拉起 CLI 时才求值，
+// 设置改动即时生效（但已启动的会话用启动时烘焙的清单，改完对下一会话生效）。
+agents.setMcpOptions({
+  port: PORT,
+  token: process.env.AGENTHUB_TOKEN || '',
+  enabled: () => settings.data.mcpTools !== false,
+  disabled: () => Array.isArray(settings.data.mcpDisabledTools) ? settings.data.mcpDisabledTools : [],
+  // 第三方 MCP 服务器：按目标 agent 求值，改设置后对下一个会话生效
+  extraServers: agentId => {
+    try {
+      return { claude: mcpServers.claudeEntries(agentId), codex: mcpServers.codexMcpArgs(agentId) };
+    } catch (e) {
+      console.error('[mcp] extra servers failed:', e.message);
+      return null;
+    }
+  },
+});
+// SQLite 数据层镜像钩子：用量与回合事件在写入 JSON 的同时进索引，
+// 后续的检索、聚合与审计查询都走索引而不是全量扫盘。
+usage.setMirrorHook(records => db.mirrorUsage(records));
+events.setMirrorHook((sessionId, event) => db.mirrorEvent(sessionId, event));
+// 消息体拆分（INVARIANTS B4）：索引只存摘要，消息正文按会话写 data/sessions/<id>.json。
+// 落盘前先写正文文件；正文写入失败的会话在索引里保留内联——宁可索引临时变大，不可丢消息。
+let _splitFailed = new Set();
+const sessionsStore = new Store('sessions', { sessions: [] }, {
+  beforeSave(data) {
+    _splitFailed = sessionFiles.persistAll(data.sessions);
+    // SQLite 数据层：JSON 落盘之后顺带同步索引。镜像失败不影响保存结果——
+    // 库是可重建的派生物，权威数据始终是会话正文文件。
+    db.mirrorSessions(data.sessions);
+  },
+  serialize(data) {
+    return JSON.stringify({
+      sessions: data.sessions.map(s => (_splitFailed.has(String(s.id)) ? s : { ...s, messages: undefined })),
+    }, null, 2);
+  },
+});
 const providerStore = new Store('providers', { list: [], meta: {} }); // AgentHub 独立管理的 API 入口
 const modelCacheStore = new Store('model-cache', { byProvider: {} }); // 拉取过的 /v1/models 缓存（#3）
+
+// 持久化底盘：会话正文（data/sessions/<id>.json）是「事件日志的派生缓存」。
+// 正文损坏时，用 data/events/<id>.jsonl 的事件重建一份可读消息列表（best
+// effort：新格式事件含 user-echo 文本，旧数据只有助手侧块）。删除/归档会话
+// 时事件文件随之清理（见 maybeArchiveSessions / DELETE 路由）。
+function rebuildMessagesFromEvents(sessionId) {
+  const file = path.join(DATA_DIR, 'events', encodeURIComponent(String(sessionId)).slice(0, 120) + '.jsonl');
+  const readLines = f => { try { return fs.readFileSync(f, 'utf8').split('\n').filter(Boolean); } catch { return []; } };
+  const lines = readLines(file.replace(/\.jsonl$/, '.old.jsonl')).concat(readLines(file));
+  const replay = lines.flatMap(line => { try { const m = JSON.parse(line); return m && typeof m === 'object' ? [m] : []; } catch { return []; } });
+  // Appends can finish out of order. Modern logs carry a sequence; legacy logs
+  // without one retain file order, with the rotated file read first.
+  if (replay.every(m => Number.isSafeInteger(m.seq))) replay.sort((a, b) => a.seq - b.seq);
+  const seenSeq = new Set();
+  const msgs = [];
+  let cur = null;
+  // 只有真正带内容（块或用量）的助手回合才落成消息：真实事件流是
+  // started → user-echo → 内容，在 chat.started 上就物化会产出空助手气泡。
+  const ensureCur = ts => {
+    if (!cur) cur = { ts, role: 'assistant', blocks: [], usage: null, elapsed: 0, _rebuilt: true };
+    return cur;
+  };
+  const closeCur = () => {
+    if (cur && (cur.blocks.length || cur.usage || cur.files?.length || cur.images?.length || cur.pages?.length || cur.plan)) msgs.push(cur);
+    cur = null;
+  };
+  const blockFromEvent = (ev, ts) => {
+    switch (ev.kind) {
+      case 'text': return { type: 'text', text: String(ev.text || ''), ts };
+      case 'think': return { type: 'think', text: String(ev.text || ''), status: 'done', ts };
+      case 'tool': return { type: 'tool', id: ev.id || '', name: ev.name || 'tool', detail: ev.detail || '', status: ev.status === 'error' ? 'error' : 'done', output: ev.output || '', ts };
+      case 'error': return { type: 'error', text: String(ev.text || ''), ts };
+      case 'stopped': return { type: 'stopped', ts };
+      default: return null;
+    }
+  };
+  for (const m of replay) {
+    if (Number.isSafeInteger(m.seq)) {
+      if (seenSeq.has(m.seq)) continue;
+      seenSeq.add(m.seq);
+    }
+    if (m.type === 'chat.started') { closeCur(); continue; }
+    if (m.type === 'chat.done') { if (cur) { if (Number(m.elapsed)) cur.elapsed = Number(m.elapsed); if (m.usage) cur.usage = m.usage; } closeCur(); continue; }
+    if (m.type !== 'chat.event' || !isRecord(m.ev)) continue;
+    const ev = m.ev;
+    const ts = Number(ev.ts) || Number(m.ts) || Date.now();
+    if (ev.kind === 'user-echo') {
+      closeCur();
+      msgs.push({ ts, role: 'user', text: String(ev.text || ''), images: Array.isArray(ev.images) ? ev.images : [], ...(m.clientId ? { clientId: m.clientId } : {}) });
+      continue;
+    }
+    if (ev.kind === 'done') { if (cur) { if (ev.usage) cur.usage = ev.usage; if (Number(ev.elapsed)) cur.elapsed = Number(ev.elapsed); } continue; }
+    if (ev.kind === 'usage') {
+      const c = ensureCur(ts), u = isRecord(ev.usage) ? ev.usage : ev;
+      const prior = c.usage || {};
+      c.usage = { ...prior, ...u };
+      for (const k of ['input', 'output', 'cacheRead', 'cacheCreate']) c.usage[k] = (Number(prior[k]) || 0) + (Number(u[k]) || 0);
+      delete c.usage.kind;
+      continue;
+    }
+    if (ev.kind === 'tooloutput') {
+      const b = cur && [...cur.blocks].reverse().find(b => b.type === 'tool' && (!ev.id || b.id === ev.id));
+      if (b) { b.output = String(ev.output || ''); b.status = ev.status === 'error' ? 'error' : 'done'; }
+      continue;
+    }
+    if (ev.kind === 'files') {
+      const c = ensureCur(ts); c.files = [...(c.files || []), ...(cleanStoredFiles(ev.files) || [])]; continue;
+    }
+    if (ev.kind === 'plan') { ensureCur(ts).plan = cleanStoredPlan({ plan: ev.plan, todos: ev.todos }); continue; }
+    if (ev.kind === 'image') {
+      const c = ensureCur(ts); c.images = [...(c.images || []), ...(cleanStoredImages(ev.images || (ev.url ? [ev.url] : [])) || [])]; continue;
+    }
+    if (ev.kind === 'webview') {
+      const c = ensureCur(ts); c.pages = [...new Set([...(c.pages || []), ...(cleanStoredPages([ev.url]) || [])])]; continue;
+    }
+    const block = blockFromEvent(ev, ts);
+    if (!block) continue;
+    const c = ensureCur(ts);
+    const existing = block.type === 'tool' && block.id && c.blocks.find(b => b.type === 'tool' && b.id === block.id);
+    if (existing) { if (block.detail) existing.detail = block.detail; }
+    else c.blocks.push(block);
+  }
+  closeCur();
+  return msgs;
+}
+sessionFiles.setRebuildHook(rebuildMessagesFromEvents);
 
 // JSON 文件可能被旧版本、手工编辑或异常中断写入成 null/数组/错误字段。
 // 启动时把外层容器恢复成各路由实际需要的形状，避免一个坏 store 让
@@ -90,10 +252,58 @@ if (!isRecord(settings.data.currentProvider)) settings.data.currentProvider = {}
 else settings.data.currentProvider = Object.fromEntries(Object.entries(settings.data.currentProvider)
   .filter(([id, value]) => /^[A-Za-z0-9:_-]{1,128}$/.test(id) && typeof value === 'string')
   .map(([id, value]) => [id, value.trim().slice(0, 256)]));
+// 项目默认（T1-4）：展开后的 cwd → { permMode, providerId, model, effort }，最多 64 个项目
+if (!isRecord(settings.data.projectDefaults)) settings.data.projectDefaults = {};
+else settings.data.projectDefaults = Object.fromEntries(Object.entries(settings.data.projectDefaults)
+  .filter(([k, v]) => typeof k === 'string' && k.length > 1 && k.length <= 4096 && isRecord(v))
+  .slice(0, 64)
+  .map(([k, v]) => [k, {
+    permMode: typeof v.permMode === 'string' && PERM_MODES.includes(v.permMode) ? v.permMode : '',
+    providerId: typeof v.providerId === 'string' ? v.providerId.trim().slice(0, 256) : '',
+    model: typeof v.model === 'string' ? v.model.trim().slice(0, 256) : '',
+    effort: typeof v.effort === 'string' && EFFORT_LEVELS.includes(v.effort) ? v.effort : '',
+  }]));
+// 项目配置档案：把一组运行配置命名保存，便于在不同会话/项目间复用。
+if (!Array.isArray(settings.data.projectProfiles)) settings.data.projectProfiles = [];
+else settings.data.projectProfiles = settings.data.projectProfiles.map(v => {
+  if (!isRecord(v)) return null;
+  const id = typeof v.id === 'string' ? v.id.trim().slice(0, 96) : '';
+  const name = typeof v.name === 'string' ? v.name.trim().slice(0, 120) : '';
+  if (!/^[A-Za-z0-9_-]{1,96}$/.test(id) || !name) return null;
+  return {
+    id, name,
+    cwd: typeof v.cwd === 'string' ? v.cwd.trim().slice(0, 4096) : '',
+    description: typeof v.description === 'string' ? v.description.trim().slice(0, 400) : '',
+    permMode: typeof v.permMode === 'string' && PERM_MODES.includes(v.permMode) ? v.permMode : '',
+    providerId: typeof v.providerId === 'string' ? v.providerId.trim().slice(0, 256) : '',
+    model: typeof v.model === 'string' ? v.model.trim().slice(0, 256) : '',
+    effort: typeof v.effort === 'string' && EFFORT_LEVELS.includes(v.effort) ? v.effort : '',
+    color: typeof v.color === 'string' ? v.color.slice(0, 32) : '#6d5dfc',
+    updatedAt: Number(v.updatedAt) || Date.now(),
+  };
+}).filter(Boolean).slice(0, 100);
+if (!Array.isArray(settings.data.disabledSkills)) settings.data.disabledSkills = [];
+else settings.data.disabledSkills = [...new Set(settings.data.disabledSkills.filter(v => typeof v === 'string').map(v => v.trim().slice(0, 160)).filter(Boolean))].slice(0, 200);
+if (!isRecord(settings.data.workflowDefaults)) settings.data.workflowDefaults = { queueMode: 'queue', notify: 'done' };
+else settings.data.workflowDefaults = {
+  queueMode: ['queue', 'steer', 'ask'].includes(settings.data.workflowDefaults.queueMode) ? settings.data.workflowDefaults.queueMode : 'queue',
+  notify: ['done', 'error', 'none'].includes(settings.data.workflowDefaults.notify) ? settings.data.workflowDefaults.notify : 'done',
+};
 if (!isRecord(settings.data.recentModels)) settings.data.recentModels = {};
 else settings.data.recentModels = Object.fromEntries(Object.entries(settings.data.recentModels)
   .filter(([id, values]) => /^[A-Za-z0-9:_-]{1,128}$/.test(id) && Array.isArray(values))
   .map(([id, values]) => [id, values.filter(v => typeof v === 'string').map(v => v.trim().slice(0, 256)).filter(Boolean).slice(0, 50)]));
+// 最近模型必须按供应商隔离。旧版只有按 Agent 的列表，跨供应商切换后会把
+// MiniMax 模型带进 OpenAI/Codex 菜单，造成“模型列表不对”的错觉；旧字段仍
+// 保留兼容，但新记录优先使用这个供应商维度的列表。
+if (!isRecord(settings.data.recentModelsByProvider)) settings.data.recentModelsByProvider = {};
+else settings.data.recentModelsByProvider = Object.fromEntries(Object.entries(settings.data.recentModelsByProvider)
+  .filter(([agent, byProvider]) => /^[A-Za-z0-9:_-]{1,128}$/.test(agent) && isRecord(byProvider))
+  .slice(0, 32)
+  .map(([agent, byProvider]) => [agent, Object.fromEntries(Object.entries(byProvider)
+    .filter(([providerId, values]) => /^[A-Za-z0-9:_-]{1,256}$/.test(providerId) && Array.isArray(values))
+    .slice(0, 64)
+    .map(([providerId, values]) => [providerId, values.filter(v => typeof v === 'string').map(v => v.trim().slice(0, 256)).filter(Boolean).slice(0, 50)]))]));
 if (!isRecord(settings.data.contextWindows)) settings.data.contextWindows = {};
 else settings.data.contextWindows = Object.fromEntries(Object.entries(settings.data.contextWindows)
   .map(([model, value]) => [model, Math.floor(Number(value))])
@@ -126,9 +336,7 @@ const cleanStoredFiles = files => {
     };
     if (typeof f.created === 'boolean') out.created = f.created;
     if (!out.path) return null;
-    const tooLarge = (typeof f.oldStr === 'string' && f.oldStr.length > MAX_FILE_SNAPSHOT_BYTES)
-      || (typeof f.newStr === 'string' && f.newStr.length > MAX_FILE_SNAPSHOT_BYTES);
-    if (tooLarge || f.snapshotUnavailable === true) out.snapshotUnavailable = true;
+    if (f.snapshotUnavailable === true) out.snapshotUnavailable = true;
     else {
       if (typeof f.oldStr === 'string') out.oldStr = f.oldStr;
       if (typeof f.newStr === 'string') out.newStr = f.newStr;
@@ -150,7 +358,7 @@ const cleanStoredImages = images => Array.isArray(images)
     const url = typeof item.url === 'string' ? item.url : '';
     const imagePath = typeof item.path === 'string' ? item.path.slice(0, 4096) : '';
     return isSafeImageSource(url) && imagePath ? { path: imagePath, url } : null;
-  }).filter(Boolean).slice(0, 6)
+  }).filter(Boolean).slice(0, 8)
   : undefined;
 const cleanStoredPages = pages => Array.isArray(pages)
   ? pages.filter(x => typeof x === 'string' && /^https?:\/\//i.test(x) && x.length <= 4096).slice(0, 8)
@@ -175,6 +383,8 @@ const cleanStoredUsage = usageValue => {
     cacheRead: n(usageValue.cacheRead), cacheCreate: n(usageValue.cacheCreate),
     context: n(usageValue.context), contextMax: n(usageValue.contextMax),
   };
+  const genMs = n(usageValue.genMs);
+  if (genMs > 0) out.genMs = genMs;
   for (const key of ['model', 'requested']) if (typeof usageValue[key] === 'string') out[key] = usageValue[key].slice(0, 256);
   return out;
 };
@@ -220,7 +430,7 @@ const normalizeSessionRecord = s => {
     cliSessionStartTs: Number.isFinite(Number(s.cliSessionStartTs)) ? Number(s.cliSessionStartTs) : 0,
     autoPerms: permission.autoPerms,
     permMode: permission.permMode,
-    effort: ['minimal', 'low', 'medium', 'high', 'max'].includes(s.effort) ? s.effort : '',
+    effort: EFFORT_LEVELS.includes(s.effort) ? s.effort : '',
     titled: s.titled === true,
     pinned: s.pinned === true,
     createdAt: Number.isFinite(Number(s.createdAt)) ? Number(s.createdAt) : Date.now(),
@@ -228,6 +438,14 @@ const normalizeSessionRecord = s => {
     messages,
   };
 };
+// 索引里缺消息正文的会话先从独立文件补齐——放在 normalize 之前，
+// 让文件里的消息也走一遍 normalize 清洗。
+for (const s of sessionsStore.data.sessions) {
+  if (!isRecord(s)) continue;
+  if (Array.isArray(s.messages) && s.messages.length) continue;
+  const fromFile = sessionFiles.loadMessages(s.id);
+  if (fromFile) s.messages = fromFile;
+}
 sessionsStore.data.sessions = sessionsStore.data.sessions.map(normalizeSessionRecord).filter(Boolean);
 if (!isRecord(providerStore.data)) providerStore.data = {};
 if (!Array.isArray(providerStore.data.list)) providerStore.data.list = [];
@@ -247,6 +465,8 @@ const normalizeProviderRecord = p => ({
   websiteUrl: typeof p.websiteUrl === 'string' ? p.websiteUrl.slice(0, 2048) : '',
   createdAt: Number.isFinite(Number(p.createdAt)) ? Number(p.createdAt) : Date.now(),
   model: typeof p.model === 'string' ? p.model.slice(0, 256) : '',
+  // 供应商的模型默认值可以带一个默认推理强度；会话仍可在发送栏单独覆盖。
+  effort: EFFORT_LEVELS.includes(p.effort) ? p.effort : '',
   models: Array.isArray(p.models) ? p.models.map(x => typeof x === 'string' ? x : (isRecord(x) ? (x.id || x.model || x.slug || x.name || '') : ''))
     .filter(x => typeof x === 'string' && x.trim()).map(x => x.trim().slice(0, 256)).slice(0, 2000) : [],
 });
@@ -286,7 +506,7 @@ if (!isRecord(modelCacheStore.data.byProvider)) modelCacheStore.data.byProvider 
 else modelCacheStore.data.byProvider = Object.fromEntries(Object.entries(modelCacheStore.data.byProvider)
   .filter(([id, models]) => typeof id === 'string' && Array.isArray(models))
   .map(([id, models]) => [id, models.filter(x => typeof x === 'string').map(x => x.slice(0, 256)).slice(0, 2000)]));
-const SESSION_ARCHIVE_FILE = path.join(__dirname, 'data', 'sessions-archive.jsonl');
+const SESSION_ARCHIVE_FILE = path.join(DATA_DIR, 'sessions-archive.jsonl');
 const MAX_ACTIVE_SESSIONS = Math.min(5000, Math.max(100, Number(process.env.AGENTHUB_MAX_ACTIVE_SESSIONS) || 500));
 const archivedSessionIds = new Set();
 try {
@@ -297,6 +517,86 @@ try {
     }
   }
 } catch {}
+
+// 消息体拆分迁移：旧版索引里内联的 messages 落到独立文件（首次迁移前把旧
+// 索引备份一份 *.presplit.bak）；同时清掉既不在活跃列表也不在归档里的孤儿文件。
+try {
+  if (sessionsStore.data.sessions.some(s => Array.isArray(s.messages) && s.messages.length)
+    && !fs.existsSync(sessionsStore.file + '.presplit.bak')) {
+    fs.copyFileSync(sessionsStore.file, sessionsStore.file + '.presplit.bak');
+  }
+  sessionFiles.persistAll(sessionsStore.data.sessions);
+  sessionFiles.sweepOrphans([...sessionsStore.data.sessions.map(s => s.id), ...archivedSessionIds]);
+} catch (e) { console.error('[sessions] message split migration failed:', e.message); }
+
+// SQLite 数据层启动同步：放到 setImmediate，避免在大库（万级消息）首次建库时
+// 拖住 listen。失败只降级为纯 JSON 扫描，功能不缺失。
+setImmediate(() => {
+  try {
+    const r = db.syncFromSources({
+      sessions: sessionsStore.data.sessions,
+      usageRecords: (usage.usageStore && usage.usageStore.data && usage.usageStore.data.records) || [],
+    });
+    if (r.ok && (r.sessions || r.usageAdded)) {
+      console.log('  sqlite: 索引已同步（会话 ' + (r.sessions || 0) + ' · 用量 +' + (r.usageAdded || 0) + '）');
+    } else if (!r.ok) {
+      console.error('[db] 启动同步失败：' + (r.error || 'unknown') + '（检索与聚合回落 JSON）');
+    }
+  } catch (e) {
+    console.error('[db] 启动同步异常：' + e.message);
+  }
+});
+
+// 一次性修复历史污染：某些会话的 cwd 曾被当作 JS 字符串字面量写回，反斜杠连同
+// 下一个字符被转义吃掉（C:\agent\_test → C:agent_test）。这种路径打不开文件预览、
+// 进不了 Git 面板，还会在项目分组里显示成 "Cagent_test" 这样的假名字。
+// 只改「同一份数据里能唯一还原」的；还原不了的保持原样，避免猜错路径。
+function migrateMalformedCwds() {
+  const BS = '\\';
+  const malformed = c => typeof c === 'string' && /^[A-Za-z]:/.test(c) && c[2] !== BS && c[2] !== '/';
+  // Windows 下 C:\agent\_test 与 C:/agent/_test 是同一个目录，判歧义前必须统一
+  // 分隔符与大小写，否则两种拼写会被当成两个候选、把可还原的记录一起误跳过。
+  const norm = c => c.split('/').join(BS).toLowerCase();
+  const stripped = c => norm(c).split(BS).join('');
+  const sessions = sessionsStore.data.sessions;
+  // 去分隔符后的键 -> { 归一化目录 -> { 原始拼写 -> 出现次数 } }
+  const pool = new Map();
+  for (const s of sessions.concat(readArchivedSessions())) {
+    if (!s || typeof s.cwd !== 'string' || !s.cwd || malformed(s.cwd)) continue;
+    const key = stripped(s.cwd);
+    const groups = pool.get(key) || new Map();
+    pool.set(key, groups);
+    const spellings = groups.get(norm(s.cwd)) || new Map();
+    groups.set(norm(s.cwd), spellings);
+    spellings.set(s.cwd, (spellings.get(s.cwd) || 0) + 1);
+  }
+  function recoverable(cwd) {
+    const groups = pool.get(stripped(cwd));
+    if (!groups || groups.size !== 1) return null;
+    const spellings = [...groups.values()][0];
+    return [...spellings].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))[0][0];
+  }
+  let fixed = 0;
+  const hopeless = new Set();
+  for (const s of sessions) {
+    if (!s || !malformed(s.cwd)) continue;
+    const target = recoverable(s.cwd);
+    if (!target) { hopeless.add(s.cwd); continue; }
+    s.cwd = target;
+    fixed++;
+  }
+  if (!fixed) return 0;
+  try {
+    if (fs.existsSync(sessionsStore.file) && !fs.existsSync(sessionsStore.file + '.precwdfix.bak')) {
+      fs.copyFileSync(sessionsStore.file, sessionsStore.file + '.precwdfix.bak');
+    }
+    sessionsStore.saveNow();
+  } catch (e) { console.error('[sessions] cwd 迁移失败:', e.message); return 0; }
+  console.log('[sessions] 已修复 ' + fixed + ' 条被转义吃掉分隔符的工作目录'
+    + (hopeless.size ? '（另有 ' + hopeless.size + ' 条无法唯一还原，保持原样）' : ''));
+  return fixed;
+}
+try { migrateMalformedCwds(); } catch (e) { console.error('[sessions] cwd 迁移异常:', e.message); }
 
 function readArchivedSessions() {
   const out = [];
@@ -369,7 +669,7 @@ function compactArchiveIfNeeded() {
 // data/tmp-settings 由本应用独占（只写临时 --settings），整目录 *.json 都是
 // 一次性文件，包含早期版本以供应商名/`prov-<id>` 命名的历史残留。
 function sweepTmpSettings() {
-  const dir = path.join(__dirname, 'data', 'tmp-settings');
+  const dir = path.join(DATA_DIR, 'tmp-settings');
   let names;
   try { names = fs.readdirSync(dir); } catch { return 0; }
   let removed = 0;
@@ -382,6 +682,7 @@ function sweepTmpSettings() {
 }
 
 function maybeArchiveSessions() {
+  if (restoreState) return 0;
   const active = sessionsStore.data.sessions;
   if (!Array.isArray(active) || active.length <= MAX_ACTIVE_SESSIONS) return 0;
   const protectedIds = new Set();
@@ -402,8 +703,23 @@ function maybeArchiveSessions() {
       // A restored session can still be present in the historical archive.
       // Append its current copy as the new source of truth before removing it
       // again; readArchivedSessions() de-duplicates by id and keeps this copy.
-      fs.appendFileSync(SESSION_ARCHIVE_FILE, JSON.stringify(s) + '\n', 'utf8');
+      // 索引里只剩元数据，正文在 data/sessions/<id>.json：归档必须把正文一起写进
+      // JSONL，否则随后删掉正文文件就等于把会话掏空。正文文件存在却读不出来
+      // （损坏且无法重建）时整条跳过，宁可少归档几条也不销毁现场。
+      let msgs = Array.isArray(s.messages) ? s.messages : null;
+      if (msgs === null) {
+        if (fs.existsSync(sessionFiles.fileFor(s.id))) {
+          msgs = sessionFiles.loadMessages(s.id);
+          if (msgs === null) { console.error('[sessions] ' + s.id + ' 正文不可读，跳过归档'); continue; }
+        } else {
+          msgs = [];
+        }
+      }
+      fs.appendFileSync(SESSION_ARCHIVE_FILE, JSON.stringify({ ...s, messages: msgs }) + '\n', 'utf8');
       archivedSessionIds.add(String(s.id));
+      // 正文已随完整记录进归档 JSONL，独立消息文件随之移除（恢复时会重建）
+      sessionFiles.removeMessages(s.id);
+      events.remove(s.id);
       moved.push(s);
     }
     const movedIds = new Set(moved.map(s => String(s.id)));
@@ -524,16 +840,96 @@ function collectRemoteOutput(handle, timeoutMs = 20000, maxBytes = 24 * 1024 * 1
 const app = express();
 // 图片以 data URL 传输，12MiB 二进制经过 base64 后还要加 data URL 前缀；
 // 16MiB 的 JSON 上限会在边界处提前拒绝，因此留出少量协议开销。
-// 访问令牌（AGENTHUB_TOKEN 设置后启用）：守护所有 /api 接口；静态资源放行以便页面加载
-if (process.env.AGENTHUB_TOKEN) {
+// 访问令牌（AGENTHUB_TOKEN 设置后启用）：守护所有 /api 接口；静态资源放行以便页面加载。
+// 只读令牌（AGENTHUB_RO_TOKEN，可选）：通过认证但只放行 GET/HEAD——看进度/用量可以，
+// 批权限、发消息、开终端、改设置一律 403。手机/分享场景把泄露后果限制在「可看」。
+const TOKEN = process.env.AGENTHUB_TOKEN || '';
+const RO_TOKEN = process.env.AGENTHUB_RO_TOKEN || '';
+// 只读令牌的 WS 白名单：这两种消息只改本连接自己的状态（activeKey、以及只可能
+// 由本连接 term.open 出来的终端——而 term.open 对只读令牌是拒绝的），不落盘、
+// 不影响别的会话。其余类型一律拒绝。
+const RO_WS_TYPES = Object.freeze(new Set(['term.active', 'term.close']));
+
+// 网页代理票据：一次签发、20 分钟有效，只能用来 GET /api/page/proxy。
+// 被代理页面的脚本能读到自己的 location.search，所以那个 URL 里绝不能放全权令牌。
+const PROXY_TICKETS = new Map();
+const PROXY_TICKET_TTL_MS = 20 * 60 * 1000;
+function issueProxyTicket() {
+  const now = Date.now();
+  for (const [t, exp] of PROXY_TICKETS) if (now > exp) PROXY_TICKETS.delete(t);
+  const t = crypto.randomBytes(16).toString('hex');
+  PROXY_TICKETS.set(t, now + PROXY_TICKET_TTL_MS);
+  return t;
+}
+function consumeProxyTicket(t) {
+  const key = String(t || '');
+  const exp = PROXY_TICKETS.get(key);
+  if (!exp) return false;
+  if (Date.now() > exp) { PROXY_TICKETS.delete(key); return false; }
+  return true;
+}
+// ---------- 账户认证（第九轮，lib/auth.js） ----------
+// 启用后接管 /api 与 /uploads 的认证；/api/auth/* 是登录入口本身必须放行。
+// AGENTHUB_TOKEN 依旧有效（运维后门不依赖密码），只读令牌语义不变。
+// 放行给路由自己判定的入口：status/login 无需认证；enable 由路由强制「本机或带令牌」。
+const AUTH_EXEMPT = new Set(['/api/auth/status', '/api/auth/login', '/api/auth/enable']);
+app.use((req, res, next) => {
+  if (!auth.enabled()) return next();
+  if (!req.path.startsWith('/api') && !req.path.startsWith('/uploads')) return next();
+  if (req.path.startsWith('/api/auth/')) {
+    // 登录/状态查询放行；登出与改密需要已登录（下面统一校验）
+    if (AUTH_EXEMPT.has(req.path)) return next();
+  }
+  // 环境令牌：最高优先级，且不受 CSRF 约束（不依赖 Cookie）
+  const supplied = req.query.token || req.headers['x-agenthub-token'];
+  if (TOKEN && supplied === TOKEN) return next();
+  const check = auth.checkRequest(req);
+  if (check && check.authed) {
+    const write = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
+    const exempt = req.path.startsWith('/api/auth/');
+    if (write && !exempt) {
+      const header = String(req.headers['x-agenthub-csrf'] || '');
+      if (!header || header !== check.csrfCookie) {
+        return res.status(403).json({ error: 'CSRF 校验失败：写操作需要 x-agenthub-csrf 头（与 ah_csrf Cookie 一致）' });
+      }
+    }
+    req.authUser = auth.user();
+    return next();
+  }
+  return res.status(401).json({ error: '需要登录', authRequired: true, authPath: '/api/auth/login' });
+});
+if (TOKEN || RO_TOKEN) {
   app.use((req, res, next) => {
     if (!req.path.startsWith('/api') && !req.path.startsWith('/uploads')) return next();
-    if (req.query.token === process.env.AGENTHUB_TOKEN || req.headers['x-agenthub-token'] === process.env.AGENTHUB_TOKEN) return next();
-    res.status(401).json({ error: '需要访问令牌：在 URL 加 ?token=… 或请求头 x-agenthub-token' });
+    const supplied = req.query.token || req.headers['x-agenthub-token'];
+    if (TOKEN && supplied === TOKEN) return next();
+    // 网页代理票据只对 /api/page/proxy 的 GET 有效：抽屉里的第三方页面会把自己的
+    // location.search 暴露给页面脚本，全权令牌拼进那个 URL 等于交给任意被打开的网页。
+    if (req.method === 'GET' && req.path === '/api/page/proxy' && consumeProxyTicket(req.query.pt)) return next();
+    if (RO_TOKEN && supplied === RO_TOKEN) {
+      if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') { req.readOnly = true; return next(); }
+      return res.status(403).json({ error: '当前为只读令牌：仅可查看，不能执行写操作' });
+    }
+    if (TOKEN) return res.status(401).json({ error: '需要访问令牌：在 URL 加 ?token=… 或请求头 x-agenthub-token' });
+    // 只配置了只读令牌、没有全权令牌：拒绝无凭据访问，避免配置错漏成裸奔
+    return res.status(401).json({ error: '需要访问令牌：在 URL 加 ?token=… 或请求头 x-agenthub-token' });
   });
 }
 // 先做令牌校验，再读取请求体。这样未授权的大 JSON/图片不会先被
 // express.json 完整读入内存，避免认证前的资源消耗。
+app.use((req, res, next) => {
+  const write = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
+  if (restoreState && req.path.startsWith('/api') && (write || req.path === '/api/backup')) {
+    return res.status(409).json({ error: '备份恢复中或已完成，请重启 AgentHub 后再操作', restartRequired: true });
+  }
+  if (write && req.path.startsWith('/api') && req.path !== '/api/restore') {
+    activeWrites++;
+    let finished = false;
+    const release = () => { if (!finished) { finished = true; activeWrites--; } };
+    res.once('finish', release); res.once('close', release);
+  }
+  next();
+});
 app.use(express.json({ limit: '17mb' }));
 
 // 图片经 base64 后体积膨胀约 4/3：约 13MB 以上的图片会先触碰到上面的 JSON
@@ -546,6 +942,74 @@ app.use((err, req, res, next) => {
   return next(err);
 });
 
+// 账户 API：登录 / 状态 / 登出 / 改密 / 启停。
+// 启用与停用的规则：启用要求「本机回环」或持有 AGENTHUB_TOKEN——否则局域网里
+// 任何人都可能抢先启用自己的密码把主人锁在外面。
+const isLoopbackRequest = req => {
+  const addr = req.socket && req.socket.remoteAddress || '';
+  return ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(addr);
+};
+app.get('/api/auth/status', (req, res) => {
+  const check = auth.enabled() ? auth.checkRequest(req) : null;
+  res.json({
+    enabled: auth.enabled(),
+    authed: auth.enabled() ? !!(check && check.authed) || (TOKEN && (req.query.token === TOKEN || req.headers['x-agenthub-token'] === TOKEN)) : true,
+    user: auth.user(),
+    csrf: auth.enabled() && check ? check.csrfCookie : '',
+  });
+});
+app.post('/api/auth/login', (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '请求格式无效' });
+  if (!auth.enabled()) return res.status(400).json({ error: '访问控制未启用' });
+  try {
+    const user = auth.verifyLogin(String(req.body.username || ''), String(req.body.password || ''), req.socket.remoteAddress || '');
+    const session = auth.issueSession(user.username, req.body.remember === true);
+    const csrf = auth.setAuthCookies(res, session);
+    res.json({ ok: true, user: user.username, csrf });
+  } catch (e) {
+    res.status(e.message.includes('频繁') ? 429 : 401).json({ error: e.message });
+  }
+});
+app.post('/api/auth/logout', (req, res) => {
+  auth.clearAuthCookies(res);
+  res.json({ ok: true });
+});
+app.post('/api/auth/password', (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '请求格式无效' });
+  const loopbackOrToken = isLoopbackRequest(req) || (TOKEN && (req.headers['x-agenthub-token'] === TOKEN || req.query.token === TOKEN));
+  const check = auth.checkRequest(req);
+  if (!loopbackOrToken && !(check && check.authed)) return res.status(401).json({ error: '需要先登录' });
+  try {
+    auth.changePassword(String(req.body.currentPassword || ''), String(req.body.newPassword || ''), req.body.username == null ? undefined : String(req.body.username));
+    res.json({ ok: true, note: '密码已更新，所有已登录设备需要重新登录' });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+app.post('/api/auth/enable', (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '请求格式无效' });
+  if (!isLoopbackRequest(req) && !(TOKEN && (req.headers['x-agenthub-token'] === TOKEN || req.query.token === TOKEN))) {
+    return res.status(403).json({ error: '启用账户认证请在本机操作，或携带 AGENTHUB_TOKEN' });
+  }
+  try {
+    const r = auth.enable(String(req.body.username || ''), String(req.body.password || ''));
+    const session = auth.issueSession(r.username, false);
+    const csrf = auth.setAuthCookies(res, session);
+    res.json({ ok: true, user: r.username, csrf });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+app.post('/api/auth/disable', (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '请求格式无效' });
+  // 停用必须先登录（或持环境令牌）：「知道密码」不等于「已通过认证」，
+  // 否则等于给了绕过登录的第二个入口。紧急情况先登录再停用即可。
+  const loopbackOrToken = (TOKEN && (req.headers['x-agenthub-token'] === TOKEN || req.query.token === TOKEN));
+  const check = auth.checkRequest(req);
+  if (!loopbackOrToken && !(check && check.authed)) return res.status(401).json({ error: '需要先登录' });
+  try { auth.disable(String(req.body.password || '')); res.json({ ok: true }); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
 // ---------- 静态资源 + vendor ----------
 // AgentHub 是本地工作台，前端迭代时不能继续复用旧的 app.js/style.css；
 // 否则新增统计布局会出现“源码有、页面没有”的错觉。
@@ -634,17 +1098,122 @@ function maskProvider(p) {
   const masked = key ? (key.length <= 10 ? key.slice(0, Math.max(1, key.length - 3)) + '***' : key.slice(0, 6) + '***' + key.slice(-4)) : '';
   // 显式白名单：raw/env 可能包含 OAuth、配置文本或完整密钥，不能依赖
   // “覆盖后设 undefined”来防止未来字段扩散到前端。
+  const qa = p.quotaApi && p.quotaApi.type ? p.quotaApi : null;
+  const qaToken = qa && qa.token ? String(qa.token) : '';
   return {
     id: p.id, agent: p.agent, name: p.name, baseUrl: p.baseUrl || '', model: p.model || '',
+    effort: p.effort || '',
     models: Array.isArray(p.models) ? p.models : [], apiKey: masked, maskedKey: masked,
     isCurrent: !!p.isCurrent, websiteUrl: p.websiteUrl || '', source: p.source || 'manual',
     managed: p.managed !== false, importedFrom: p.importedFrom || '', ccsId: p.ccsId || '',
     protocol: p.protocol || '', balanceType: p.balanceType || '',
+    imageInput: p.imageInput === true,
+    lastHealth: p.lastHealth && typeof p.lastHealth === 'object' ? { at: p.lastHealth.at, ok: p.lastHealth.ok, ms: p.lastHealth.ms, error: p.lastHealth.error, mode: p.lastHealth.mode } : null,
+    // 自定义额度接口（new-api 系令牌用量）：token 与 apiKey 同等对待，只回脱敏值
+    quotaApi: qa ? { type: qa.type, url: qa.url || '', hasToken: !!qaToken, token: qaToken ? (qaToken.length <= 10 ? qaToken.slice(0, 4) + '***' : qaToken.slice(0, 4) + '***' + qaToken.slice(-4)) : '' } : null,
   };
 }
+// 供应商自定义额度接口（T1-5 ①）：目前支持 new-api/one-api 系的令牌用量端点。
+// 只接受明确的类型与 http(s) 地址；非法输入直接丢弃（不阻断供应商保存）。
+function sanitizeQuotaApi(raw) {
+  if (!isRecord(raw)) return null;
+  const type = String(raw.type || '').trim().toLowerCase();
+  if (type !== 'newapi') return null;
+  const url = String(raw.url || '').trim().slice(0, 2048);
+  if (url) {
+    try {
+      const u = new URL(url);
+      if (!/^https?:$/.test(u.protocol)) return null;
+    } catch { return null; }
+  }
+  const token = String(raw.token || '').trim().slice(0, 512);
+  return { type, url, token };
+}
+
+// ---------- model capabilities ----------
+// 模型名称来自 Agent CLI、供应商目录和历史用量；能力优先使用官方目录/本地
+// 配置，没有可靠来源的字段保留为 null，前端显示“未知”，避免误导用户。
+app.get('/api/models/capabilities', async (req, res) => {
+  try {
+    const detected = await agents.detectAgentsCached(settings.data);
+    const pricing = ccswitch.modelPricing();
+    const rows = new Map();
+    const catalogs = new Map((Array.isArray(detected) ? detected : []).map(a => [a.id, Array.isArray(a.modelCatalog) ? a.modelCatalog : []]));
+    const agentById = new Map((Array.isArray(detected) ? detected : []).map(a => [a.id, a]));
+    const add = (model, agentId = '', provider = null) => {
+      const id = String(model || '').trim().slice(0, 256);
+      if (!id) return;
+      const agent = agentById.get(agentId);
+      const catalog = catalogs.get(agentId) || [];
+      const cap = modelCapabilities.inferCapabilities({
+        model: id,
+        agent: agentId,
+        provider,
+        catalog,
+        contextWindows: { ...(settings.data.contextWindows || {}), ...((agent && agent.modelWindows) || {}) },
+        pricing,
+      });
+      const row = rows.get(id) || {
+        model: id, label: '', description: '', agents: [], providers: [],
+        contextWindow: 0, maxOutputTokens: 0, reasoningLevels: [], reasoningSource: '',
+        tools: { value: null, source: '' }, images: { value: null, source: '' }, streaming: { value: null, source: '' },
+        pricing: null, metadataSources: new Set(),
+      };
+      const entry = Array.isArray(catalog) ? catalog.find(x => x && String(x.id || '').toLowerCase() === id.toLowerCase()) : null;
+      if (entry && !row.label) row.label = String(entry.label || '');
+      if (cap.description && !row.description) row.description = cap.description;
+      if (cap.contextWindow > row.contextWindow) row.contextWindow = cap.contextWindow;
+      if (cap.maxOutputTokens > row.maxOutputTokens) row.maxOutputTokens = cap.maxOutputTokens;
+      if (cap.reasoningLevels.length) {
+        row.reasoningLevels = [...new Set([...row.reasoningLevels, ...cap.reasoningLevels])]
+          .filter(x => modelCapabilities.REASONING_LEVELS.includes(x));
+      }
+      // 没有档位但有来源说明的模型（如 MiniMax 的 adaptive 开关）也要把来源带出去，
+      // 否则矩阵只能显示“未知”，把“支持推理但没有档位”说成“不知道”。
+      if (!row.reasoningSource && cap.reasoningSource) row.reasoningSource = cap.reasoningSource;
+      for (const kind of ['tools', 'images', 'streaming']) {
+        if (cap[kind] && cap[kind].value === true) row[kind] = cap[kind];
+        else if (row[kind].value == null && cap[kind] && cap[kind].value === false) row[kind] = cap[kind];
+      }
+      if (!row.pricing && cap.pricing) row.pricing = cap.pricing;
+      if (cap.metadataSource) row.metadataSources.add(cap.metadataSource);
+      if (agentId && !row.agents.includes(agentId)) row.agents.push(agentId);
+      if (provider) {
+        const providerRow = { id: provider.id || '', name: provider.name || '', agent: provider.agent || agentId || '' };
+        if (!row.providers.some(p => p.id === providerRow.id && p.name === providerRow.name)) row.providers.push(providerRow);
+      }
+      rows.set(id, row);
+    };
+    for (const a of Array.isArray(detected) ? detected : []) for (const model of Array.isArray(a.models) ? a.models : []) add(model, a.id);
+    for (const p of allProviders()) {
+      for (const model of Array.isArray(p.models) ? p.models : []) add(model, p.agent, p);
+      if (p.model) add(p.model, p.agent, p);
+    }
+    const historical = usage.aggregate({ days: 3650 });
+    for (const modelRow of historical.byModel || []) add(modelRow.model, modelRow.agent || '');
+    res.json({
+      generatedAt: new Date().toISOString(),
+      reasoningLevels: modelCapabilities.REASONING_LEVELS,
+      models: [...rows.values()].map(row => ({
+        ...row,
+        metadataSources: [...row.metadataSources],
+        providers: row.providers.slice(0, 64),
+        agents: row.agents.slice(0, 32),
+      })).sort((a, b) => (a.label || a.model).localeCompare(b.label || b.model)),
+    });
+  } catch (e) {
+    res.status(500).json({ error: '模型能力目录加载失败：' + (e.message || '未知错误') });
+  }
+});
 app.post('/api/providers', (req, res) => {
   if (!isRecord(req.body)) return res.status(400).json({ error: '供应商请求格式无效' });
-  const { agent, name, baseUrl, apiKey, model, protocol } = req.body;
+  let payload = req.body;
+  // 平台预设：先按预设补全再统一走下面的校验
+  if (payload.presetId) {
+    try { payload = providerPresets.applyPreset(payload); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+  }
+  const { agent, name, baseUrl, apiKey, model, effort, protocol, models } = payload;
   if (typeof agent !== 'string' || typeof name !== 'string' || !agent.trim() || !name.trim()) return res.status(400).json({ error: 'agent/name 必填' });
   const agentId = agent.trim();
   const providerName = name.trim();
@@ -653,8 +1222,14 @@ app.post('/api/providers', (req, res) => {
   if (baseUrl != null && typeof baseUrl !== 'string') return res.status(400).json({ error: 'Base URL 格式无效' });
   if (apiKey != null && typeof apiKey !== 'string') return res.status(400).json({ error: 'API Key 格式无效' });
   if (model != null && typeof model !== 'string') return res.status(400).json({ error: '模型格式无效' });
+  if (models != null && !Array.isArray(models)) return res.status(400).json({ error: '模型列表格式无效' });
+  if (Array.isArray(models) && models.length > 2000) return res.status(400).json({ error: '模型列表过长' });
+  if (effort != null && typeof effort !== 'string') return res.status(400).json({ error: '推理强度格式无效' });
   if (protocol != null && typeof protocol !== 'string') return res.status(400).json({ error: '协议格式无效' });
-  if (String(baseUrl || '').length > 2048 || String(apiKey || '').length > 4096 || String(model || '').length > 256) return res.status(400).json({ error: '供应商字段过长' });
+  if (payload.imageInput != null && typeof payload.imageInput !== 'boolean') return res.status(400).json({ error: '图片输入标记必须是布尔值' });
+  if (String(baseUrl || '').length > 2048 || String(apiKey || '').length > 4096 || String(model || '').length > 256 || String(effort || '').length > 32) return res.status(400).json({ error: '供应商字段过长' });
+  const effortValue = String(effort || '').trim().toLowerCase();
+  if (effortValue && !EFFORT_LEVELS.includes(effortValue)) return res.status(400).json({ error: '推理强度无效' });
   const protocolValue = String(protocol || '').trim().toLowerCase();
   if (protocolValue && !['anthropic', 'openai'].includes(protocolValue)) return res.status(400).json({ error: '协议必须是 Anthropic 或 OpenAI 兼容' });
   const cleanBase = String(baseUrl || '').trim();
@@ -662,7 +1237,13 @@ app.post('/api/providers', (req, res) => {
     try { const u = new URL(cleanBase); if (!/^https?:$/.test(u.protocol) || !u.hostname) throw new Error(); }
     catch { return res.status(400).json({ error: 'Base URL 必须是 http(s) 地址' }); }
   }
-  const p = { id: 'local:' + crypto.randomUUID(), agent: agentId, name: providerName, baseUrl: cleanBase, apiKey: apiKey || '', model: model || '', protocol: protocolValue, source: 'manual', managed: true, createdAt: Date.now() };
+  const modelList = Array.isArray(models) ? [...new Set(models.map(x => String(x || '').trim()).filter(x => x && x.length <= 256))].slice(0, 2000) : [];
+  const p = { id: 'local:' + crypto.randomUUID(), agent: agentId, name: providerName, baseUrl: cleanBase, apiKey: apiKey || '', model: model || '', models: modelList, effort: effortValue, protocol: protocolValue, source: String(payload.source || 'manual').startsWith('preset:') ? String(payload.source) : 'manual', managed: true, createdAt: Date.now() };
+  if (payload.imageInput === true) p.imageInput = true;
+  if (payload.quotaApi != null) {
+    const qa = sanitizeQuotaApi(payload.quotaApi);
+    if (qa) p.quotaApi = qa;
+  }
   providerStore.data.list.push(p);
   providerStore.save();
   res.json(maskProvider(p));
@@ -671,14 +1252,18 @@ app.put('/api/providers/:id', (req, res) => {
   const i = providerStore.data.list.findIndex(p => p.id === req.params.id);
   if (i < 0) return res.status(404).json({ error: 'API 入口不存在' });
   if (!isRecord(req.body)) return res.status(400).json({ error: '供应商请求格式无效' });
-  const { name, baseUrl, apiKey, model, protocol, clearApiKey } = req.body;
+  const { name, baseUrl, apiKey, model, effort, protocol, clearApiKey, imageInput } = req.body;
   if (name != null && (typeof name !== 'string' || !name.trim() || name.length > 120)) return res.status(400).json({ error: '供应商名称无效' });
   if (baseUrl != null && typeof baseUrl !== 'string') return res.status(400).json({ error: 'Base URL 格式无效' });
   if (apiKey != null && typeof apiKey !== 'string') return res.status(400).json({ error: 'API Key 格式无效' });
   if (clearApiKey != null && typeof clearApiKey !== 'boolean') return res.status(400).json({ error: '清除 API Key 标记无效' });
+  if (imageInput != null && typeof imageInput !== 'boolean') return res.status(400).json({ error: '图片输入标记必须是布尔值' });
   if (model != null && typeof model !== 'string') return res.status(400).json({ error: '模型格式无效' });
+  if (effort != null && typeof effort !== 'string') return res.status(400).json({ error: '推理强度格式无效' });
   if (protocol != null && typeof protocol !== 'string') return res.status(400).json({ error: '协议格式无效' });
-  if (String(baseUrl || '').length > 2048 || String(apiKey || '').length > 4096 || String(model || '').length > 256) return res.status(400).json({ error: '供应商字段过长' });
+  if (String(baseUrl || '').length > 2048 || String(apiKey || '').length > 4096 || String(model || '').length > 256 || String(effort || '').length > 32) return res.status(400).json({ error: '供应商字段过长' });
+  const effortValue = effort == null ? undefined : String(effort || '').trim().toLowerCase();
+  if (effortValue !== undefined && effortValue && !EFFORT_LEVELS.includes(effortValue)) return res.status(400).json({ error: '推理强度无效' });
   const protocolValue = protocol == null ? undefined : String(protocol || '').trim().toLowerCase();
   if (protocolValue !== undefined && protocolValue && !['anthropic', 'openai'].includes(protocolValue)) return res.status(400).json({ error: '协议必须是 Anthropic 或 OpenAI 兼容' });
   const cleanBase = baseUrl == null ? undefined : String(baseUrl).trim();
@@ -687,17 +1272,114 @@ app.put('/api/providers/:id', (req, res) => {
     catch { return res.status(400).json({ error: 'Base URL 必须是 http(s) 地址' }); }
   }
   const cur = providerStore.data.list[i];
+  // 自定义额度接口（new-api 令牌用量）：显式传入才替换；quotaApi: {clear:true} 删除
+  let quotaApiNext = cur.quotaApi;
+  if (req.body.quotaApi != null) {
+    if (isRecord(req.body.quotaApi) && req.body.quotaApi.clear === true) quotaApiNext = undefined;
+    else {
+      const qa = sanitizeQuotaApi(req.body.quotaApi);
+      if (qa) {
+        // 只改地址时保留原令牌（前端回传的是脱敏值，不能当真实令牌覆盖）
+        const prevToken = cur.quotaApi && cur.quotaApi.token ? cur.quotaApi.token : '';
+        quotaApiNext = { type: qa.type, url: qa.url, token: qa.token && !qa.token.includes('***') ? qa.token : prevToken };
+      }
+    }
+  }
   providerStore.data.list[i] = {
     ...cur,
+    quotaApi: quotaApiNext,
     name: name == null ? cur.name : name.trim(),
     baseUrl: cleanBase == null ? cur.baseUrl : cleanBase,
     apiKey: clearApiKey === true ? '' : (apiKey && !apiKey.includes('***') ? apiKey : cur.apiKey),
     model: model == null ? cur.model : model.slice(0, 256),
+    effort: effortValue === undefined ? cur.effort || '' : effortValue,
     protocol: protocolValue === undefined ? cur.protocol || '' : protocolValue,
+    // 图片输入能力：发送带图消息时前端据此提示（不是硬拦截，标记错了也能发）
+    imageInput: imageInput === undefined ? cur.imageInput === true : imageInput,
   };
   providerStore.save();
   res.json(maskProvider(providerStore.data.list[i]));
 });
+// 平台预设：新建供应商时一键填好 baseUrl / 协议 / 常见模型。只做预填，
+// 仍走 POST /api/providers 的同一条校验；密钥永远由用户自己填。
+app.get('/api/provider-presets', (req, res) => {
+  res.json({ presets: providerPresets.list() });
+});
+
+// 模型健康检查：真实请求一次供应商并测延迟。两种模式——
+//   models（默认）：GET /models，不花 token，验证「地址可达 + 密钥有效 + 能列模型」；
+//   chat：给默认模型发 1 token 的对话，验证「模型真的能出话」（会花极少量 token）。
+// 结果写回 provider.lastHealth 供界面显示；失败原因必须可读（区分网络/密钥/模型）。
+async function providerHealthProbe(provider, mode) {
+  const base = String(provider.baseUrl || '').replace(/\/+$/, '');
+  if (!base) return { ok: false, error: '未配置 Base URL' };
+  const key = String(provider.apiKey || '');
+  const started = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+  try {
+    if (mode === 'chat') {
+      const model = String(provider.model || '').trim();
+      if (!model) return { ok: false, error: '未配置默认模型，无法做对话探活' };
+      const anthropic = provider.protocol === 'anthropic';
+      const versioned = /\/v\d+$/.test(base);
+      const url = anthropic
+        ? (base + '/v1/messages')
+        : (base + (versioned ? '/chat/completions' : '/v1/chat/completions'));
+      const headers = { 'content-type': 'application/json' };
+      if (anthropic) { headers['x-api-key'] = key; headers['anthropic-version'] = '2023-06-01'; }
+      else if (key) headers.authorization = 'Bearer ' + key;
+      const body = anthropic
+        ? { model, max_tokens: 1, messages: [{ role: 'user', content: 'ping' }] }
+        : { model, max_tokens: 1, messages: [{ role: 'user', content: 'ping' }] };
+      const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal });
+      const ms = Date.now() - started;
+      const text = (await r.text().catch(() => '')).slice(0, 300);
+      if (r.status === 401 || r.status === 403) return { ok: false, ms, error: '密钥被拒绝（HTTP ' + r.status + '）', httpStatus: r.status };
+      if (r.status === 404) return { ok: false, ms, error: '模型不存在或端点路径不对（HTTP 404）', httpStatus: r.status };
+      if (!r.ok) return { ok: false, ms, error: 'HTTP ' + r.status + (text ? '：' + text : ''), httpStatus: r.status };
+      return { ok: true, ms, mode: 'chat', model };
+    }
+    const anthropic = provider.protocol === 'anthropic';
+    // baseUrl 可能已经带 /v1（OpenAI 习惯）也可能是根地址（Anthropic 习惯）：
+    // 以「是否以版本段结尾」决定要不要补 /v1，两种写法都能测。
+    const url = base + (/\/v\d+$/.test(base) ? '/models' : '/v1/models');
+    const headers = {};
+    if (anthropic) { if (key) headers['x-api-key'] = key; headers['anthropic-version'] = '2023-06-01'; }
+    else if (key) headers.authorization = 'Bearer ' + key;
+    const r = await fetch(url, { headers, signal: controller.signal });
+    const ms = Date.now() - started;
+    const text = (await r.text().catch(() => '')).slice(0, 300);
+    if (r.status === 401 || r.status === 403) return { ok: false, ms, error: '密钥被拒绝（HTTP ' + r.status + '）', httpStatus: r.status };
+    if (!r.ok) return { ok: false, ms, error: 'HTTP ' + r.status + (text ? '：' + text : ''), httpStatus: r.status };
+    let count = null;
+    try { const j = JSON.parse(text); count = Array.isArray(j.data) ? j.data.length : (Array.isArray(j.models) ? j.models.length : null); } catch {}
+    return { ok: true, ms, mode: 'models', models: count };
+  } catch (e) {
+    const ms = Date.now() - started;
+    let reason = e.name === 'AbortError' ? '超时（12 秒无响应）' : '';
+    if (!reason) {
+      // undici 的 fetch failed 会把真实原因包在 cause（可能是 AggregateError）里
+      const causes = [e.cause, ...(e.cause && Array.isArray(e.cause.errors) ? e.cause.errors : [])];
+      const code = causes.find(c => c && c.code);
+      const cause = e.cause;
+      reason = code ? '网络不可达：' + code.code
+        : (cause && cause.message && cause.message !== 'fetch failed' ? '网络不可达：' + cause.message
+          : (e.message || '请求失败'));
+    }
+    return { ok: false, ms, error: reason };
+  } finally { clearTimeout(timer); }
+}
+app.post('/api/providers/:id/health', async (req, res) => {
+  const provider = providerStore.data.list.find(x => x.id === req.params.id);
+  if (!provider) return res.status(404).json({ error: 'API 入口不存在' });
+  const mode = req.body && req.body.mode === 'chat' ? 'chat' : 'models';
+  const result = await providerHealthProbe(provider, mode);
+  provider.lastHealth = { at: Date.now(), ok: result.ok === true, ms: result.ms || 0, error: result.error || '', mode: result.mode || mode };
+  providerStore.save();
+  res.json({ ...result, lastHealth: provider.lastHealth });
+});
+
 app.delete('/api/providers/:id', (req, res) => {
   const affected = sessionsStore.data.sessions.concat(readArchivedSessions()).filter(s => s.providerId === req.params.id);
   if (affected.length) return res.status(409).json({ error: `供应商仍被 ${affected.length} 个会话使用，请先切换会话供应商` });
@@ -720,6 +1402,34 @@ app.post('/api/providers/balance', async (req, res) => {
   try { res.json(await balance.checkBalance(p)); }
   catch (e) { res.status(502).json({ error: '余额查询失败：' + (e.message || '供应商无响应') }); }
 });
+app.post('/api/providers/models/preview', async (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '供应商请求格式无效' });
+  const { agent, baseUrl, apiKey, protocol } = req.body;
+  if (agent != null && typeof agent !== 'string') return res.status(400).json({ error: 'Agent 格式无效' });
+  if (baseUrl == null || typeof baseUrl !== 'string' || !baseUrl.trim()) return res.status(400).json({ error: '请先填写 Base URL' });
+  if (apiKey != null && typeof apiKey !== 'string') return res.status(400).json({ error: 'API Key 格式无效' });
+  if (protocol != null && typeof protocol !== 'string') return res.status(400).json({ error: '协议格式无效' });
+  const cleanBase = baseUrl.trim();
+  if (cleanBase.length > 2048) return res.status(400).json({ error: 'Base URL 过长' });
+  try {
+    const u = new URL(cleanBase);
+    if (!/^https?:$/.test(u.protocol) || !u.hostname) throw new Error();
+  } catch {
+    return res.status(400).json({ error: 'Base URL 必须是 http(s) 地址' });
+  }
+  if (String(apiKey || '').length > 4096) return res.status(400).json({ error: 'API Key 过长' });
+  const protocolValue = String(protocol || '').trim().toLowerCase();
+  if (protocolValue && !['anthropic', 'openai'].includes(protocolValue)) return res.status(400).json({ error: '协议必须是 Anthropic 或 OpenAI 兼容' });
+  try {
+    const result = await balance.listModels({ agent: String(agent || ''), baseUrl: cleanBase, apiKey: apiKey || '', protocol: protocolValue });
+    if (!result.ok) return res.status(502).json(result);
+    const models = [...new Set((Array.isArray(result.models) ? result.models : [])
+      .map(x => String(x || '').trim()).filter(x => x && x.length <= 256))].slice(0, 2000);
+    res.json({ ok: true, models, source: 'preview' });
+  } catch (e) {
+    res.status(502).json({ error: '模型目录获取失败：' + (e.message || '供应商无响应') });
+  }
+});
 app.post('/api/providers/models', async (req, res) => {
   if (!isRecord(req.body) || (req.body.id != null && typeof req.body.id !== 'string')) return res.status(400).json({ error: '供应商请求格式无效' });
   const p = findProvider(req.body && req.body.id);
@@ -738,7 +1448,7 @@ app.post('/api/providers/models', async (req, res) => {
 });
 
 // ---------- 上传（粘贴图片） ----------
-const UPLOAD_DIR = path.join(__dirname, 'data', 'uploads');
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 app.use('/uploads', express.static(UPLOAD_DIR));
 app.use('/vendor/hljs', express.static(path.join(__dirname, 'node_modules/@highlightjs/cdn-assets')));
@@ -748,7 +1458,7 @@ app.post('/api/upload', async (req, res) => {
   if (!m) return res.status(400).json({ error: '仅支持图片' });
   const body = Buffer.from(m[2], 'base64');
   if (!body.length) return res.status(400).json({ error: '图片数据为空或 base64 无效' });
-  if (body.length > 12 * 1024 * 1024) return res.status(400).json({ error: '图片超过 12MB' });
+  if (body.length > 12 * 1024 * 1024) return res.status(400).json({ error: '图片超过 12MB（客户端压缩后仍超限）' });
   // 同一毫秒内的多次粘贴不能覆盖彼此的附件。
   const name = 'paste-' + crypto.randomUUID() + '.' + (m[1] === 'jpeg' ? 'jpg' : m[1]);
   try {
@@ -756,6 +1466,419 @@ app.post('/api/upload', async (req, res) => {
     res.json({ path: path.join(UPLOAD_DIR, name), url: '/uploads/' + name });
   } catch (e) {
     res.status(500).json({ error: '图片保存失败: ' + e.message });
+  }
+});
+// 大段粘贴转文本文件（前端 ≥32KiB 时调用）：避免整段文本吃掉上下文窗口，
+// 让 agent 需要时用工具按路径读取。文件落在 data/uploads，与图片附件同目录。
+app.post('/api/upload-text', async (req, res) => {
+  const text = typeof (req.body || {}).text === 'string' ? req.body.text : '';
+  if (!text) return res.status(400).json({ error: '文本为空' });
+  const bytes = Buffer.byteLength(text, 'utf8');
+  if (bytes > 4 * 1024 * 1024) return res.status(400).json({ error: '粘贴内容超过 4MB，请拆分后再粘贴' });
+  const name = 'paste-' + crypto.randomUUID() + '.txt';
+  try {
+    await fs.promises.writeFile(path.join(UPLOAD_DIR, name), text, { flag: 'wx' });
+    res.json({ path: path.join(UPLOAD_DIR, name), url: '/uploads/' + name, bytes, chars: text.length });
+  } catch (e) {
+    res.status(500).json({ error: '文本保存失败: ' + e.message });
+  }
+});
+// 通用附件上传（提问卡附件）：data:<mime>;base64,<data>，≤25MB。
+// 与粘贴图片同目录；文件名保留原名（清洗危险字符）便于 agent/用户辨认。
+app.post('/api/upload-file', async (req, res) => {
+  const m = /^data:([\w.+-]+\/[\w.+-]+);base64,(.+)$/.exec(String((req.body || {}).dataUrl || ''));
+  if (!m) return res.status(400).json({ error: 'dataUrl 格式无效' });
+  const body = Buffer.from(m[2], 'base64');
+  if (!body.length) return res.status(400).json({ error: '附件为空或 base64 无效' });
+  if (body.length > 25 * 1024 * 1024) return res.status(400).json({ error: '附件超过 25MB' });
+  const rawName = String((req.body || {}).name || 'file.bin').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(-80);
+  const name = 'up-' + crypto.randomUUID().slice(0, 8) + '-' + (rawName || 'file.bin');
+  try {
+    await fs.promises.writeFile(path.join(UPLOAD_DIR, name), body, { flag: 'wx' });
+    res.json({ path: path.join(UPLOAD_DIR, name), url: '/uploads/' + name, name: rawName || name, bytes: body.length });
+  } catch (e) {
+    res.status(500).json({ error: '附件保存失败: ' + e.message });
+  }
+});
+// 未被任何活跃会话/归档引用的旧上传文件清理（命令面板触发，支持试运行）。
+// 引用检查覆盖：活跃会话内存态 + sessions-archive.jsonl 全文扫描，宁可漏删不可误删。
+app.post('/api/uploads/sweep', async (req, res) => {
+  const dryRun = !(req.body && req.body.confirm === true);
+  const minAgeMs = Math.max(1, Number(req.body && req.body.days) || 30) * 24 * 3600 * 1000;
+  const referenced = new Set();
+  for (const s of sessionsStore.data.sessions || []) {
+    for (const m of s.messages || []) {
+      for (const im of m.images || []) {
+        if (im && im.url) referenced.add(String(im.url).replace(/^\/uploads\//, ''));
+      }
+    }
+  }
+  try {
+    const arch = path.join(DATA_DIR, 'sessions-archive.jsonl');
+    const raw = await fs.promises.readFile(arch, 'utf8').catch(() => '');
+    for (const mm of raw.matchAll(/\/uploads\/([A-Za-z0-9][A-Za-z0-9._-]*)/g)) referenced.add(mm[1]);
+  } catch {}
+  let names = [];
+  try { names = await fs.promises.readdir(UPLOAD_DIR); } catch { names = []; }
+  const now = Date.now();
+  const victims = [];
+  for (const name of names) {
+    // 只清理「粘贴产生的」文件（paste-*）：提问卡附件是用户主动上传的少量文件，
+    // 不参与自动清理，避免误删消息里引用过的路径
+    if (!/^paste-/.test(name)) continue;
+    if (referenced.has(name)) continue;
+    const full = path.join(UPLOAD_DIR, name);
+    try {
+      const st = await fs.promises.stat(full);
+      if (!st.isFile()) continue;
+      if (now - st.mtimeMs < minAgeMs) continue;
+      victims.push({ name, bytes: st.size });
+    } catch {}
+  }
+  if (!dryRun) {
+    for (const v of victims) { try { await fs.promises.unlink(path.join(UPLOAD_DIR, v.name)); } catch {} }
+    console.log('[uploads] swept ' + victims.length + ' orphan files');
+  }
+  res.json({ ok: true, dryRun, referenced: referenced.size, victims, count: victims.length, bytes: victims.reduce((a, v) => a + v.bytes, 0) });
+});
+
+// ---------- 项目动作（.agenthub.json）：仓库自带的常用命令 ----------
+// 命令来自项目文件 = 不可信输入：只解析展示，必须用户点击运行（confirm:true），
+// 绝不自动触发；仅支持本机目录。返回内容与 .agenthub.json 的 actions 对齐。
+function readProjectActions(cwd) {
+  const file = path.join(cwd, '.agenthub.json');
+  let raw;
+  try {
+    const st = fs.statSync(file);
+    if (!st.isFile()) return { ok: true, actions: [] };
+    if (st.size > 256 * 1024) return { ok: false, error: '.agenthub.json 超过 256KB，拒绝解析' };
+    raw = fs.readFileSync(file, 'utf8');
+  } catch { return { ok: true, actions: [] }; }
+  let data;
+  try { data = JSON.parse(raw); } catch (e) { return { ok: false, error: '.agenthub.json 解析失败: ' + e.message }; }
+  const list = Array.isArray(data && data.actions) ? data.actions : [];
+  const actions = [];
+  for (const a of list.slice(0, 50)) {
+    if (!isRecord(a)) continue;
+    const id = String(a.id || '').trim();
+    const command = String(a.command || '').trim();
+    if (!/^[A-Za-z0-9_-]{1,40}$/.test(id) || !command || command.length > 1000) continue;
+    actions.push({
+      id,
+      name: String(a.name || id).slice(0, 60),
+      command,
+      subdir: String(a.cwd || '').slice(0, 512),
+    });
+  }
+  return { ok: true, actions };
+}
+app.get('/api/project-actions', (req, res) => {
+  const cwd = resolveLocalGitDir(req.query.cwd);
+  if (!cwd) return res.status(400).json({ error: '目录不存在或不可用' });
+  const r = readProjectActions(cwd);
+  if (!r.ok) return res.status(400).json({ error: r.error });
+  res.json({ cwd, actions: r.actions });
+});
+app.post('/api/project-actions/run', (req, res) => {
+  const b = req.body || {};
+  const cwd = resolveLocalGitDir(b.cwd);
+  if (!cwd) return res.status(400).json({ error: '目录不存在或不可用' });
+  if (b.confirm !== true) return res.status(400).json({ error: '项目动作来自仓库文件，请在界面确认后运行（confirm:true）' });
+  const r = readProjectActions(cwd);
+  if (!r.ok) return res.status(400).json({ error: r.error });
+  const act = r.actions.find(a => a.id === String(b.id || ''));
+  if (!act) return res.status(404).json({ error: '动作不存在（.agenthub.json 可能已变化）' });
+  const { exec } = require('child_process');
+  const timeout = Math.min(600000, Math.max(1000, Number(b.timeoutMs) || 120000));
+  let runCwd = cwd;
+  if (act.subdir) {
+    const resolved = path.resolve(cwd, act.subdir);
+    if (resolved.startsWith(cwd + path.sep) || resolved === cwd) runCwd = resolved;
+  }
+  exec(act.command, { cwd: runCwd, timeout, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
+    const cap = s => String(s || '').slice(0, 20000);
+    const code = err && typeof err.code === 'number' ? err.code : (err ? 1 : 0);
+    res.json({ ok: !err, code, stdout: cap(stdout), stderr: cap(stderr || (err && err.message) || ''), action: act.id, command: act.command, timeoutMs: timeout });
+  });
+});
+// ---------- 工作区内容搜索（只读）：跳过依赖/构建目录与二进制文件 ----------
+app.get('/api/fs/search', (req, res) => {
+  const found = resolveLocalGitDir(req.query.cwd);
+  if (!found) return res.status(400).json({ error: '目录不存在或不可用' });
+  // 搜索会把命中行的原文回传（每条 240 字符），等于一个任意目录的内容读取通道，
+  // 只读令牌必须先过磁盘闸门。
+  const cwd = roDiskGate(req, res, '', found);
+  if (cwd === null) return;
+  const q = String(req.query.q || '').slice(0, 200);
+  if (q.length < 2) return res.status(400).json({ error: '至少输入 2 个字符' });
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 60));
+  const skip = new Set(['node_modules', '.git', 'dist', 'build', 'out', '.next', '.venv', 'venv', '__pycache__', 'vendor', 'target', '.cache', 'coverage']);
+  const MAX_FILES = 4000;
+  const MAX_FILE_BYTES = 1024 * 1024;
+  const needle = q.toLowerCase();
+  const hits = [];
+  let scanned = 0;
+  let truncated = false;
+  const walk = (dir, depth) => {
+    if (truncated || depth > 8 || hits.length >= limit) return;
+    let items = [];
+    try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const it of items) {
+      if (truncated || hits.length >= limit) return;
+      if (it.isDirectory() && (skip.has(it.name) || it.name.startsWith('.'))) continue;
+      const full = path.join(dir, it.name);
+      if (it.isDirectory()) { walk(full, depth + 1); continue; }
+      if (!it.isFile()) continue;
+      if (++scanned > MAX_FILES) { truncated = true; return; }
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      if (st.size > MAX_FILE_BYTES) continue;
+      let text;
+      try { text = fs.readFileSync(full, 'utf8'); } catch { continue; }
+      if (text.indexOf('\u0000') >= 0) continue;   // 二进制
+      const lines = text.split('\n');
+      for (let i = 0; i < lines.length && hits.length < limit; i++) {
+        if (lines[i].toLowerCase().includes(needle)) {
+          hits.push({ path: full, line: i + 1, text: lines[i].trim().slice(0, 240) });
+        }
+      }
+    }
+  };
+  walk(cwd, 0);
+  res.json({ cwd, q, scanned, truncated, hits });
+});
+// ---------- 技能清单（$ 菜单）：Claude config 目录 + 项目 .claude/skills ----------
+// 只读扫描 SKILL.md 的 frontmatter（name/description）；远程会话不适用。
+app.get('/api/skills', (req, res) => {
+  const found = resolveLocalGitDir(req.query.cwd);
+  // 只读令牌不给任意目录探技能清单：虽然只回名字和 120 字描述，仍然是磁盘内容。
+  const cwd = found ? roDiskGate(req, res, '', found) : null;
+  if (found && cwd === null) return;
+  const q = String(req.query.q || '').toLowerCase().slice(0, 64);
+  const includeDisabled = String(req.query.all || '') === '1';
+  const disabled = new Set(Array.isArray(settings.data.disabledSkills) ? settings.data.disabledSkills : []);
+  const roots = [path.join(os.homedir(), '.claude', 'skills')];
+  if (cwd) roots.push(path.join(cwd, '.claude', 'skills'));
+  const skills = [];
+  const seen = new Set();
+  for (const root of roots) {
+    let items = [];
+    try { items = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
+    for (const it of items) {
+      if (!it.isDirectory() || seen.has(it.name)) continue;
+      let description = '';
+      try {
+        const raw = fs.readFileSync(path.join(root, it.name, 'SKILL.md'), 'utf8').slice(0, 4096);
+        const dm = /^description:\s*(.+)$/m.exec(raw);
+        if (dm) description = dm[1].trim().replace(/^["']|["']$/g, '').slice(0, 120);
+      } catch { continue; }
+      if (q && !it.name.toLowerCase().includes(q) && !description.toLowerCase().includes(q)) continue;
+      seen.add(it.name);
+      skills.push({ name: it.name, description, scope: root === roots[0] ? 'global' : 'project', enabled: !disabled.has(it.name) });
+      if (skills.length >= 50) break;
+    }
+    if (skills.length >= 50) break;
+  }
+  skills.sort((a, b) => a.name.localeCompare(b.name));
+  res.json({ skills: includeDisabled ? skills : skills.filter(x => x.enabled), disabled: [...disabled] });
+});
+app.post('/api/skills/toggle', (req, res) => {
+  const name = String(req.body && req.body.name || '').trim().slice(0, 160);
+  if (!name || !/^[A-Za-z0-9._-]{1,160}$/.test(name)) return res.status(400).json({ error: '技能名称无效' });
+  const disabled = new Set(Array.isArray(settings.data.disabledSkills) ? settings.data.disabledSkills : []);
+  if (req.body && req.body.enabled === false) disabled.add(name); else disabled.delete(name);
+  settings.data.disabledSkills = [...disabled].slice(0, 200);
+  settings.save();
+  res.json({ ok: true, name, enabled: !disabled.has(name), disabled: settings.data.disabledSkills });
+});
+// ---------- 注入型 MCP 工具清单（设置界面的分组勾选） ----------
+app.get('/api/mcp/tools', (req, res) => {
+  const disabled = Array.isArray(settings.data.mcpDisabledTools) ? settings.data.mcpDisabledTools : [];
+  res.json({
+    enabled: settings.data.mcpTools !== false,
+    disabled,
+    tools: mcpTools.TOOLS.map(t => ({ name: t.name, label: t.label, group: t.group, description: t.description })),
+    groups: mcpTools.GROUPS,
+  });
+});
+// ---------- 外部 CLI 会话导入：只读扫描 + 导入为可续接的会话 ----------
+// claude 的会话 id 直接写进 s.cliSessionId：后续回合走 --resume 原生续接，
+// 上下文不丢；源文件只读，绝不修改。
+app.get('/api/import/scan', (req, res) => {
+  try {
+    res.json({ items: importSessions.scan({ limit: 60 }) });
+  } catch (e) {
+    res.status(500).json({ error: '扫描失败: ' + e.message });
+  }
+});
+app.post('/api/import', (req, res) => {
+  const b = req.body || {};
+  const agent = b.agent === 'codex' ? 'codex' : 'claude';
+  const parsed = importSessions.parse(b.path, agent);
+  if (!parsed || !parsed.msgs.length) return res.status(400).json({ error: '该会话没有可导入的消息（文件不存在/过大/格式不支持）' });
+  const now = Date.now();
+  const permission = normalizePermissionState(false, '');
+  const s = {
+    id: 's' + now.toString(36) + Math.random().toString(36).slice(2, 6),
+    agent,
+    title: String(parsed.title || '导入的会话').trim().slice(0, 200) || '导入的会话',
+    model: '', providerId: '', remoteHostId: '',
+    cwd: String(parsed.cwd || '').slice(0, 4096),
+    autoPerms: permission.autoPerms, permMode: permission.permMode, effort: '',
+    titled: true, cliSessionId: parsed.cliSessionId || '',
+    imported: { from: path.resolve(String(b.path || '')), at: now, messages: parsed.msgs.length },
+    createdAt: now, updatedAt: now,
+    messages: parsed.msgs,
+  };
+  sessionsStore.data.sessions.unshift(s);
+  sessionsStore.save();
+  maybeArchiveSessions();
+  res.json(s);
+});
+
+// ---------- 受控浏览器（CDP）：agent 可驱动的本机 Chrome/Edge ----------
+// 惰性启动（首次调用才起进程）、独立 profile、只允许 http(s)、默认开启可在设置关闭。
+// 页面内容是不可信输入：工具返回值一律当数据（INVARIANTS F1 的延伸）。
+app.get('/api/browser/status', (req, res) => {
+  res.json({ ...browserCdp.status(), enabled: settings.data.browserTools !== false });
+});
+function browserDenied(res) {
+  if (settings.data.browserTools === false) {
+    res.status(403).json({ error: '受控浏览器已在设置中关闭' });
+    return true;
+  }
+  return false;
+}
+app.post('/api/browser/open', async (req, res) => {
+  if (browserDenied(res)) return;
+  try { res.json({ ok: true, page: await browserCdp.open((req.body || {}).url) }); }
+  catch (e) { res.status(400).json({ error: e.message || '打开失败' }); }
+});
+app.post('/api/browser/snapshot', async (req, res) => {
+  if (browserDenied(res)) return;
+  try { res.json({ ok: true, page: await browserCdp.snapshot({ maxChars: (req.body || {}).maxChars }) }); }
+  catch (e) { res.status(400).json({ error: e.message || '快照失败' }); }
+});
+app.post('/api/browser/click', async (req, res) => {
+  if (browserDenied(res)) return;
+  try { res.json(await browserCdp.click((req.body || {}).selector)); }
+  catch (e) { res.status(400).json({ error: e.message || '点击失败' }); }
+});
+app.post('/api/browser/type', async (req, res) => {
+  if (browserDenied(res)) return;
+  const b = req.body || {};
+  try { res.json(await browserCdp.typeText(b.selector, b.text, { submit: b.submit === true })); }
+  catch (e) { res.status(400).json({ error: e.message || '输入失败' }); }
+});
+app.post('/api/browser/evaluate', async (req, res) => {
+  if (browserDenied(res)) return;
+  try { res.json(await browserCdp.evaluateJs((req.body || {}).expression)); }
+  catch (e) { res.status(400).json({ error: e.message || '求值失败' }); }
+});
+app.post('/api/browser/screenshot', async (req, res) => {
+  if (browserDenied(res)) return;
+  try {
+    const shot = await browserCdp.screenshotBase64({ fullPage: (req.body || {}).fullPage === true });
+    const name = 'browser-' + crypto.randomUUID() + '.png';
+    await fs.promises.writeFile(path.join(UPLOAD_DIR, name), Buffer.from(shot.base64, 'base64'), { flag: 'wx' });
+    res.json({ ok: true, url: shot.url, path: path.join(UPLOAD_DIR, name), image: '/uploads/' + name });
+  } catch (e) { res.status(400).json({ error: e.message || '截图失败' }); }
+});
+app.post('/api/browser/close', async (req, res) => {
+  if (browserDenied(res)) return;
+  try { res.json(await browserCdp.stop()); }
+  catch (e) { res.status(400).json({ error: e.message || '关闭失败' }); }
+});
+
+// ---------- 设备面板（最小集）：Android 模拟器/真机 + iOS 模拟器 ----------
+// 只做「发现 + 开关机」；实时画面/触控不在本轮范围（需要长连接与视频流）。
+// 外部命令一律 execFile 数组参数 + 超时；未安装工具时如实返回不可用。
+function deviceExec(bin, args, timeoutMs = 8000) {
+  const { execFile } = require('child_process');
+  return new Promise(resolve => {
+    execFile(bin, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({ ok: !err, out: String(stdout || ''), err: String(stderr || (err && err.message) || '').slice(0, 400) });
+    });
+  });
+}
+app.get('/api/devices', async (req, res) => {
+  const android = { available: false, devices: [], avds: [], error: '' };
+  const ios = { available: false, devices: [], error: '' };
+  const adb = await deviceExec(process.platform === 'win32' ? 'adb.exe' : 'adb', ['devices']);
+  if (adb.ok) {
+    android.available = true;
+    android.devices = adb.out.split('\n').slice(1).map(l => l.trim()).filter(Boolean).map(l => {
+      const [serial, state] = l.split(/\s+/);
+      return { serial: serial || '', state: state || '' };
+    }).filter(d => d.serial);
+    const emu = await deviceExec(process.platform === 'win32' ? 'emulator.exe' : 'emulator', ['-list-avds']);
+    if (emu.ok) android.avds = emu.out.split('\n').map(s => s.trim()).filter(Boolean);
+  } else {
+    android.error = adb.err || '未找到 adb（安装 Android SDK Platform-Tools 后重试）';
+  }
+  if (process.platform === 'darwin') {
+    const sim = await deviceExec('xcrun', ['simctl', 'list', 'devices', 'available', '-j']);
+    if (sim.ok) {
+      try {
+        const data = JSON.parse(sim.out);
+        ios.available = true;
+        for (const [runtime, list] of Object.entries(data.devices || {})) {
+          for (const d of list || []) ios.devices.push({ runtime, name: d.name, udid: d.udid, state: d.state });
+        }
+      } catch { ios.error = 'simctl 输出解析失败'; }
+    } else {
+      ios.error = sim.err || '未找到 xcrun simctl';
+    }
+  } else {
+    ios.error = '仅 macOS 支持 iOS 模拟器';
+  }
+  res.json({ android, ios, platform: process.platform });
+});
+// PATH 查找：外部工具（adb/emulator/xcrun）不存在时如实报错，而不是 spawn 后
+// 异步 'error'（未监听会崩进程）或谎报成功。
+function findOnPath(bin) {
+  const dirs = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  for (const d of dirs) {
+    const p = path.join(d, bin);
+    try { if (fs.statSync(p).isFile()) return p; } catch {}
+  }
+  return '';
+}
+app.post('/api/devices/action', async (req, res) => {
+  const b = req.body || {};
+  const kind = String(b.kind || '');
+  const action = String(b.action || '');
+  const target = String(b.target || '').slice(0, 200);
+  if (target && !/^[A-Za-z0-9._:-]{1,200}$/.test(target)) return res.status(400).json({ error: '目标不合法' });
+  const adbBin = process.platform === 'win32' ? 'adb.exe' : 'adb';
+  const emuBin = process.platform === 'win32' ? 'emulator.exe' : 'emulator';
+  try {
+    if (kind === 'android' && action === 'start-avd') {
+      if (!target) return res.status(400).json({ error: '缺少 AVD 名称' });
+      const bin = findOnPath(emuBin);
+      if (!bin) return res.status(400).json({ error: '未找到 ' + emuBin + '（安装 Android SDK 的 Emulator 组件后重试）' });
+      const { spawn } = require('child_process');
+      const child = spawn(bin, ['-avd', target], { detached: true, stdio: 'ignore', windowsHide: true });
+      // 异步失败必须有人接：否则未处理的 'error' 事件会崩掉服务进程
+      child.on('error', e => console.error('[devices] start-avd failed:', e.message));
+      child.unref();
+      return res.json({ ok: true, started: target, bin });
+    }
+    if (kind === 'android' && action === 'stop-avd') {
+      const bin = findOnPath(adbBin);
+      if (!bin) return res.status(400).json({ error: '未找到 ' + adbBin + '（安装 Android SDK Platform-Tools 后重试）' });
+      const r = await deviceExec(bin, ['-s', target, 'emu', 'kill']);
+      return r.ok ? res.json({ ok: true }) : res.status(400).json({ error: r.err || '关闭失败' });
+    }
+    if (kind === 'ios' && (action === 'boot' || action === 'shutdown')) {
+      if (process.platform !== 'darwin') return res.status(400).json({ error: '仅 macOS 支持 iOS 模拟器' });
+      if (!findOnPath('xcrun')) return res.status(400).json({ error: '未找到 xcrun（需安装 Xcode Command Line Tools）' });
+      const r = await deviceExec('xcrun', ['simctl', action, target], 60000);
+      return r.ok ? res.json({ ok: true }) : res.status(400).json({ error: r.err || (action + ' 失败') });
+    }
+    res.status(400).json({ error: '不支持的动作' });
+  } catch (e) {
+    res.status(500).json({ error: e.message || '设备操作失败' });
   }
 });
 
@@ -781,6 +1904,18 @@ app.post('/api/fs/mkdir', async (req, res) => {
     if (host && host !== 'local') {
       const cfg = ssh.getHostCfg(host);
       if (!cfg) return res.status(404).json({ error: '主机不存在' });
+      const platform = await ssh.getRemotePlatform(cfg);
+      if (platform === 'windows') {
+        const script = [
+          "$ErrorActionPreference = 'Stop'",
+          'New-Item -ItemType Directory -Force -LiteralPath ' + ssh.windowsPowerShellLiteral(p) + ' | Out-Null',
+          "Write-Output 'MKDIR_OK'",
+        ].join('; ');
+        const result = await collectRemoteOutput(ssh.execStream(cfg, ssh.windowsPowerShellCommand(script), ''), 20000, 256 * 1024);
+        if (result.code === 0 && result.stdout.includes('MKDIR_OK')) res.json({ ok: true, path: p });
+        else res.status(400).json({ error: '远程创建失败（exit ' + result.code + '）' });
+        return;
+      }
       // POSIX 单引号路径统一走同一个安全包装；手写反斜杠版本在路径含
       // 单引号时会生成不闭合的 shell 字符串。
       const q = shq(p);
@@ -807,6 +1942,9 @@ app.get('/api/fs/files', async (req, res) => {
   const skip = new Set(['node_modules', '.git', 'dist', 'build', '.claude', '__pycache__', '.venv', 'coverage']);
   const out = [];
   if (localHost) root = expandLocalPath(root);
+  // 只读令牌连目录结构也不该看到会话工作目录之外的部分（@ 引用的文件树）。
+  root = roDiskGate(req, res, host, root);
+  if (root === null) return;
   if (host === 'wsl') {
     if (process.platform !== 'win32') return res.json({ files: [] });
     try {
@@ -824,6 +1962,22 @@ app.get('/api/fs/files', async (req, res) => {
     const cfg = ssh.getHostCfg(host);
     if (!cfg) return res.status(404).json({ error: '主机不存在' });
     try {
+      const platform = await ssh.getRemotePlatform(cfg);
+      if (platform === 'windows') {
+        const literal = ssh.windowsPowerShellLiteral(root);
+        const script = [
+          "$ErrorActionPreference = 'Stop'",
+          '$rootItem = Get-Item -LiteralPath ' + literal + ' -ErrorAction Stop',
+          'if (-not $rootItem.PSIsContainer) { exit 2 }',
+          'Get-ChildItem -LiteralPath ' + literal + ' -Recurse -File -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 400 -ExpandProperty FullName',
+        ].join('; ');
+        const result = await collectRemoteOutput(ssh.execStream(cfg, ssh.windowsPowerShellCommand(script), ''), 20000, 4 * 1024 * 1024);
+        if (result.code !== 0) throw new Error('远程文件列表失败（exit ' + result.code + '）');
+        const files = result.stdout.split(/\r?\n/).map(x => x.trim()).filter(Boolean)
+          .filter(f => !f.split(/[\\/]/).some(part => skip.has(part)))
+          .filter(f => !q || f.toLowerCase().includes(q));
+        return res.json({ files: files.map(f => ({ path: f, name: (f.match(/[^\\/]+$/) || [''])[0] })) });
+      }
       const raw = wslShellPath(root);
       const result = await collectRemoteOutput(ssh.execStream(cfg, 'find ' + raw + ' -maxdepth 4 -type f -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -400', ''), 20000, 4 * 1024 * 1024);
       if (result.code !== 0) throw new Error('远程文件列表失败（exit ' + result.code + '）');
@@ -853,18 +2007,465 @@ app.get('/api/fs/files', async (req, res) => {
   res.json({ files: out });
 });
 
+// ---------- 工作区文件操作（文件树 / 编辑 / 重命名 / 删除 / 系统打开） ----------
+// 作用域规则（这是新增的写接口，必须有明确边界）：
+// - 只对**本地会话**开放，作用域 = 该会话的工作目录（没有 cwd 时用默认工作区）；
+// - 远程 / WSL 会话一律拒绝——它们的路径要在目标环境里解析，本机直接读写会写错地方；
+// - 解析后必须仍在该根目录内（realpath 比对，挡住 `..` 与符号链接逃逸）；
+// - 删除不是真删，而是移进 data/trash/（不进备份），误删可人工找回；
+// - 不碰 `.git`：删除/重命名/移动都拒绝该路径段，避免一次误操作毁掉仓库。
+const FS_TEXT_MAX = 2 * 1024 * 1024;      // 单个文本文件写入上限
+const FS_READ_MAX = 2 * 1024 * 1024;      // 编辑器读取上限
+const FS_TREE_LIMIT = 2000;               // 单目录条目上限
+const FS_FIND_LIMIT = 200;                // 文件名搜索结果上限
+const FS_FIND_SCAN_LIMIT = 20000;         // 文件名搜索扫描条目上限
+const FS_SKIP_DIRS = new Set(['node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out', '.next', '.cache', '__pycache__', '.venv', 'venv', 'target']);
+
+function fsRootForSession(session) {
+  if (!session) return { error: '会话不存在', code: 404 };
+  if (session.remoteHostId) return { error: '远程 / WSL 会话的文件操作请在目标环境执行（本机不会替它读写路径）', code: 400 };
+  const raw = String(session.cwd || '').trim() || defaultWorkspaceDir();
+  try {
+    const root = fs.realpathSync(path.resolve(expandLocalPath(raw)));
+    if (!fs.statSync(root).isDirectory()) return { error: '工作目录不是文件夹：' + raw, code: 400 };
+    return { root };
+  } catch (e) {
+    return { error: '工作目录不可用：' + raw + '（' + e.message + '）', code: 400 };
+  }
+}
+
+// 把请求里的路径解析到作用域内。返回 { full, rel } 或 { error }。
+// 支持相对根目录的相对路径与根目录内的绝对路径；其余一律拒绝。
+function fsResolveInScope(root, input, { allowRoot = false, mustExist = false } = {}) {
+  const raw = String(input == null ? '' : input).trim();
+  if (!raw) {
+    if (allowRoot) return { full: root, rel: '' };
+    return { error: '路径不能为空' };
+  }
+  if (raw.includes('\0')) return { error: '路径包含非法字符' };
+  const normalizedInput = raw.replace(/\\/g, '/');
+  const segments = normalizedInput.split('/').filter(seg => seg && seg !== '.');
+  if (segments.some(seg => seg === '..')) return { error: '路径不能包含 ..' };
+  const candidate = path.isAbsolute(raw) || /^[A-Za-z]:/.test(raw) ? path.resolve(raw) : path.resolve(root, raw);
+  // .git 是仓库的命脉：删除/写入/重命名都不允许落在里面（读取预览不受限）
+  if (segments.some(seg => seg.toLowerCase() === '.git')) return { error: '不能修改 .git 目录内的内容' };
+  let real;
+  try {
+    real = fs.realpathSync(candidate);
+  } catch (e) {
+    if (mustExist || e.code !== 'ENOENT') return { error: '路径不存在或不可访问：' + raw };
+    // 新文件/新目录：逐级往上找最近的已存在祖先做 realpath 校验，
+    // 再把剩余段接回去。这样 `deep/a/b/c.txt` 这种一次性建多层目录也能通过，
+    // 同时仍然挡住 `..`（已在上面拒绝）与符号链接逃逸。
+    let ancestor = path.dirname(candidate);
+    const tail = [path.basename(candidate)];
+    while (true) {
+      try {
+        const realAncestor = fs.realpathSync(ancestor);
+        real = path.join(realAncestor, ...tail);
+        break;
+      } catch (err) {
+        if (err.code !== 'ENOENT') return { error: '上级目录不可访问：' + raw };
+        const parent = path.dirname(ancestor);
+        if (parent === ancestor) return { error: '路径不存在或不可访问：' + raw };
+        tail.unshift(path.basename(ancestor));
+        ancestor = parent;
+      }
+    }
+  }
+  const rel = path.relative(root, real);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return { error: '路径超出会话工作目录：' + raw };
+  if (!rel && !allowRoot) return { error: '不能对工作目录本身执行该操作' };
+  return { full: real, rel: rel.replace(/\\/g, '/') };
+}
+
+function fsEntryInfo(root, full, dirent) {
+  let stat = null;
+  try { stat = fs.statSync(full); } catch {}
+  let isDir = dirent ? dirent.isDirectory() : !!(stat && stat.isDirectory());
+  if (dirent && dirent.isSymbolicLink()) {
+    // 符号链接按目标类型展示，但保留标记（前端可以提示）
+    isDir = !!(stat && stat.isDirectory());
+  }
+  return {
+    name: path.basename(full),
+    rel: path.relative(root, full).replace(/\\/g, '/'),
+    path: full,
+    dir: isDir,
+    link: dirent ? dirent.isSymbolicLink() : false,
+    size: stat && stat.isFile() ? stat.size : 0,
+    mtime: stat ? Math.round(stat.mtimeMs) : 0,
+  };
+}
+
+function fsListDir(root, dir, limit = FS_TREE_LIMIT) {
+  let entries = [];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { throw new Error('目录不可读：' + e.message); }
+  const list = entries
+    .filter(e => e.name !== '.' && e.name !== '..')
+    .map(e => fsEntryInfo(root, path.join(dir, e.name), e))
+    .sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name, 'zh-CN') : a.dir ? -1 : 1));
+  return { entries: list.slice(0, limit), truncated: list.length > limit, total: list.length };
+}
+
+const FS_TRASH_DIR = path.join(DATA_DIR, 'trash');
+
+// 删除 = 移入 data/trash/<时间戳>/<原相对路径>。保留现场，可人工找回；
+// 不进备份（见 listDataFiles），也不会被 AgentHub 自动清理。
+function fsTrashMove(root, rel, full) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const dest = path.join(FS_TRASH_DIR, stamp, rel);
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  try {
+    fs.renameSync(full, dest);
+  } catch (e) {
+    if (e.code !== 'EXDEV') throw e;
+    fs.cpSync(full, dest, { recursive: true });
+    fs.rmSync(full, { recursive: true, force: true });
+  }
+  return path.join(FS_TRASH_DIR, stamp);
+}
+
+function fsWriteAtomic(full, content) {
+  const tmp = full + '.' + process.pid + '.' + crypto.randomBytes(4).toString('hex') + '.tmp';
+  fs.writeFileSync(tmp, content);
+  try { fs.renameSync(tmp, full); } catch (e) { try { fs.unlinkSync(tmp); } catch {} throw e; }
+}
+
+// 本地打开：Windows 用 explorer/start，macOS 用 open，Linux 用 xdg-open。
+function fsOpenLocal(target, mode) {
+  const { spawn } = require('child_process');
+  const platform = process.platform;
+  if (mode === 'reveal') {
+    if (platform === 'win32') spawn('explorer.exe', ['/select,' + path.win32.normalize(target)], { detached: true, stdio: 'ignore' }).unref();
+    else if (platform === 'darwin') spawn('open', ['-R', target], { detached: true, stdio: 'ignore' }).unref();
+    else spawn('xdg-open', [path.dirname(target)], { detached: true, stdio: 'ignore' }).unref();
+    return;
+  }
+  if (mode === 'vscode') {
+    const code = process.platform === 'win32' ? 'code.cmd' : 'code';
+    const child = spawn(code, [target], { detached: true, stdio: 'ignore', shell: process.platform === 'win32' });
+    child.on('error', () => {});
+    child.unref();
+    return;
+  }
+  if (mode === 'terminal') {
+    const dir = fs.statSync(target).isDirectory() ? target : path.dirname(target);
+    if (platform === 'win32') spawn('cmd.exe', ['/c', 'start', 'cmd.exe', '/K', 'cd /d ' + dir], { detached: true, stdio: 'ignore', windowsVerbatimArguments: false }).unref();
+    else if (platform === 'darwin') spawn('open', ['-a', 'Terminal', dir], { detached: true, stdio: 'ignore' }).unref();
+    else spawn('x-terminal-emulator', ['--working-directory', dir], { detached: true, stdio: 'ignore' }).unref();
+    return;
+  }
+  if (platform === 'win32') spawn('cmd.exe', ['/c', 'start', '', target], { detached: true, stdio: 'ignore' }).unref();
+  else if (platform === 'darwin') spawn('open', [target], { detached: true, stdio: 'ignore' }).unref();
+  else spawn('xdg-open', [target], { detached: true, stdio: 'ignore' }).unref();
+}
+
+// 取会话（文件操作统一入口）：body/query 里的 sessionId 必填，避免「无会话就写默认工作区」
+function fsSessionFromReq(req) {
+  const raw = req.body && req.body.sessionId != null ? req.body.sessionId : req.query.sessionId;
+  const id = String(raw == null ? '' : raw).trim();
+  if (!id) return { error: '缺少 sessionId：文件操作必须绑定一个会话', code: 400 };
+  return { session: findSession(id) };
+}
+
+app.get('/api/fs/tree', (req, res) => {
+  const got = fsSessionFromReq(req);
+  if (got.error) return res.status(got.code).json({ error: got.error });
+  const scope = fsRootForSession(got.session);
+  if (scope.error) return res.status(scope.code).json({ error: scope.error });
+  const target = fsResolveInScope(scope.root, req.query.path, { allowRoot: true, mustExist: true });
+  if (target.error) return res.status(400).json({ error: target.error });
+  try {
+    if (!fs.statSync(target.full).isDirectory()) return res.status(400).json({ error: '不是文件夹：' + target.rel });
+    const listed = fsListDir(scope.root, target.full);
+    res.json({ root: scope.root, path: target.full, rel: target.rel, ...listed });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// 文件名搜索：只匹配名字，不读内容（内容搜索是 /api/fs/search），带扫描上限。
+app.get('/api/fs/find', (req, res) => {
+  const got = fsSessionFromReq(req);
+  if (got.error) return res.status(got.code).json({ error: got.error });
+  const scope = fsRootForSession(got.session);
+  if (scope.error) return res.status(scope.code).json({ error: scope.error });
+  const q = String(req.query.q || '').trim().toLowerCase();
+  if (q.length < 1) return res.json({ root: scope.root, query: '', results: [], scanned: 0, truncated: false });
+  const results = [];
+  let scanned = 0;
+  let truncated = false;
+  const queue = [scope.root];
+  while (queue.length && !truncated) {
+    const dir = queue.shift();
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (scanned++ > FS_FIND_SCAN_LIMIT) { truncated = true; break; }
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (FS_SKIP_DIRS.has(e.name) || e.name.startsWith('.')) continue;
+        queue.push(full);
+        continue;
+      }
+      if (!e.isFile()) continue;
+      if (!e.name.toLowerCase().includes(q)) continue;
+      results.push(fsEntryInfo(scope.root, full, e));
+      if (results.length >= FS_FIND_LIMIT) { truncated = true; break; }
+    }
+  }
+  res.json({ root: scope.root, query: q, results, scanned, truncated });
+});
+
+app.get('/api/fs/text', (req, res) => {
+  const got = fsSessionFromReq(req);
+  if (got.error) return res.status(got.code).json({ error: got.error });
+  const scope = fsRootForSession(got.session);
+  if (scope.error) return res.status(scope.code).json({ error: scope.error });
+  const target = fsResolveInScope(scope.root, req.query.path, { mustExist: true });
+  if (target.error) return res.status(400).json({ error: target.error });
+  try {
+    const stat = fs.statSync(target.full);
+    if (!stat.isFile()) return res.status(400).json({ error: '不是文件：' + target.rel });
+    // meta=1：只要大小与修改时间（预览自动刷新轮询用，不读内容）
+    if (String(req.query.meta || '') === '1') return res.json({ path: target.full, rel: target.rel, size: stat.size, mtime: Math.round(stat.mtimeMs) });
+    if (stat.size > FS_READ_MAX) return res.status(413).json({ error: '文件超过 2MB，请用系统编辑器打开', size: stat.size });
+    const buf = fs.readFileSync(target.full);
+    if (buf.includes(0)) return res.status(400).json({ error: '二进制文件不能在内置编辑器打开' });
+    res.json({ path: target.full, rel: target.rel, text: buf.toString('utf8'), size: stat.size, mtime: Math.round(stat.mtimeMs) });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post('/api/fs/write', (req, res) => {
+  const body = req.body;
+  if (!isRecord(body)) return res.status(400).json({ error: '请求格式无效' });
+  const got = fsSessionFromReq(req);
+  if (got.error) return res.status(got.code).json({ error: got.error });
+  const scope = fsRootForSession(got.session);
+  if (scope.error) return res.status(scope.code).json({ error: scope.error });
+  if (typeof body.content !== 'string') return res.status(400).json({ error: 'content 必须是字符串' });
+  if (Buffer.byteLength(body.content, 'utf8') > FS_TEXT_MAX) return res.status(413).json({ error: '内容超过 2MB，请拆分或改用系统编辑器' });
+  const target = fsResolveInScope(scope.root, body.path);
+  if (target.error) return res.status(400).json({ error: target.error });
+  // 外部并发修改保护：编辑器带上读到的 mtime，磁盘变了就拒绝覆盖
+  const expect = body.expectedMtime == null ? null : Number(body.expectedMtime);
+  try {
+    let existed = false;
+    let currentMtime = null;
+    try {
+      const stat = fs.statSync(target.full);
+      existed = true;
+      currentMtime = Math.round(stat.mtimeMs);
+      if (stat.isDirectory()) return res.status(400).json({ error: '目标是文件夹：' + target.rel });
+    } catch {}
+    if (Number.isFinite(expect) && existed && currentMtime !== expect) {
+      return res.status(409).json({ error: '文件在磁盘上已被修改，请重新打开后再保存', mtime: currentMtime });
+    }
+    fs.mkdirSync(path.dirname(target.full), { recursive: true });
+    fsWriteAtomic(target.full, body.content);
+    const stat = fs.statSync(target.full);
+    res.json({ ok: true, path: target.full, rel: target.rel, size: stat.size, mtime: Math.round(stat.mtimeMs), created: !existed });
+  } catch (e) {
+    res.status(400).json({ error: '保存失败：' + e.message });
+  }
+});
+
+app.post('/api/fs/new', (req, res) => {
+  const body = req.body;
+  if (!isRecord(body)) return res.status(400).json({ error: '请求格式无效' });
+  const got = fsSessionFromReq(req);
+  if (got.error) return res.status(got.code).json({ error: got.error });
+  const scope = fsRootForSession(got.session);
+  if (scope.error) return res.status(scope.code).json({ error: scope.error });
+  const kind = body.kind === 'folder' ? 'folder' : 'file';
+  const target = fsResolveInScope(scope.root, body.path);
+  if (target.error) return res.status(400).json({ error: target.error });
+  if (fs.existsSync(target.full)) return res.status(409).json({ error: '已存在同名文件或文件夹：' + target.rel });
+  try {
+    fs.mkdirSync(path.dirname(target.full), { recursive: true });
+    if (kind === 'folder') fs.mkdirSync(target.full);
+    else fs.writeFileSync(target.full, '', { flag: 'wx' });
+    res.json({ ok: true, kind, path: target.full, rel: target.rel, entry: fsEntryInfo(scope.root, target.full, null) });
+  } catch (e) {
+    res.status(400).json({ error: (kind === 'folder' ? '新建文件夹失败：' : '新建文件失败：') + e.message });
+  }
+});
+
+app.post('/api/fs/rename', (req, res) => {
+  const body = req.body;
+  if (!isRecord(body)) return res.status(400).json({ error: '请求格式无效' });
+  const got = fsSessionFromReq(req);
+  if (got.error) return res.status(got.code).json({ error: got.error });
+  const scope = fsRootForSession(got.session);
+  if (scope.error) return res.status(scope.code).json({ error: scope.error });
+  const name = String(body.name == null ? '' : body.name).trim();
+  if (!name || name === '.' || name === '..' || /[\\/]/.test(name) || name.includes('\0')) {
+    return res.status(400).json({ error: '名称不能为空，且不能包含路径分隔符' });
+  }
+  const target = fsResolveInScope(scope.root, body.path, { mustExist: true });
+  if (target.error) return res.status(400).json({ error: target.error });
+  const dest = path.join(path.dirname(target.full), name);
+  if (dest === target.full) return res.json({ ok: true, path: target.full, rel: target.rel, unchanged: true });
+  if (fs.existsSync(dest)) return res.status(409).json({ error: '已存在同名文件或文件夹：' + name });
+  try {
+    fs.renameSync(target.full, dest);
+    res.json({ ok: true, path: dest, rel: path.relative(scope.root, dest).replace(/\\/g, '/') });
+  } catch (e) {
+    res.status(400).json({ error: '重命名失败：' + e.message });
+  }
+});
+
+app.post('/api/fs/delete', (req, res) => {
+  const body = req.body;
+  if (!isRecord(body)) return res.status(400).json({ error: '请求格式无效' });
+  const got = fsSessionFromReq(req);
+  if (got.error) return res.status(got.code).json({ error: got.error });
+  const scope = fsRootForSession(got.session);
+  if (scope.error) return res.status(scope.code).json({ error: scope.error });
+  const target = fsResolveInScope(scope.root, body.path, { mustExist: true });
+  if (target.error) return res.status(400).json({ error: target.error });
+  try {
+    const stat = fs.lstatSync(target.full);
+    if (stat.isDirectory() && path.resolve(target.full) === path.resolve(scope.root)) {
+      return res.status(400).json({ error: '不能删除会话工作目录本身' });
+    }
+    const trash = fsTrashMove(scope.root, target.rel || path.basename(target.full), target.full);
+    res.json({ ok: true, rel: target.rel, trash, recoverable: true });
+  } catch (e) {
+    res.status(400).json({ error: '删除失败：' + e.message });
+  }
+});
+
+app.post('/api/fs/move', (req, res) => {
+  const body = req.body;
+  if (!isRecord(body)) return res.status(400).json({ error: '请求格式无效' });
+  const got = fsSessionFromReq(req);
+  if (got.error) return res.status(got.code).json({ error: got.error });
+  const scope = fsRootForSession(got.session);
+  if (scope.error) return res.status(scope.code).json({ error: scope.error });
+  const target = fsResolveInScope(scope.root, body.path, { mustExist: true });
+  if (target.error) return res.status(400).json({ error: target.error });
+  const dirInput = String(body.targetDir == null ? '' : body.targetDir).trim();
+  const dir = dirInput ? fsResolveInScope(scope.root, dirInput, { allowRoot: true, mustExist: true }) : { full: scope.root, rel: '' };
+  if (dir.error) return res.status(400).json({ error: dir.error });
+  try {
+    if (!fs.statSync(dir.full).isDirectory()) return res.status(400).json({ error: '目标不是文件夹' });
+    const dest = path.join(dir.full, path.basename(target.full));
+    if (path.resolve(dest) === path.resolve(target.full)) return res.json({ ok: true, unchanged: true, path: target.full });
+    const relToDir = path.relative(target.full, dest);
+    if (fs.statSync(target.full).isDirectory() && !relToDir.startsWith('..')) {
+      return res.status(400).json({ error: '不能把文件夹移动到它自己的子目录里' });
+    }
+    if (fs.existsSync(dest)) return res.status(409).json({ error: '目标目录已有同名项目：' + path.basename(target.full) });
+    fs.renameSync(target.full, dest);
+    res.json({ ok: true, path: dest, rel: path.relative(scope.root, dest).replace(/\\/g, '/') });
+  } catch (e) {
+    res.status(400).json({ error: '移动失败：' + e.message });
+  }
+});
+
+app.post('/api/fs/reveal', (req, res) => {
+  const body = req.body;
+  if (!isRecord(body)) return res.status(400).json({ error: '请求格式无效' });
+  const got = fsSessionFromReq(req);
+  if (got.error) return res.status(got.code).json({ error: got.error });
+  const scope = fsRootForSession(got.session);
+  if (scope.error) return res.status(scope.code).json({ error: scope.error });
+  const target = fsResolveInScope(scope.root, body.path, { allowRoot: true, mustExist: true });
+  if (target.error) return res.status(400).json({ error: target.error });
+  try {
+    fsOpenLocal(target.full, 'reveal');
+    res.json({ ok: true, path: target.full });
+  } catch (e) {
+    res.status(400).json({ error: '无法打开文件管理器：' + e.message });
+  }
+});
+
+app.post('/api/fs/open', (req, res) => {
+  const body = req.body;
+  if (!isRecord(body)) return res.status(400).json({ error: '请求格式无效' });
+  const got = fsSessionFromReq(req);
+  if (got.error) return res.status(got.code).json({ error: got.error });
+  const scope = fsRootForSession(got.session);
+  if (scope.error) return res.status(scope.code).json({ error: scope.error });
+  const mode = ['system', 'vscode', 'terminal'].includes(body.with) ? body.with : 'system';
+  const target = fsResolveInScope(scope.root, body.path, { allowRoot: true, mustExist: true });
+  if (target.error) return res.status(400).json({ error: target.error });
+  try {
+    fsOpenLocal(target.full, mode);
+    res.json({ ok: true, path: target.full, with: mode });
+  } catch (e) {
+    res.status(400).json({ error: '打开失败：' + e.message });
+  }
+});
+
 // ---------- 读取图片（消息里生成/提到的图片文件预览，#12）----------
 // 扩展：支持 pdf/docx/xlsx/pptx —— mode=raw 流式返回（PDF iframe 直显），否则 JSON base64（前端 JSZip 解析）
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
 const DOC_EXT = /\.(pdf|docx|xlsx|pptx)$/i;
-const TEXT_EXT = /\.(md|markdown|txt)$/i;
+// 源码文件也允许通过 raw 端点读取，供消息内完整 diff 还原当前文件。
+const TEXT_EXT = /\.(md|markdown|txt|csv|tsv|html?|json|log|ya?ml|ini|conf|xml|env|js|mjs|cjs|jsx|ts|tsx|css|scss|less|vue|svelte|py|java|go|rs|rb|php|c|cc|cpp|h|hpp|cs|sh|bash|zsh|bat|cmd|ps1|sql|toml|lock)$/i;
+const AUDIO_EXT = /\.(mp3|wav|ogg|m4a|aac|flac)$/i;
 const TEXT_PREVIEW_BYTES = 512 * 1024;
+// 本机文本预览的块大小。它只限制单次响应，不限制文件本身——前端拿
+// nextOffset 继续要下一块，所以再大的文件也能翻到底。
+const TEXT_CHUNK_BYTES = 2 * 1024 * 1024;
+// 块边界可能切在 UTF-8 多字节字符中间，留下半个字符会让下一块开头乱码；
+// 回退到最后一个完整字符的末尾。
+function utf8SafeLength(buf) {
+  let lead = buf.length - 1;
+  while (lead >= 0 && (buf[lead] & 0xc0) === 0x80) lead--;
+  if (lead < 0) return buf.length;
+  const b = buf[lead];
+  const need = b < 0x80 ? 1 : b < 0xe0 ? 2 : b < 0xf0 ? 3 : 4;
+  return buf.length - lead >= need ? buf.length : lead;
+}
+async function sendLocalTextRange(req, res, targetPath) {
+  let fh;
+  try {
+    fh = await fs.promises.open(targetPath, 'r');
+    const { size } = await fh.stat();
+    const offset = Math.min(Math.max(0, Math.floor(Number(req.query.offset) || 0)), size);
+    const want = Math.floor(Number(req.query.limit) || 0);
+    const limit = Math.min(want > 0 ? want : TEXT_CHUNK_BYTES, TEXT_CHUNK_BYTES);
+    const raw = Buffer.alloc(Math.max(0, Math.min(limit, size - offset)));
+    const { bytesRead } = await fh.read(raw, 0, raw.length, offset);
+    const cut = utf8SafeLength(raw.subarray(0, bytesRead));
+    const next = offset + cut;
+    return res.json({
+      ok: true, text: raw.subarray(0, cut).toString('utf8'), bytes: size,
+      offset, nextOffset: next, truncated: next < size, hasMore: next < size,
+    });
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return res.status(404).json({ error: '文件不存在: ' + targetPath });
+    return res.status(400).json({ error: (e && e.message) || '读取失败' });
+  } finally { if (fh) await fh.close().catch(() => {}); }
+}
+
 const DOC_MIME = {
   pdf: 'application/pdf',
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 };
+const AUDIO_MIME = {
+  mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg',
+  m4a: 'audio/mp4', aac: 'audio/aac', flac: 'audio/flac',
+};
+// svg 不在这张表里：按同源 URL 直接返回 svg 等于把「在我们源上执行脚本」交给
+// 文件内容，继续走 data URL 那条渲染路径（img 上下文里 svg 脚本不执行）。
+const IMAGE_STREAM_EXT = /\.(png|jpe?g|gif|webp|bmp)$/i;
+const IMAGE_STREAM_MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', bmp: 'image/bmp',
+};
+// 只剩「必须整块转 base64 内嵌」的路径受这个上限约束：远程（WSL/SSH）文件、
+// 以及本机 svg。64MB 文件 base64 后约 86MB，所以下面两条远程通道给到 90MB。
+const INLINE_B64_MAX_BYTES = 64 * 1024 * 1024;
+const REMOTE_B64_STDOUT_BYTES = 90 * 1024 * 1024;
 
 // 文件事件经常只记录相对路径；它属于产生该事件的会话工作目录，不能
 // 直接按 AgentHub 服务进程的当前目录读取。~、POSIX 绝对路径、Windows
@@ -889,29 +2490,141 @@ function resolveTargetPath(cwd, p, local = true) {
   return root + separator + relative;
 }
 
+// 只读令牌的目标是「看进度/用量」，不是「读磁盘」。/api/fs/raw 接受绝对路径与 ~，
+// 而 TEXT_EXT 覆盖 json/env/toml/conf/ini，放开就等于把 ~/.claude/settings.json
+// 之类的明文密钥交给只读令牌。这里把只读请求限制在会话工作目录和上传目录内。
+// 所有会按路径读磁盘的 GET（raw/search/files/ls/git）都走 roDiskGate 这一个闸门。
+const _sessionRootCache = new Map();
+// 把 ./ 与 ../ 收敛掉，保留开头的分隔符和 Windows 盘符。不借助 path.resolve，
+// 因为远程路径要用远程的规则解析，而 path.resolve 会把本地 process.cwd() 掺进去。
+function collapseDots(input) {
+  const s = String(input || '').replace(/\\/g, '/');
+  if (!s) return '';
+  const drive = /^([A-Za-z]:)(?=\/|$)/.exec(s);
+  const absolute = s.startsWith('/');
+  const body = drive ? s.slice(drive[1].length) : s;
+  const out = [];
+  for (const part of body.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      if (out.length && out[out.length - 1] !== '..') out.pop();
+      else if (!absolute && !drive) out.push('..');
+      continue;
+    }
+    out.push(part);
+  }
+  if (drive) return drive[1] + '/' + out.join('/');
+  return absolute ? '/' + out.join('/') : out.join('/');
+}
+function sessionRootsFor(host) {
+  const key = host || 'local';
+  const hit = _sessionRootCache.get(key);
+  const now = Date.now();
+  if (hit && now - hit.at < 5000) return hit.roots;
+  const raw = key === 'local' ? [UPLOAD_DIR] : [];
+  for (const s of sessionsStore.data.sessions.concat(readArchivedSessions())) {
+    if (!s || !s.cwd) continue;
+    if ((s.remoteHostId || 'local') !== key) continue;
+    raw.push(key === 'local' ? expandLocalPath(String(s.cwd)) : String(s.cwd));
+  }
+  // 根要和目标用同一套规范化规则，否则会出现「根比目标宽松」而误放行。
+  const roots = [];
+  for (const item of raw) {
+    const value = String(item || '');
+    if (!value) continue;
+    if (key !== 'local') {
+      const remote = collapseDots(value);
+      if (remote && remote !== '/' && remote !== '..') roots.push(remote);
+      continue;
+    }
+    try { roots.push(fs.realpathSync(path.resolve(value))); } catch { /* 不存在的根直接丢掉 */ }
+  }
+  _sessionRootCache.set(key, { at: now, roots });
+  return roots;
+}
+function insideRoots(file, roots) {
+  const f = String(file || '');
+  for (const raw of roots) {
+    const r = String(raw).replace(/[\\/]+$/, '');
+    if (!r) continue;
+    if (f === r || f.startsWith(r + '/') || f.startsWith(r + '\\')) return true;
+  }
+  return false;
+}
+// 判定必须落在「真实路径」上：resolveTargetPath 只做字符串拼接，../.. 不会被消掉，
+// 符号链接（含 Windows 的目录联接）也不会被解析——两者都能让一个看起来在会话目录里
+// 的路径实际指向目录外，边界因此形同虚设。本机额外走一次 realpath，并让调用方拿
+// 规范化后的路径去读文件，避免「校验完再把链接换掉」的 TOCTOU；realpath 失败一律
+// 当越界（fail closed）。远程只收敛 ../..：解析符号链接要在远端多跑一次命令，而
+// 在会话目录里种链接本身就需要远端写权限。
+function roCanonicalPath(file, host) {
+  const value = String(file || '');
+  if (!value) return null;
+  const local = !host || host === 'local';
+  let canonical;
+  if (local) {
+    try { canonical = fs.realpathSync(path.resolve(value)); } catch { return null; }
+  } else {
+    canonical = collapseDots(value);
+  }
+  return insideRoots(canonical, sessionRootsFor(host)) ? canonical : null;
+}
+// 只读令牌的磁盘闸门。放行时返回规范化路径（非只读请求原样返回，不改变现有行为），
+// 拒绝时已经写好 403 并返回 null。
+function roDiskGate(req, res, host, target) {
+  const value = String(target || '');
+  if (!req.readOnly) return value;
+  const canonical = roCanonicalPath(value, host);
+  if (canonical === null) {
+    res.status(403).json({ error: '只读令牌只能读取会话工作目录与上传目录内的文件' });
+    return null;
+  }
+  return canonical;
+}
+
 app.get('/api/fs/raw', async (req, res) => {
   const p = typeof req.query.path === 'string' ? req.query.path.trim() : '';
   const host = typeof req.query.host === 'string' ? req.query.host.trim() : '';
   const cwd = typeof req.query.cwd === 'string' ? req.query.cwd.trim() : '';
   const mode = typeof req.query.mode === 'string' ? req.query.mode.trim() : '';
-  if (!p || !(IMAGE_EXT.test(p) || DOC_EXT.test(p) || TEXT_EXT.test(p))) return res.status(400).json({ error: '仅支持图片与 pdf/docx/xlsx/pptx/md/txt' });
-  const targetPath = resolveTargetPath(cwd, p, !host || host === 'local');
-  try {
+  if (!p || !(IMAGE_EXT.test(p) || DOC_EXT.test(p) || TEXT_EXT.test(p) || AUDIO_EXT.test(p))) return res.status(400).json({ error: '不支持预览该文件格式' });
+  const targetPath = roDiskGate(req, res, host, resolveTargetPath(cwd, p, !host || host === 'local'));
+  if (targetPath === null) return;
+  // 本机文本走区间读取、本机文档/音频/位图原始模式走流式返回：这几条都不再把
+  // 整个文件读进内存，因此不受大小上限约束。远程（WSL/SSH）仍走下面的 base64 通道。
+  if (!host && mode !== 'raw' && TEXT_EXT.test(p)) return sendLocalTextRange(req, res, targetPath);
+  if (!host && mode === 'raw' && (DOC_EXT.test(p) || AUDIO_EXT.test(p) || IMAGE_STREAM_EXT.test(p))) {
+    const rawExt = ((/\.([a-z0-9]+)$/i.exec(p) || [])[1] || '').toLowerCase();
+    let streamSize = 0;
+    try { streamSize = (await fs.promises.stat(targetPath)).size; }
+    catch { return res.status(404).json({ error: '文件不存在: ' + targetPath }); }
+    res.setHeader('Content-Type', IMAGE_STREAM_MIME[rawExt] || DOC_MIME[rawExt] || AUDIO_MIME[rawExt] || 'application/octet-stream');
+    res.setHeader('Content-Length', String(streamSize));
+    res.setHeader('Accept-Ranges', 'bytes');
+    return fs.createReadStream(targetPath).on('error', () => res.destroy()).pipe(res);
+  }  try {
     let buf = null;
     if (host === 'wsl') {
       if (process.platform !== 'win32') return res.status(400).json({ error: 'WSL 仅在 Windows 上可用' });
       // WSL 内路径 cat 回来。异步执行，不能让一次大文件预览阻塞整个服务；
-      // 12MB 文件经过 base64 后约 16MB，因此单独提高 stdout 上限。
+      // 上限按 base64 膨胀后的体积给，见 REMOTE_B64_STDOUT_BYTES。
       const wr = wslPath(targetPath) || targetPath;
-      const r = await wslExec('base64 -w0 ' + wslShellPath(wr) + ' 2>/dev/null', 30000, 20 * 1024 * 1024);
+      const r = await wslExec('base64 -w0 ' + wslShellPath(wr) + ' 2>/dev/null', 30000, REMOTE_B64_STDOUT_BYTES);
       if (r.code !== 0 || !r.stdout) return res.status(404).json({ error: '读不到文件（不存在或无权限）' });
       buf = Buffer.from(r.stdout.replace(/\s/g, ''), 'base64');
     } else if (host && host !== 'local') {
       const cfg = ssh.getHostCfg(host);
       if (!cfg) return res.status(404).json({ error: '主机不存在' });
-      // 不使用 GNU 专属的 `-w0`，也不把 base64 放进管道隐藏其失败码；
-      // 输出换行由本机统一去掉，Linux、macOS、BSD 都能工作。
-      const result = await collectRemoteOutput(ssh.execStream(cfg, 'base64 ' + wslShellPath(targetPath) + ' 2>/dev/null', ''), 30000, 20 * 1024 * 1024);
+      const platform = await ssh.getRemotePlatform(cfg);
+      const command = platform === 'windows'
+        ? ssh.windowsPowerShellCommand([
+          "$ErrorActionPreference = 'Stop'",
+          '[Convert]::ToBase64String([IO.File]::ReadAllBytes(' + ssh.windowsPowerShellLiteral(targetPath) + '))',
+        ].join('; '))
+        // 不使用 GNU 专属的 `-w0`，也不把 base64 放进管道隐藏其失败码；
+        // 输出换行由本机统一去掉，Linux、macOS、BSD 都能工作。
+        : 'base64 ' + wslShellPath(targetPath) + ' 2>/dev/null';
+      const result = await collectRemoteOutput(ssh.execStream(cfg, command, ''), 30000, REMOTE_B64_STDOUT_BYTES);
       if (result.code !== 0) return res.status(404).json({ error: '读不到文件（不存在或无权限）' });
       buf = Buffer.from(result.stdout.replace(/\s/g, ''), 'base64');
     } else {
@@ -923,10 +2636,12 @@ app.get('/api/fs/raw', async (req, res) => {
       }
     }
     if (!buf || !buf.length) return res.status(404).json({ error: '文件为空或读取失败' });
-    if (buf.length > 12 * 1024 * 1024) return res.status(400).json({ error: '文件超过 12MB，无法预览' });
+    // 走到这里的只剩「必须整文件转 base64 内嵌」的路径（图片、远程文件），
+    // 文本和文档/音频已在上面分流，不再受这个上限影响。
+    if (buf.length > INLINE_B64_MAX_BYTES) return res.status(400).json({ error: '该文件只能整块内嵌预览（远程文件或 svg），超过 ' + Math.floor(INLINE_B64_MAX_BYTES / 1024 / 1024) + 'MB；本机的文本、图片、文档不受此限制' });
     const ext = ((/\.([a-z0-9]+)$/i.exec(p) || [])[1] || 'png').toLowerCase();
-    if (mode === 'raw' && DOC_EXT.test(p)) {
-      res.setHeader('Content-Type', DOC_MIME[ext] || 'application/octet-stream');
+    if (mode === 'raw' && (DOC_EXT.test(p) || AUDIO_EXT.test(p))) {
+      res.setHeader('Content-Type', DOC_MIME[ext] || AUDIO_MIME[ext]);
       return res.send(buf);
     }
     if (IMAGE_EXT.test(p)) {
@@ -937,9 +2652,47 @@ app.get('/api/fs/raw', async (req, res) => {
       const sliced = buf.length > TEXT_PREVIEW_BYTES ? buf.subarray(0, TEXT_PREVIEW_BYTES) : buf;
       return res.json({ ok: true, text: sliced.toString('utf8'), bytes: buf.length, truncated: buf.length > TEXT_PREVIEW_BYTES });
     }
+    if (AUDIO_EXT.test(p)) return res.status(400).json({ error: '音频预览需要 raw 模式' });
     res.json({ ok: true, b64: buf.toString('base64'), bytes: buf.length, ext });
   } catch (e) {
     res.status(400).json({ error: e.message });
+  }
+});
+
+// 读取 Office（docx/xlsx/pptx）压缩包里的单个媒体条目。
+// 预览里的图片走这个 URL 按需加载，而不是把 base64 塞进页面：一份 185 张截图的
+// 测试大纲内联后是 70MB 的 HTML，浏览器会被这份字符串拖死；改 URL 后页面只有
+// 短 src，浏览器自己按需解码可见的那些。
+// 只读取目标条目的字节（见 lib/zip-entry.js），不把整个文件读进内存。
+const OFFICE_MEDIA_PART = /^(?:word|ppt|xl)\/media\/[^\\/\u0000-\u001f]{1,200}\.(?:png|jpe?g|gif|bmp|webp)$/i;
+const OFFICE_MEDIA_MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+  gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp',
+};
+app.get('/api/fs/office-media', async (req, res) => {
+  const p = typeof req.query.path === 'string' ? req.query.path.trim() : '';
+  const part = typeof req.query.part === 'string' ? req.query.part.trim() : '';
+  const host = typeof req.query.host === 'string' ? req.query.host.trim() : '';
+  const cwd = typeof req.query.cwd === 'string' ? req.query.cwd.trim() : '';
+  if (!p || !DOC_EXT.test(p)) return res.status(400).json({ error: '仅支持 Office 文档' });
+  // 只放行 media 目录下的位图：svg 不在这里（同源直接打开 svg 等于执行其内容里的脚本，
+  // 与 /api/fs/raw 的处理保持一致，svg 仍走 data URL），XML 部件也不放行。
+  if (!OFFICE_MEDIA_PART.test(part)) return res.status(400).json({ error: '不支持的内嵌部件' });
+  if (host) return res.status(400).json({ error: '远程会话的内嵌图片仍走整包内联' });
+  const targetPath = roDiskGate(req, res, '', resolveTargetPath(cwd, p, true));
+  if (targetPath === null) return;
+  const ext = (part.split('.').pop() || '').toLowerCase();
+  try {
+    const buf = await zipEntryBuffer(targetPath, part);
+    if (!buf) return res.status(404).json({ error: '部件不存在' });
+    res.setHeader('Content-Type', OFFICE_MEDIA_MIME[ext] || 'application/octet-stream');
+    res.setHeader('Content-Length', String(buf.length));
+    // 防止把内容当成别的类型执行；图片本身不可信，不能让浏览器去嗅探。
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, max-age=60');
+    res.end(buf);
+  } catch (e) {
+    res.status(400).json({ error: '读取内嵌图片失败: ' + e.message });
   }
 });
 
@@ -1046,6 +2799,10 @@ function pageErrorPage(message, url, scheme) {
 // localStorage（访问令牌）和 /api。
 const PROXY_SANDBOX_CSP = "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox";
 
+// 前端在打开代理页面前换取一次性票据（走 x-agenthub-token 头，不进 URL）。
+app.post('/api/page/ticket', (req, res) => {
+  res.json({ ok: true, ticket: issueProxyTicket(), ttlMs: PROXY_TICKET_TTL_MS });
+});
 app.get('/api/page/check', async (req, res) => {
   const u = validPageUrl(String(req.query.url || ''));
   if (!u) return res.status(400).json({ error: '仅支持 http(s) 链接' });
@@ -1074,8 +2831,10 @@ app.get('/api/page/proxy', async (req, res) => {
     if (!r.ok) return res.status(502).type('html').send(pageErrorPage('目标站点返回 HTTP ' + r.status, r.url || u.href, sch));
     if (!/^text\/html|application\/xhtml/i.test(ctype)) {
       // 图片/文本等直接透传（仅限抽屉里能直接展示的类型）
+      // SVG 是例外：它自己能带脚本，顶层打开时同样要沙箱，否则就在本服务源上执行。
       res.setHeader('Content-Type', ctype || 'application/octet-stream');
       res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Security-Policy', PROXY_SANDBOX_CSP);
       res.setHeader('Cache-Control', 'no-store');
       return res.send(buf);
     }
@@ -1154,12 +2913,24 @@ async function forkZcodeAt(s, messages, targetIndex) {
   }
 }
 
+function messageIndexForAction(messages, body, role) {
+  const list = Array.isArray(messages) ? messages : [];
+  const b = body || {};
+  // 时间戳不是消息 ID：导入记录和同一毫秒内的消息可能共享 ts。
+  // 新客户端传列表序号；校验时间戳可阻止旧页面对已改变的列表误操作。
+  if (Object.prototype.hasOwnProperty.call(b, 'msgIndex')) {
+    const i = b.msgIndex;
+    const m = Number.isInteger(i) && i >= 0 ? list[i] : null;
+    return m && m.ts === b.msgTs && (!role || m.role === role) ? i : -1;
+  }
+  return list.findIndex(m => m.ts === b.msgTs && (!role || m.role === role));
+}
+
 app.post('/api/sessions/:id/rewind', async (req, res) => {
   const s = sessionsStore.data.sessions.find(x => x.id === req.params.id);
   if (!s) return res.status(404).json({ error: '会话不存在' });
   if (running.has(s.id)) return res.status(400).json({ error: '会话正在运行中' });
-  const msgTs = req.body && req.body.msgTs;
-  const idx = (s.messages || []).findIndex(m => m.ts === msgTs && m.role === 'user');
+  const idx = messageIndexForAction(s.messages, req.body, 'user');
   if (idx < 0) return res.status(404).json({ error: '找不到该消息' });
   const before = s.messages || [];
   const um = s.messages[idx];
@@ -1230,8 +3001,7 @@ app.post('/api/sessions/:id/fork', async (req, res) => {
   const s = sessionsStore.data.sessions.find(x => x.id === req.params.id);
   if (!s) return res.status(404).json({ error: '会话不存在' });
   if (running.has(s.id)) return res.status(400).json({ error: '会话正在运行中' });
-  const msgTs = req.body && req.body.msgTs;
-  const idx = (s.messages || []).findIndex(m => m.ts === msgTs);
+  const idx = messageIndexForAction(s.messages, req.body);
   if (idx < 0) return res.status(404).json({ error: '找不到分叉点' });
   const copied = s.messages.slice(0, idx + 1);
   const ns = {
@@ -1259,41 +3029,51 @@ app.post('/api/sessions/:id/fork', async (req, res) => {
 
 // ---------- 全库搜索 ----------
 app.get('/api/search', (req, res) => {
-  const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+  const q = rank.normalizeSearchQuery(typeof req.query.q === 'string' ? req.query.q : '');
   if (!q) return res.json({ results: [] });
-  const out = [];
   // 搜索范围包含当前会话和 JSONL 归档；恢复中的会话可能同时出现在两处，
   // 以当前会话为准，避免同一个命中显示两遍。
   const sessions = [...sessionsStore.data.sessions, ...readArchivedSessions()];
+  const activeIds = new Set(sessionsStore.data.sessions.map(s => String(s.id)));
   const seenSession = new Set();
+  const LIMIT = 60;
+  const ranked = [];
+  // 分级打分（移植自 t3code 的 searchRanking）：完全匹配 < 前缀 < 词边界 < 包含 < 模糊子序列
+  const TIERS = { exactBase: 0, prefixBase: 10, boundaryBase: 20, includesBase: 30, fuzzyBase: 60 };
   for (const s of sessions) {
     if (!s || !s.id || seenSession.has(String(s.id))) continue;
     seenSession.add(String(s.id));
-    if (out.length >= 60) break;
-    let matched = false;
-    if ((s.title || '').toLowerCase().includes(q)) {
-      out.push({ sessionId: s.id, agent: s.agent, title: s.title, msgTs: null, snippet: '※ 标题匹配 · ' + fmtRelS(s.updatedAt) });
-      matched = true;
+    const title = String(s.title || '');
+    let best = null;
+    const titleScore = rank.scoreQueryMatch({ value: title.toLowerCase(), query: q, ...TIERS });
+    if (titleScore !== null) {
+      best = { sessionId: s.id, agent: s.agent, title, msgTs: null, snippet: '※ 标题匹配 · ' + fmtRelS(s.updatedAt), _score: titleScore };
     }
-    // B15：每个会话最多一条消息命中（标题命中后不再追加），避免同一会话刷屏
-    if (matched) continue;
-    for (const m of (s.messages || [])) {
-      if (out.length >= 60) break;
+    // 消息命中：取该会话内**得分最高**的一条（旧实现取第一条，命中质量与顺序无关）
+    let msgBest = null;
+    for (const [msgIndex, m] of (s.messages || []).entries()) {
       let text = '';
       if (m.role === 'user') text = m.text || '';
       else if (Array.isArray(m.blocks)) text = m.blocks.filter(b => b.type === 'text').map(b => b.text).join('\n');
       else text = m.text || '';
-      const idx = text.toLowerCase().indexOf(q);
-      if (idx >= 0) {
-        out.push({
-          sessionId: s.id, agent: s.agent, title: s.title, msgTs: m.ts,
-          snippet: '…' + text.slice(Math.max(0, idx - 30), idx + 90).replace(/\n/g, ' ') + '…',
-        });
-        break;
-      }
+      if (!text) continue;
+      const norm = text.toLowerCase();
+      const sc = rank.scoreQueryMatch({ value: norm, query: q, exactBase: 0, prefixBase: 12, boundaryBase: 24, includesBase: 40, fuzzyBase: 90 });
+      if (sc === null) continue;
+      const idx = norm.indexOf(q);
+      const snippet = idx >= 0
+        ? '…' + text.slice(Math.max(0, idx - 30), idx + 90).replace(/\n/g, ' ') + '…'
+        : '…' + text.slice(0, 120).replace(/\n/g, ' ') + '…';
+      if (!msgBest || sc < msgBest._score) msgBest = { sessionId: s.id, agent: s.agent, title, msgTs: m.ts, msgIndex, snippet, _score: sc + 5 };
     }
+    const pick = (!best || (msgBest && msgBest._score < best._score)) ? msgBest : best;
+    if (!pick) continue;
+    // tieBreaker 用倒序时间戳（定宽字符串）：得分相同时越新越靠前
+    const tie = String(9999999999999 - (Number(pick.msgTs) || Number(s.updatedAt) || 0)).padStart(13, '0');
+    pick.archived = !activeIds.has(String(s.id));
+    rank.insertRankedSearchResult(ranked, { item: pick, score: pick._score, tieBreaker: tie }, LIMIT);
   }
-  res.json({ results: out });
+  res.json({ results: ranked.map(r => { const rest = { ...r.item }; delete rest._score; return rest; }) });
 });
 
 function fmtRelS(ts) {
@@ -1309,6 +3089,14 @@ app.get('/api/fs/ls', async (req, res) => {
   const host = typeof req.query.host === 'string' ? req.query.host.trim() : '';
   const localHost = !host || host === 'local';
   const queryPath = typeof req.query.path === 'string' ? req.query.path : '';
+  // 目录选择器：只读令牌不能新建/改会话，用不上它，而它能把整台机器的目录树
+  // （含驱动器根）摊开。空路径的根视图对只读令牌直接拒绝。
+  if (req.readOnly) {
+    const wanted = queryPath.trim();
+    if (!wanted) return res.status(403).json({ error: '只读令牌不能浏览工作目录之外的文件夹' });
+    const gated = roDiskGate(req, res, host, localHost ? expandLocalPath(wanted) : wanted);
+    if (gated === null) return;
+  }
   // WSL 目录浏览
   if (host === 'wsl') {
     if (process.platform !== 'win32') return res.status(400).json({ error: 'WSL 仅在 Windows 上可用' });
@@ -1351,14 +3139,9 @@ app.get('/api/fs/ls', async (req, res) => {
     const cfg = ssh.getHostCfg(host);
     if (!cfg) return res.status(404).json({ error: '主机不存在' });
     const rp = queryPath.trim();
-    if (!rp) {
-      const home = cfg.user === 'root' ? '/root' : '/home/' + cfg.user;
-      return res.json({ root: true, dirs: [
-        { name: '/（根目录）', path: '/', drive: true },
-        { name: home + '（' + cfg.user + ' 主目录）', path: home, special: true },
-      ] });
-    }
-    ssh.listRemoteDirs(cfg, rp).then(r => res.json(r)).catch(e => res.status(400).json({ error: e.message }));
+    ssh.listRemoteDirs(cfg, rp, { showHidden: req.query.showHidden === '1' })
+      .then(r => res.json({ ...r, root: !rp }))
+      .catch(e => res.status(400).json({ error: e.message }));
     return;
   }
   let p = expandLocalPath(queryPath.trim());
@@ -1398,6 +3181,803 @@ app.get('/api/fs/ls', async (req, res) => {
 // ---------- 设置 / agents ----------
 app.get('/api/agents', async (req, res) => {
   res.json(await agents.detectAgentsCached(settings.data));
+});
+// 前端启动时探测自身权限级别：只读令牌进入时隐藏发送/终端/审批等写操作
+app.get('/api/meta', (req, res) => {
+  res.json({ readonly: req.readOnly === true, version: require('./package.json').version || '' });
+});
+// 手动月限额装饰（T1-5）：把「本月已用 / 上限」挂到额度条目上，前端角标与
+// /usage-limits 卡片直接显示；未配置限额的供应商原样返回。
+function withManualLimits(item) {
+  if (!item || !item.providerId) return item;
+  const lim = (settings.data.providerLimits || {})[item.providerId];
+  if (!lim || !(lim.monthlyUsd > 0 || lim.windowUsd > 0)) return item;
+  const manual = {};
+  if (lim.monthlyUsd > 0) {
+    const spend = usage.monthSpend();
+    const used = spend.byId[item.providerId] != null ? spend.byId[item.providerId] : (spend.byName[item.name] || 0);
+    manual.month = spend.month;
+    manual.limitUsd = lim.monthlyUsd;
+    manual.usedUsd = Math.round(used * 100) / 100;
+    manual.pctUsed = Math.min(1, used / lim.monthlyUsd);
+  }
+  if (lim.windowUsd > 0) {
+    const win = usage.spendWindow(lim.windowHours || 5);
+    const usedW = win.byId[item.providerId] != null ? win.byId[item.providerId] : (win.byName[item.name] || 0);
+    manual.window = {
+      hours: win.hours,
+      limitUsd: lim.windowUsd,
+      usedUsd: Math.round(usedW * 100) / 100,
+      pctUsed: Math.min(1, usedW / lim.windowUsd),
+      resetsInMs: win.resetsInMs,
+    };
+  }
+  item.manual = manual;
+  return item;
+}
+app.get('/api/quota', async (req, res) => {
+  const force = req.query.force === '1';
+  const providerId = typeof req.query.providerId === 'string' ? req.query.providerId : '';
+  try {
+    if (providerId) {
+      const r = await quota.one(providerStore.data.list, providerId, force);
+      return res.json(r.item ? { item: withManualLimits(r.item), ts: r.ts } : { item: null, error: '供应商不存在' });
+    }
+    const all = await quota.all(providerStore.data.list, force);
+    for (const item of (all && all.items) || []) withManualLimits(item);
+    res.json(all);
+  } catch (e) {
+    res.status(500).json({ error: e.message || '额度查询失败' });
+  }
+});
+
+// ---------- Git 工作区（P1-B）：status/diff/commit/push/PR/checkpoint ----------
+// cwd 一律先展开再校验存在且是目录；命令全部 execFile 数组参数。只支持本机
+// 路径（WSL/SSH 远程工作区走目标环境 git 的场景留待后续，避免把路径翻译
+// 混进两层环境）。只读令牌自动被上面的中间件挡在写操作之外。
+function resolveLocalGitDir(raw) {
+  const p = expandLocalPath(String(raw || '').slice(0, 2048));
+  if (!p || p.length < 2) return null;
+  try { if (!fs.statSync(p).isDirectory()) return null; } catch { return null; }
+  return p;
+}
+async function gitReadyOr400(req, res, rawCwd) {
+  const resolved = resolveLocalGitDir(rawCwd);
+  if (!resolved) { res.status(400).json({ error: '目录不存在或不可用' }); return null; }
+  // 前端在只读模式下已经隐藏了 Git 入口，这里再挡一次：diff 的内容就是文件明文，
+  // 放开等于绕过 /api/fs/raw 的边界从另一扇门读任意仓库。
+  const cwd = roDiskGate(req, res, '', resolved);
+  if (cwd === null) return null;
+  if (!(await git.isRepo(cwd))) { res.status(400).json({ error: '该目录不是 Git 仓库（或未安装 git）' }); return null; }
+  return cwd;
+}
+app.get('/api/git/status', async (req, res) => {
+  const cwd = await gitReadyOr400(req, res, req.query.cwd);
+  if (cwd) res.json({ ...(await git.status(cwd)), cwd });
+});
+app.get('/api/git/project-changes', async (req, res) => {
+  const cwd = await gitReadyOr400(req, res, req.query.cwd);
+  if (!cwd) return;
+  const root = await git.repoRoot(cwd);
+  if (!root) return res.status(500).json({ error: '无法读取仓库根目录' });
+  const active = sessionsStore.data.sessions;
+  const activeIds = new Set(active.map(s => String(s.id)));
+  const archived = readArchivedSessions().filter(s => !activeIds.has(String(s.id))).map(s => ({ ...s, archived: true }));
+  res.json({ ok: true, root, ...collectProjectChanges(root, active.concat(archived), expandLocalPath) });
+});
+app.get('/api/git/diff', async (req, res) => {
+  const cwd = await gitReadyOr400(req, res, req.query.cwd);
+  if (cwd) res.json(await git.diff(cwd, req.query.path));
+});
+app.get('/api/git/checkpoints', async (req, res) => {
+  const cwd = await gitReadyOr400(req, res, req.query.cwd);
+  if (cwd) res.json(await git.listCheckpoints(cwd));
+});
+app.post('/api/git/commit', async (req, res) => {
+  const b = req.body || {};
+  const cwd = await gitReadyOr400(req, res, b.cwd);
+  if (!cwd) return;
+  res.json(await git.commit(cwd, b.message, b.addAll !== false));
+});
+app.post('/api/git/push', async (req, res) => {
+  const b = req.body || {};
+  const cwd = await gitReadyOr400(req, res, b.cwd);
+  if (!cwd) return;
+  res.json(await git.push(cwd));
+});
+app.post('/api/git/pr', async (req, res) => {
+  const b = req.body || {};
+  const cwd = await gitReadyOr400(req, res, b.cwd);
+  if (!cwd) return;
+  res.json(await git.createPr(cwd, b.title, b.body));
+});
+app.post('/api/git/checkpoint', async (req, res) => {
+  const b = req.body || {};
+  const cwd = await gitReadyOr400(req, res, b.cwd);
+  if (!cwd) return;
+  res.json(await git.checkpoint(cwd, typeof b.label === 'string' ? b.label.slice(0, 200) : ''));
+});
+app.post('/api/git/checkpoint/restore', async (req, res) => {
+  const b = req.body || {};
+  const cwd = await gitReadyOr400(req, res, b.cwd);
+  if (!cwd) return;
+  // 恢复会丢弃快照之后的全部工作区改动，必须显式 confirm=true 才执行
+  if (b.confirm !== true) return res.status(400).json({ error: '恢复快照会丢弃之后的改动，需要显式确认' });
+  res.json(await git.restoreCheckpoint(cwd, b.id));
+});
+app.post('/api/git/checkpoint/delete', async (req, res) => {
+  const b = req.body || {};
+  const cwd = await gitReadyOr400(req, res, b.cwd);
+  if (!cwd) return;
+  res.json(await git.deleteCheckpoint(cwd, b.id));
+});
+// AI 提交信息（T1-1）：staged 优先的 diff + 最近 subject + 仓库惯例文件 →
+// 内置 Agent 的 chatOnly 通道生成一条提交信息。不落库、不跑工具。
+app.post('/api/git/suggest-commit', async (req, res) => {
+  const b = req.body || {};
+  const cwd = await gitReadyOr400(req, res, b.cwd);
+  if (!cwd) return;
+  const ctx = await git.collectCommitContext(cwd);
+  if (!ctx.diff.trim()) return res.json({ ok: false, error: '没有可提交的改动（diff 为空）' });
+  const cp = settings.data.currentProvider || {};
+  const providerId = (typeof b.providerId === 'string' && b.providerId.trim()) ? b.providerId.trim()
+    : cp.builtin || cp['chatgpt-web'] || '';
+  const provider = providerId ? findProvider(providerId) : null;
+  if (!provider || !provider.baseUrl || !provider.apiKey) return res.json({ ok: false, error: '未找到可用的内置 Agent 供应商：请在「API 管理」添加并设为默认' });
+  const model = (typeof b.model === 'string' && b.model.trim()) ? b.model.trim().slice(0, 256)
+    : (provider.model || (Array.isArray(provider.models) && provider.models[0]) || '');
+  if (!model) return res.json({ ok: false, error: '供应商未配置模型' });
+  const parts = [
+    '你是一个 commit message 生成器。根据下面的改动差异，生成一条提交信息。',
+    '规则：第一行是简洁的 subject（≤72 字符，语言跟随仓库已有 subject）；之后空一行写 2-4 行要点说明（可选）。',
+    '只输出提交信息本身，不要任何解释、引号或 markdown 代码围栏。',
+  ];
+  if (ctx.subjects.length) parts.push('\n## 仓库最近的提交 subject（风格参考）\n' + ctx.subjects.join('\n'));
+  if (ctx.conventions) parts.push('\n## 仓库惯例（节选）\n' + ctx.conventions);
+  parts.push('\n## 改动 diff（' + (ctx.staged ? '已暂存' : '未暂存全部') + (ctx.diffTruncated ? '，已截断' : '') + '）\n```diff\n' + ctx.diff + '\n```');
+  let text = '', errText = '';
+  const emit = ev => {
+    if (!ev || typeof ev !== 'object') return;
+    if (ev.kind === 'text' && typeof ev.text === 'string') text += ev.text;
+    else if (ev.kind === 'error' && typeof ev.text === 'string') errText = ev.text;
+  };
+  try {
+    const handle = apiAgent.runApiChat({ prompt: parts.join('\n'), model, provider, history: [], images: [], sessionKey: 'git-suggest' }, emit);
+    await handle.done;
+  } catch (e) {
+    return res.json({ ok: false, error: '生成失败：' + (e.message || '未知错误') });
+  }
+  if (!text.trim()) return res.json({ ok: false, error: errText ? '生成失败：' + errText : '生成失败：模型没有返回内容' });
+  const cleaned = text.trim().replace(/^```[a-z]*\n?|```$/g, '').trim().slice(0, 2000);
+  res.json({ ok: true, message: cleaned, model });
+});
+// 快照差异（T1-3）
+app.get('/api/git/diff-since', async (req, res) => {
+  const cwd = await gitReadyOr400(req, res, req.query.cwd);
+  if (!cwd) return;
+  res.json(await git.diffSince(cwd, req.query.id, req.query.full === '1'));
+});
+app.get('/api/git/compare-changes', async (req, res) => {
+  const cwd = await gitReadyOr400(req, res, req.query.cwd);
+  if (!cwd) return;
+  res.json(await git.compareChanges(cwd, req.query.base));
+});
+app.get('/api/git/compare-file', async (req, res) => {
+  const cwd = await gitReadyOr400(req, res, req.query.cwd);
+  if (!cwd) return;
+  res.json(await git.compareFileDiff(cwd, req.query.base, req.query.path));
+});
+// 每会话 worktree：独立目录 + 独立分支，不污染用户当前工作区
+app.post('/api/git/worktree', async (req, res) => {
+  const b = req.body || {};
+  const cwd = await gitReadyOr400(req, res, b.cwd);
+  if (!cwd) return;
+  const branch = String(b.branch || '').trim().slice(0, 128);
+  if (!branch || !/^[A-Za-z0-9._\/-]+$/.test(branch) || branch.includes('..') || branch.startsWith('/') || branch.endsWith('/')) {
+    return res.status(400).json({ error: '分支名不合法（仅字母数字 . _ - /，且不能以 / 开头结尾）' });
+  }
+  const r = await git.createWorktree(cwd, branch, typeof b.base === 'string' ? b.base : '');
+  if (!r.ok) return res.status(400).json({ error: r.error || 'worktree 创建失败' });
+  res.json(r);
+});
+app.get('/api/git/worktrees', async (req, res) => {
+  const cwd = await gitReadyOr400(req, res, req.query.cwd);
+  if (!cwd) return;
+  res.json(await git.listWorktrees(cwd));
+});
+app.post('/api/git/worktree/remove', async (req, res) => {
+  const b = req.body || {};
+  const cwd = await gitReadyOr400(req, res, b.cwd);
+  if (!cwd) return;
+  const r = await git.removeWorktree(cwd, typeof b.path === 'string' ? b.path : '');
+  if (!r.ok) return res.status(400).json({ error: r.error || 'worktree 删除失败' });
+  res.json(r);
+});
+// 项目默认（T1-4）：存取以展开 cwd 为键的会话默认配置
+app.get('/api/project-defaults', (req, res) => {
+  res.json({ items: Object.entries(settings.data.projectDefaults || {}).map(([cwd, v]) => ({ cwd, ...v })) });
+});
+app.put('/api/project-defaults', (req, res) => {
+  const b = req.body || {};
+  const cwd = expandLocalPath(String(b.cwd || '').trim().slice(0, 4096));
+  if (!cwd || cwd.length < 2) return res.status(400).json({ error: 'cwd 无效' });
+  if (b.clear === true) { delete settings.data.projectDefaults[cwd]; settings.save(); return res.json({ ok: true, cleared: true }); }
+  const v = {
+    permMode: typeof b.permMode === 'string' && PERM_MODES.includes(b.permMode) ? b.permMode : '',
+    providerId: typeof b.providerId === 'string' ? b.providerId.trim().slice(0, 256) : '',
+    model: typeof b.model === 'string' ? b.model.trim().slice(0, 256) : '',
+    effort: typeof b.effort === 'string' && EFFORT_LEVELS.includes(b.effort) ? b.effort : '',
+  };
+  if (!v.permMode && !v.providerId && !v.model && !v.effort) return res.status(400).json({ error: '至少要保存一项默认配置' });
+  settings.data.projectDefaults[cwd] = v;
+  settings.save();
+  res.json({ ok: true, cwd, ...v });
+});
+// 项目配置档案：命名保存一组项目运行配置，供设置页和新任务入口复用。
+app.get('/api/project-profiles', (req, res) => {
+  res.json({ items: Array.isArray(settings.data.projectProfiles) ? settings.data.projectProfiles : [] });
+});
+app.post('/api/project-profiles', (req, res) => {
+  const b = req.body || {};
+  const id = String(b.id || ('profile_' + Date.now().toString(36))).trim();
+  const name = String(b.name || '').trim();
+  if (!/^[A-Za-z0-9_-]{1,96}$/.test(id) || !name) return res.status(400).json({ error: '档案 ID 或名称无效' });
+  const next = {
+    id, name: name.slice(0, 120),
+    cwd: expandLocalPath(String(b.cwd || '').trim().slice(0, 4096)),
+    description: String(b.description || '').trim().slice(0, 400),
+    permMode: typeof b.permMode === 'string' && PERM_MODES.includes(b.permMode) ? b.permMode : '',
+    providerId: String(b.providerId || '').trim().slice(0, 256),
+    model: String(b.model || '').trim().slice(0, 256),
+    effort: typeof b.effort === 'string' && EFFORT_LEVELS.includes(b.effort) ? b.effort : '',
+    color: String(b.color || '#6d5dfc').slice(0, 32), updatedAt: Date.now(),
+  };
+  const list = Array.isArray(settings.data.projectProfiles) ? settings.data.projectProfiles : [];
+  const idx = list.findIndex(x => x && x.id === id);
+  if (idx >= 0) list[idx] = { ...list[idx], ...next };
+  else list.unshift(next);
+  settings.data.projectProfiles = list.slice(0, 100);
+  settings.save();
+  res.json({ ok: true, profile: next, items: settings.data.projectProfiles });
+});
+app.delete('/api/project-profiles/:id', (req, res) => {
+  const id = String(req.params.id || '');
+  const list = Array.isArray(settings.data.projectProfiles) ? settings.data.projectProfiles : [];
+  const next = list.filter(x => x && x.id !== id);
+  if (next.length === list.length) return res.status(404).json({ error: '档案不存在' });
+  settings.data.projectProfiles = next; settings.save();
+  res.json({ ok: true, items: next });
+});
+// 诊断（T5-1）
+app.get('/api/health', (req, res) => {
+  let eventsBytes = 0;
+  try {
+    const dir = path.join(DATA_DIR, 'events');
+    for (const f of fs.readdirSync(dir)) {
+      try { eventsBytes += fs.statSync(path.join(dir, f)).size; } catch {}
+    }
+  } catch {}
+  res.json({
+    version: require('./package.json').version || '',
+    startedAt: BOOT_TS,
+    uptime: Math.round(process.uptime()),
+    running: running.size,
+    sessions: sessionsStore.data.sessions.length,
+    providers: (providerStore.data.list || []).length,
+    ccswitchError: ccswitch.lastError || '',
+    eventsBytes,
+    log: logring.stats(),
+    node: process.version,
+    // 会话没选目录时 Agent/终端实际落脚的地方。界面要能显示它，
+    // 否则用户不知道生成的文件去了哪。
+    defaultWorkspace: defaultWorkspaceDir(),
+  });
+});
+// ---------- 数据备份 / 恢复（持久化底盘） ----------
+// 备份：把 data/ 打包为 zip 下载（默认含 events 事件流；排除历史恢复快照与临时目录）。
+// 恢复：上传 zip → 拒绝非法路径 → 先落一份时间戳快照 → 覆盖 → 提示重启生效。
+// 运行中会话存在时拒绝恢复：内存态会覆盖刚恢复的文件，先停后恢复才安全。
+function listDataFiles(includeEvents) {
+  const out = [];
+  const walk = (dir, rel) => {
+    let items = [];
+    try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const it of items) {
+      const r = rel ? rel + '/' + it.name : it.name;
+      if (r.startsWith('.restore-backup-') || r === 'tmp-settings') continue;
+      // 回收站（文件删除的落地处）不进备份：它是本机误删的补救，不是用户数据的一部分
+      if (r === 'trash') continue;
+      // SQLite 索引不进备份：它是可重建的派生物，打进去只会让备份变大；
+      // 而且带 WAL 的库文件在运行中按文件复制并不保证一致。
+      // 恢复之后索引为空，下次启动的 syncFromSources 会按 JSON 重新灌一遍。
+      if (/^agenthub\.db(?:-wal|-shm)?$/.test(r)) continue;
+      if (it.isDirectory()) {
+        if (!includeEvents && r === 'events') continue;
+        walk(path.join(dir, it.name), r);
+      } else if (it.isFile()) {
+        out.push({ r, full: path.join(dir, it.name) });
+      }
+    }
+  };
+  walk(DATA_DIR, '');
+  return out;
+}
+app.get('/api/backup', async (req, res) => {
+  // 只读令牌能看到会话/进度，但备份包含凭据与全部历史——必须全权令牌
+  if (req.readOnly === true) return res.status(403).json({ error: '只读令牌不能导出备份（含凭据与全部会话）' });
+  const includeEvents = String(req.query.events || '1') !== '0';
+  try {
+    if (!flushAllStores()) throw new Error('当前数据尚未成功落盘，请检查数据目录权限与磁盘空间');
+    const zip = new JSZip();
+    const files = listDataFiles(includeEvents);
+    let bytes = 0;
+    for (const f of files) {
+      const buf = await fs.promises.readFile(f.full);
+      bytes += buf.length;
+      zip.file(f.r, buf);
+    }
+    zip.file('.backup-meta.json', JSON.stringify({
+      version: require('./package.json').version || '',
+      at: new Date().toISOString(),
+      files: files.length,
+      bytes,
+      events: includeEvents,
+      dataDir: DATA_DIR,
+    }, null, 2));
+    const buf = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="agenthub-backup-' + stamp + '.zip"');
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ error: '备份失败: ' + e.message });
+  }
+});
+app.post('/api/restore', express.raw({ type: 'application/zip', limit: '512mb' }), async (req, res) => {
+  if (running.size || activeWrites || restoreState) return res.status(409).json({ error: '有会话或写入操作正在运行，请完成后再恢复' });
+  if (!req.body || !req.body.length) return res.status(400).json({ error: '请上传 zip 文件（Content-Type: application/zip）' });
+  if (String(req.query.confirm) !== '1') return res.status(400).json({ error: '恢复会覆盖当前数据：请在 URL 加 confirm=1 重试（服务端会先自动快照）' });
+  let zip;
+  try { zip = await JSZip.loadAsync(req.body); } catch (e) { return res.status(400).json({ error: 'zip 解析失败: ' + e.message }); }
+  const names = Object.keys(zip.files);
+  if (!names.length) return res.status(400).json({ error: 'zip 为空' });
+  for (const n of names) {
+    const original = zip.files[n].unsafeOriginalName || n;
+    if ([n, original].some(value => value.includes('..') || value.startsWith('/') || value.startsWith('\\') || value.includes(':'))) {
+      return res.status(400).json({ error: 'zip 内含非法路径，已拒绝: ' + n });
+    }
+    // Existing symlinks/junctions must not redirect writes outside DATA_DIR.
+    let current = path.resolve(DATA_DIR);
+    for (const part of n.split(/[\\/]/).filter(Boolean)) {
+      current = path.join(current, part);
+      try { if (fs.lstatSync(current).isSymbolicLink()) return res.status(400).json({ error: '恢复路径包含符号链接，已拒绝: ' + n }); }
+      catch (e) { if (e.code !== 'ENOENT') return res.status(400).json({ error: '恢复路径不可访问: ' + n }); }
+    }
+  }
+  // Recheck after asynchronous ZIP parsing, then hold the gate until restart.
+  if (running.size || activeWrites || restoreState) return res.status(409).json({ error: '有会话或写入操作正在运行，请完成后再恢复' });
+  if (!flushAllStores()) return res.status(500).json({ error: '恢复前数据落盘失败，未覆盖备份' });
+  restoreState = 'restoring';
+  pauseStoreWrites();
+  // 恢复前快照：失败可手动回滚（保留在 data/.restore-backup-<时间戳>/）
+  const snap = path.join(DATA_DIR, '.restore-backup-' + new Date().toISOString().replace(/[:.]/g, '-'));
+  let copied = 0;
+  try {
+    for (const f of listDataFiles(true)) {
+      const dest = path.join(snap, f.r);
+      await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+      await fs.promises.copyFile(f.full, dest);
+      copied++;
+    }
+  } catch (e) {
+    restoreState = ''; pauseStoreWrites(false);
+    return res.status(500).json({ error: '恢复前快照失败，未改动任何数据: ' + e.message });
+  }
+  let restored = 0;
+  try {
+    for (const n of names) {
+      const f = zip.files[n];
+      if (f.dir || n === '.backup-meta.json') continue;
+      const dest = path.join(DATA_DIR, n);
+      await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+      await fs.promises.writeFile(dest, await f.async('nodebuffer'));
+      restored++;
+    }
+  } catch (e) {
+    restoreState = 'restart-required';
+    return res.status(500).json({ error: '恢复写入失败（恢复前快照仍保留在 ' + snap + '，可手动回滚）: ' + e.message });
+  }
+  restoreState = 'restart-required';
+  // 索引层按新数据重建：这里只清空，重启时的 syncFromSources 会按恢复后的
+  // JSON 重新灌一遍（恢复流程本就不允许继续写，空索引不会影响任何读取路径）。
+  try { db.rebuildFromSources({ sessions: [], usageRecords: [] }); } catch (e) { console.error('[db] 恢复后清空索引失败：' + e.message); }
+  res.json({ ok: true, restored, snapshot: snap, preSnapshotFiles: copied, restartRequired: true, note: '数据已覆盖；运行中的服务内存态未刷新，请重启 server.js 后生效' });
+});
+app.get('/api/logs', (req, res) => {
+  res.json(logring.tail(req.query.tail, typeof req.query.level === 'string' ? req.query.level : ''));
+});
+
+// ---------- 助手（Assistant） ----------
+// 会话级角色：一段系统提示词 + 一组默认运行参数。提示词按 Agent 能力注入
+// （内置 Agent 拼 system，Claude 用 --append-system-prompt，其余只应用默认参数）。
+function assistantPromptFor(session) {
+  try { return assistants.promptForSession(session); } catch (e) { console.error('[assistants] prompt:', e.message); return ''; }
+}
+app.get('/api/assistants', (req, res) => {
+  const { builtin, custom } = assistants.list();
+  res.json({ builtin, custom, total: builtin.length + custom.length });
+});
+app.post('/api/assistants', (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '请求格式无效' });
+  try { res.json({ ok: true, assistant: assistants.upsertCustom(req.body) }); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+app.put('/api/assistants/:id', (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '请求格式无效' });
+  try { res.json({ ok: true, assistant: assistants.upsertCustom({ ...req.body, id: req.params.id }) }); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+app.delete('/api/assistants/:id', (req, res) => {
+  if (!assistants.removeCustom(req.params.id)) return res.status(404).json({ error: '自定义助手不存在（内置助手只能停用）' });
+  res.json({ ok: true });
+});
+// 内置助手只能启用/停用：它们是代码定义的目录，改不了也不该被删
+app.post('/api/assistants/:id/enabled', (req, res) => {
+  if (!isRecord(req.body) || typeof req.body.enabled !== 'boolean') return res.status(400).json({ error: 'enabled 必须是布尔值' });
+  if (!assistants.setBuiltinEnabled(req.params.id, req.body.enabled)) return res.status(404).json({ error: '内置助手不存在' });
+  res.json({ ok: true });
+});
+
+// ---------- 第三方 MCP 服务器（管理 + 注入 + 连接测试） ----------
+// 条目由 lib/mcp-servers.js 持久化；会话启动时经 agents.setMcpOptions 的
+// extraServers 钩子注入给 Claude（--mcp-config）与 Codex（-c 覆盖）。
+app.get('/api/mcp/servers', (req, res) => {
+  res.json({ servers: mcpServers.list().map(mcpServers.publicServer) });
+});
+app.post('/api/mcp/servers', (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '请求格式无效' });
+  try {
+    const server = mcpServers.upsert(req.body);
+    res.json({ ok: true, server: mcpServers.publicServer(server) });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+app.put('/api/mcp/servers/:id', (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '请求格式无效' });
+  if (!mcpServers.find(req.params.id)) return res.status(404).json({ error: 'MCP 服务器不存在' });
+  try {
+    const server = mcpServers.upsert({ ...req.body, id: req.params.id });
+    res.json({ ok: true, server: mcpServers.publicServer(server) });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+app.delete('/api/mcp/servers/:id', (req, res) => {
+  if (!mcpServers.remove(req.params.id)) return res.status(404).json({ error: 'MCP 服务器不存在' });
+  res.json({ ok: true });
+});
+app.post('/api/mcp/servers/:id/test', async (req, res) => {
+  if (!mcpServers.find(req.params.id)) return res.status(404).json({ error: 'MCP 服务器不存在' });
+  try {
+    const result = await mcpServers.test(req.params.id);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+// 发现：本机已装 CLI 的配置里现成的 MCP 服务器（Claude 的 mcpServers、Codex 的 config.toml）
+app.get('/api/mcp/detect', (req, res) => {
+  try {
+    res.json({ servers: mcpServers.detect() });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+app.post('/api/mcp/import-json', (req, res) => {
+  if (!isRecord(req.body) || typeof req.body.json !== 'string') return res.status(400).json({ error: '缺少 json 字符串' });
+  if (req.body.json.length > 200000) return res.status(413).json({ error: 'JSON 过大' });
+  try {
+    res.json(mcpServers.importJson(req.body.json));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// ---------- SQLite 数据层（检索 / 聚合 / 维护） ----------
+// JSON 仍是权威源，这里是可重建的索引层：/api/db/rebuild 任何时候都能把它
+// 按 JSON/JSONL 重新灌一遍。AGENTHUB_DB=0 时全部端点回落到 JSON 扫描语义。
+function findSession(id) {
+  return sessionsStore.data.sessions.find(x => String(x.id) === String(id)) || null;
+}
+
+// ---------- B11 消息能力：跨会话提及与 /btw 旁问 ----------
+// 会话索引里通常不再内嵌正文；引用展开时按需读取正文文件。归档会话本身
+// 已带完整消息，所以不需要先恢复就可以作为只读参考资料。
+function sessionMessagesForFeatures(session) {
+  if (!session) return [];
+  if (Array.isArray(session.messages)) return session.messages;
+  const loaded = sessionFiles.loadMessages(session.id);
+  return Array.isArray(loaded) ? loaded : [];
+}
+
+function featureSession(session) {
+  if (!session) return null;
+  const copy = { ...session };
+  copy.messages = sessionMessagesForFeatures(session);
+  return copy;
+}
+
+function mentionSessionMap() {
+  const map = new Map();
+  for (const session of sessionsStore.data.sessions || []) {
+    if (session && session.id) map.set(String(session.id), session);
+  }
+  for (const session of readArchivedSessions()) {
+    if (session && session.id && !map.has(String(session.id))) map.set(String(session.id), session);
+  }
+  return map;
+}
+
+function mentionSessionSummary(session) {
+  const messages = sessionMessagesForFeatures(session);
+  return {
+    id: String(session.id), title: String(session.title || '新会话').slice(0, 200),
+    agent: String(session.agent || ''), cwd: String(session.cwd || '').slice(0, 4096),
+    updatedAt: Number(session.updatedAt) || 0, createdAt: Number(session.createdAt) || 0,
+    msgCount: messages.length, archived: !!session.archived,
+  };
+}
+
+function mentionCandidates(req) {
+  const q = String(req.query.q || '').trim().slice(0, 100).toLowerCase();
+  const currentId = String(req.query.currentSessionId || req.query.sessionId || '');
+  const limit = Math.max(1, Math.min(50, Number(req.query.limit) || 20));
+  const rows = [...mentionSessionMap().values()]
+    .filter(session => String(session.id) !== currentId)
+    .map(mentionSessionSummary)
+    .filter(row => !q || [row.title, row.agent, row.id, row.cwd].some(value => String(value).toLowerCase().includes(q)))
+    .sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt))
+    .slice(0, limit);
+  return { query: q, currentSessionId: currentId, results: rows };
+}
+
+app.get('/api/sessions/mentions', (req, res) => res.json(mentionCandidates(req)));
+// 另一个更贴近消息语义的别名，便于插件/外部前端调用；两者返回完全相同。
+app.get('/api/messages/mentions', (req, res) => res.json(mentionCandidates(req)));
+
+function resolveMessageMentions(body) {
+  const text = String(body && body.text == null ? '' : (body && body.text) || '');
+  if (text.length > 200000) throw new Error('消息过长，无法展开跨会话提及');
+  const rootId = String(body && body.sessionId || '').slice(0, 256);
+  const sessions = mentionSessionMap();
+  const result = messageFeatures.expandMentions(text, rootId, id => featureSession(sessions.get(String(id))), {
+    maxMentions: 8, maxDepth: 3, maxChars: 48000, maxMessages: 24, perMessageChars: 4000,
+  });
+  return { ok: true, sessionId: rootId, ...result };
+}
+
+app.post('/api/messages/mentions/resolve', (req, res) => {
+  if (!isRecord(req.body) || typeof req.body.text !== 'string') return res.status(400).json({ error: 'text 必须是文本' });
+  try { res.json(resolveMessageMentions(req.body)); }
+  catch (e) { res.status(400).json({ error: e.message || '提及展开失败' }); }
+});
+app.post('/api/mentions/resolve', (req, res) => {
+  if (!isRecord(req.body) || typeof req.body.text !== 'string') return res.status(400).json({ error: 'text 必须是文本' });
+  try { res.json(resolveMessageMentions(req.body)); }
+  catch (e) { res.status(400).json({ error: e.message || '提及展开失败' }); }
+});
+
+const btwBuckets = new Map();
+function allowBtw(req, sessionId) {
+  const ip = String(req.ip || (req.socket && req.socket.remoteAddress) || 'local');
+  const key = ip + '|' + String(sessionId || '');
+  const now = Date.now();
+  const list = (btwBuckets.get(key) || []).filter(ts => now - ts < 60 * 1000);
+  if (list.length >= 6) {
+    btwBuckets.set(key, list);
+    return { ok: false, retryAfter: Math.max(1, Math.ceil((60 * 1000 - (now - list[0])) / 1000)) };
+  }
+  list.push(now);
+  btwBuckets.set(key, list);
+  // 只保留一个小的、近期活跃的桶集合，避免长期运行的本地服务被随机 IP
+  // 或大量会话名持续占用内存。
+  if (btwBuckets.size > 2048) {
+    for (const [bucket, stamps] of btwBuckets) {
+      if (!stamps.length || now - stamps[stamps.length - 1] >= 60 * 1000) btwBuckets.delete(bucket);
+      if (btwBuckets.size <= 1800) break;
+    }
+  }
+  return { ok: true };
+}
+
+function btwHistory(session) {
+  const messages = sessionMessagesForFeatures(session).slice(-12);
+  const rows = [];
+  let chars = 0;
+  for (const message of messages) {
+    const text = messageFeatures.trimForContext(messageFeatures.textOfMessage(message), 3000).trim();
+    if (!text) continue;
+    const row = { role: message.role === 'assistant' ? 'assistant' : 'user', text };
+    if (chars + row.text.length > 12000) break;
+    rows.push(row); chars += row.text.length;
+  }
+  return rows;
+}
+
+app.post('/api/btw', async (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '请求格式无效' });
+  const sessionId = typeof req.body.sessionId === 'string' ? req.body.sessionId.trim() : '';
+  const rawQuestion = typeof req.body.question === 'string' ? req.body.question : '';
+  const question = rawQuestion.replace(/^\/btw(?:\s+|$)/i, '').trim();
+  if (!sessionId || sessionId.length > 256) return res.status(400).json({ error: 'sessionId 必填' });
+  if (!question) return res.status(400).json({ error: '旁问内容不能为空' });
+  if (question.length > 4000) return res.status(400).json({ error: '旁问不能超过 4000 字符' });
+  const session = mentionSessionMap().get(sessionId);
+  if (!session) return res.status(404).json({ error: '会话不存在' });
+  const quota = allowBtw(req, sessionId);
+  if (!quota.ok) {
+    res.setHeader('Retry-After', String(quota.retryAfter));
+    return res.status(429).json({ error: '旁问请求过于频繁，请稍后再试', retryAfter: quota.retryAfter });
+  }
+  const provider = session.providerId ? findProvider(session.providerId) : defaultProviderForAgent(session.agent);
+  if (!provider) return res.status(400).json({ error: '当前会话没有可用供应商，无法进行旁问' });
+  const model = String(req.body.model || session.model || provider.model || (Array.isArray(provider.models) ? provider.models[0] : '') || '').trim().slice(0, 256);
+  if (!model) return res.status(400).json({ error: '当前会话没有可用模型，无法进行旁问' });
+  const history = req.body.includeContext === false ? [] : btwHistory(session);
+  const answerParts = [];
+  const errors = [];
+  let usageResult = null;
+  let handle = null;
+  let timer = null;
+  let sawDelta = false;
+  const key = 'btw:' + sessionId + ':' + crypto.randomUUID();
+  try {
+    handle = runApiChat({
+      prompt: question, model, provider, history, sessionKey: key,
+      effort: String(session.effort || ''), systemPrompt: assistantPromptFor(session),
+    }, ev => {
+      if (!ev || typeof ev !== 'object') return;
+      if (ev.kind === 'delta' && typeof ev.text === 'string') { sawDelta = true; answerParts.push(ev.text); }
+      else if (ev.kind === 'text' && !sawDelta && typeof ev.text === 'string') answerParts.push(ev.text);
+      else if (ev.kind === 'error' && ev.text) errors.push(String(ev.text));
+      else if (ev.kind === 'usage' && isRecord(ev.usage)) usageResult = ev.usage;
+    });
+    if (!handle || !handle.done || typeof handle.done.then !== 'function') throw new Error('旁问没有返回有效的执行句柄');
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        try { handle.cancel && handle.cancel(); } catch {}
+        reject(new Error('旁问超时，请稍后重试'));
+      }, 90000);
+    });
+    const code = await Promise.race([handle.done, timeout]);
+    if (code !== 0) throw new Error(errors[0] || '旁问未完成');
+    const answer = answerParts.join('').trim();
+    if (!answer) throw new Error('供应商返回了空的旁问结果');
+    const u = usageResult || {};
+    usage.record({
+      agent: session.agent, model: u.model || model, provider: provider.name || '', providerId: provider.id || '',
+      input: Number(u.input) || 0, output: Number(u.output) || 0,
+      cacheRead: Number(u.cacheRead) || 0, cacheCreate: Number(u.cacheCreate) || 0,
+      sessionId: session.id, sessionKey: session.id, project: usageProjectForSession(session),
+      elapsedMs: 0, success: true, source: 'btw',
+    });
+    res.json({ ok: true, answer: answer.slice(0, 50000), model: u.model || model, contextMessages: history.length, usage: u });
+  } catch (e) {
+    const u = usageResult || {};
+    if (usageResult) usage.record({
+      agent: session.agent, model: u.model || model, provider: provider.name || '', providerId: provider.id || '',
+      input: Number(u.input) || 0, output: Number(u.output) || 0,
+      cacheRead: Number(u.cacheRead) || 0, cacheCreate: Number(u.cacheCreate) || 0,
+      sessionId: session.id, sessionKey: session.id, project: usageProjectForSession(session),
+      elapsedMs: 0, success: false, source: 'btw',
+    });
+    res.status(502).json({ error: e.message || '旁问失败' });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+});
+
+// 索引不可用时的会话内检索回落：正文本来就在内存里，线性扫一遍即可。
+function searchSessionMessages(session, q, limit) {
+  const needle = q.toLowerCase();
+  const out = [];
+  const msgs = Array.isArray(session.messages) ? session.messages : [];
+  for (let i = msgs.length - 1; i >= 0 && out.length < limit; i--) {
+    const text = db.textOfMessage(msgs[i]);
+    const at = text.toLowerCase().indexOf(needle);
+    if (at < 0) continue;
+    const start = Math.max(0, at - 60);
+    const end = Math.min(text.length, at + needle.length + 60);
+    out.push({
+      sessionId: session.id, idx: i, role: msgs[i].role, ts: msgs[i].ts, title: session.title,
+      agent: session.agent, cwd: session.cwd,
+      snippet: (start > 0 ? '…' : '') + text.slice(start, end).replace(/\s+/g, ' ') + (end < text.length ? '…' : ''), at,
+    });
+  }
+  return out;
+}
+app.get('/api/db/status', (req, res) => {
+  const status = db.status();
+  res.json({ ...status, eventsDir: path.join(DATA_DIR, 'events') });
+});
+app.post('/api/db/rebuild', (req, res) => {
+  if (restoreState) return res.status(409).json({ error: '数据恢复中，请重启 AgentHub 后再操作', restartRequired: true });
+  const r = db.rebuildFromSources({
+    sessions: sessionsStore.data.sessions,
+    usageRecords: (usage.usageStore && usage.usageStore.data && usage.usageStore.data.records) || [],
+    eventsDir: path.join(DATA_DIR, 'events'),
+  });
+  if (!r.ok) return res.status(500).json({ error: '重建失败：' + (r.error || 'unknown') });
+  res.json({ ok: true, ...r, status: db.status() });
+});
+app.post('/api/db/vacuum', (req, res) => {
+  const r = db.vacuum();
+  if (!r.ok) return res.status(500).json({ error: '整理失败：' + (r.error || 'unknown') });
+  res.json({ ok: true, ...r });
+});
+// 会话内检索：不读全量正文，直接查索引；命中带片段与消息序号，前端可跳转定位。
+app.get('/api/sessions/:id/search', (req, res) => {
+  const session = findSession(req.params.id);
+  if (!session) return res.status(404).json({ error: '会话不存在' });
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json({ query: '', total: 0, results: [], engine: db.enabled() ? 'sqlite' : 'disabled' });
+  const limit = Math.max(1, Math.min(Number(req.query.limit) || 50, 200));
+  const r = db.searchMessages({ q, sessionId: String(session.id), limit });
+  if (!r.ok) {
+    // 索引不可用时退回内存扫描（会话正文本来就在内存里）
+    const fallback = searchSessionMessages(session, q, limit);
+    return res.json({ query: q, total: fallback.length, results: fallback, engine: 'memory', fallbackReason: r.error || '' });
+  }
+  res.json({ query: q, total: r.total, results: r.rows, engine: r.engine === 'fts5' ? 'sqlite-fts' : 'sqlite' });
+});
+// 跨会话消息检索（索引版 /api/search）：带片段与命中位置，UI 用来做「全局消息搜索」。
+app.get('/api/messages/search', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json({ query: '', total: 0, results: [] });
+  const limit = Math.max(1, Math.min(Number(req.query.limit) || 40, 200));
+  const r = db.searchMessages({ q, limit });
+  if (!r.ok) return res.status(503).json({ error: '索引不可用：' + (r.error || 'unknown'), hint: '可在「设置 → 数据与维护」重建索引' });
+  const titles = new Map(sessionsStore.data.sessions.map(s => [String(s.id), s]));
+  const archived = new Map(readArchivedSessions().map(s => [String(s.id), s]));
+  const results = r.rows.map(row => {
+    const live = titles.get(String(row.sessionId));
+    const arch = archived.get(String(row.sessionId));
+    const src = live || arch || {};
+    return {
+      sessionId: row.sessionId, agent: src.agent || row.agent || '', title: src.title || row.title || '',
+      msgTs: row.ts, msgIndex: row.idx, role: row.role, snippet: row.snippet,
+      archived: !live && !!arch,
+    };
+  });
+  res.json({ query: q, total: r.total, engine: r.engine === 'fts5' ? 'sqlite-fts' : 'sqlite', results });
+});
+app.get('/api/db/usage', (req, res) => {
+  const groupBy = String(req.query.groupBy || 'day');
+  const r = db.usageSummary({
+    from: Number(req.query.from) || 0, to: Number(req.query.to) || 0, groupBy,
+    agent: String(req.query.agent || ''), model: String(req.query.model || ''),
+    provider: String(req.query.provider || ''), source: String(req.query.source || ''),
+  });
+  if (!r.ok) return res.status(503).json({ error: '索引不可用：' + (r.error || 'unknown') });
+  const price = settings.data.modelPricing || {};
+  const rows = (r.rows || []).map(row => {
+    const p = price[row.grp] || null;
+    const cost = p ? ((row.input || 0) / 1e6) * (Number(p.in) || 0) + ((row.output || 0) / 1e6) * (Number(p.out) || 0) : null;
+    return { ...row, cost };
+  });
+  const totals = r.totals || {};
+  res.json({ groupBy: r.groupBy, rows, totals, source: 'sqlite' });
+});
+app.get('/api/sessions/:id/events', (req, res) => {
+  const session = findSession(req.params.id);
+  const archivedOnly = !session && readArchivedSessions().some(s => String(s.id) === String(req.params.id));
+  if (!session && !archivedOnly) return res.status(404).json({ error: '会话不存在' });
+  const r = db.sessionEvents(String(req.params.id), {
+    limit: Number(req.query.limit) || 200, sinceSeq: Number(req.query.since) || 0,
+  });
+  if (!r.ok) return res.status(503).json({ error: '索引不可用：' + (r.error || 'unknown') });
+  res.json({ sessionId: String(req.params.id), count: r.rows.length, events: r.rows });
 });
 app.get('/api/settings', (req, res) => {
   const s = { ...settings.data };
@@ -1492,6 +4072,21 @@ app.put('/api/settings', (req, res) => {
     }
     clean.recentModels = recent;
   }
+  if (has('recentModelsByProvider')) {
+    if (!isRecord(body.recentModelsByProvider)) return invalid('按供应商记录的最近模型格式无效');
+    const scoped = {};
+    for (const [agent, byProvider] of Object.entries(body.recentModelsByProvider).slice(0, 32)) {
+      const agentKey = safeKey(agent);
+      if (!agentKey || !isRecord(byProvider)) return invalid('按供应商记录的最近模型格式无效');
+      const rows = {};
+      for (const [providerId, values] of Object.entries(byProvider).slice(0, 64)) {
+        if (!/^[A-Za-z0-9:_-]{1,256}$/.test(providerId) || !Array.isArray(values) || values.some(x => typeof x !== 'string')) return invalid('按供应商记录的最近模型格式无效');
+        rows[providerId] = values.map(x => x.trim().slice(0, 256)).filter(Boolean).slice(0, 50);
+      }
+      scoped[agentKey] = rows;
+    }
+    clean.recentModelsByProvider = scoped;
+  }
   if (has('contextWindows')) {
     if (!isRecord(body.contextWindows)) return invalid('上下文窗口格式无效');
     const windows = {};
@@ -1503,6 +4098,40 @@ app.put('/api/settings', (req, res) => {
     }
     clean.contextWindows = windows;
   }
+  if (has('projectProfiles')) {
+    if (!Array.isArray(body.projectProfiles) || body.projectProfiles.length > 100) return invalid('项目配置档案格式无效');
+    const seenProfiles = new Set();
+    clean.projectProfiles = [];
+    for (const p of body.projectProfiles) {
+      if (!isRecord(p)) return invalid('项目配置档案项格式无效');
+      const id = String(p.id || '').trim();
+      const name = String(p.name || '').trim();
+      if (!/^[A-Za-z0-9_-]{1,96}$/.test(id) || seenProfiles.has(id) || !name) return invalid('项目配置档案名称或 ID 无效');
+      seenProfiles.add(id);
+      clean.projectProfiles.push({
+        id, name: name.slice(0, 120),
+        cwd: typeof p.cwd === 'string' ? p.cwd.trim().slice(0, 4096) : '',
+        description: typeof p.description === 'string' ? p.description.trim().slice(0, 400) : '',
+        permMode: typeof p.permMode === 'string' && PERM_MODES.includes(p.permMode) ? p.permMode : '',
+        providerId: typeof p.providerId === 'string' ? p.providerId.trim().slice(0, 256) : '',
+        model: typeof p.model === 'string' ? p.model.trim().slice(0, 256) : '',
+        effort: typeof p.effort === 'string' && EFFORT_LEVELS.includes(p.effort) ? p.effort : '',
+        color: typeof p.color === 'string' ? p.color.slice(0, 32) : '#6d5dfc',
+        updatedAt: Number(p.updatedAt) || Date.now(),
+      });
+    }
+  }
+  if (has('disabledSkills')) {
+    if (!Array.isArray(body.disabledSkills)) return invalid('停用技能列表格式无效');
+    clean.disabledSkills = [...new Set(body.disabledSkills.filter(v => typeof v === 'string').map(v => v.trim().slice(0, 160)).filter(Boolean))].slice(0, 200);
+  }
+  if (has('workflowDefaults')) {
+    if (!isRecord(body.workflowDefaults)) return invalid('工作流默认值格式无效');
+    clean.workflowDefaults = {
+      queueMode: ['queue', 'steer', 'ask'].includes(body.workflowDefaults.queueMode) ? body.workflowDefaults.queueMode : 'queue',
+      notify: ['done', 'error', 'none'].includes(body.workflowDefaults.notify) ? body.workflowDefaults.notify : 'done',
+    };
+  }
   if (has('customAgents')) {
     const nextIds = new Set(clean.customAgents.map(c => c.id));
     const removedIds = settings.data.customAgents.filter(c => c && !nextIds.has(c.id)).map(c => c.id);
@@ -1513,9 +4142,70 @@ app.put('/api/settings', (req, res) => {
   if (has('agents')) { settings.data.agents = clean.agents; agents.clearNativeRouteCache(); }
   if (has('currentProvider')) settings.data.currentProvider = clean.currentProvider;
   if (has('sound')) settings.data.sound = clean.sound;
+  if (has('mcpTools')) settings.data.mcpTools = body.mcpTools !== false;
+  // 单独停用注入型 MCP 里的部分工具：只接受注册表里存在的名字，未知/重复丢弃。
+  if (has('mcpDisabledTools')) {
+    const src = Array.isArray(body.mcpDisabledTools) ? body.mcpDisabledTools : [];
+    settings.data.mcpDisabledTools = [...new Set(src.filter(v => typeof v === 'string' && mcpTools.isToolName(v)).slice(0, 64))];
+  }
+  if (has('browserTools')) settings.data.browserTools = body.browserTools !== false;
+  // 会话自动收起（0 = 关闭）
+  if (has('autoSettleDays')) {
+    const days = Number(body.autoSettleDays);
+    // 允许小数天（0.001 天 ≈ 86 秒）：便于测试与「快速验证规则」，0 = 关闭
+    settings.data.autoSettleDays = Number.isFinite(days) && days > 0 ? Math.min(365, Math.max(0.001, days)) : 0;
+  }
+  // 快捷键自定义（只接受 4 个已知动作的键位串；非法项丢弃，不阻断保存）
+  if (has('keybindings')) {
+    const src = isRecord(body.keybindings) ? body.keybindings : {};
+    const next = {};
+    for (const name of ['search', 'palette', 'newTask', 'stash']) {
+      const v = typeof src[name] === 'string' ? src[name].trim().toLowerCase().slice(0, 40) : '';
+      if (/^[a-z0-9+ ]{1,40}$/.test(v)) next[name] = v;
+    }
+    settings.data.keybindings = next;
+  }
   if (has('terminalShell')) settings.data.terminalShell = clean.terminalShell;
   if (has('recentModels')) settings.data.recentModels = clean.recentModels;
+  if (has('recentModelsByProvider')) settings.data.recentModelsByProvider = clean.recentModelsByProvider;
   if (has('contextWindows')) settings.data.contextWindows = clean.contextWindows;
+  if (has('projectProfiles')) settings.data.projectProfiles = clean.projectProfiles;
+  if (has('disabledSkills')) settings.data.disabledSkills = clean.disabledSkills;
+  if (has('workflowDefaults')) settings.data.workflowDefaults = clean.workflowDefaults;
+  // 供应商手动月限额（T1-5）：中转站没有窗口化额度接口时的兜底。逐项校验，
+  // 非法项直接丢弃而不是整个请求失败——限额是附加信息，不该阻断设置保存。
+  if (has('providerLimits')) {
+    const src = isRecord(body.providerLimits) ? body.providerLimits : {};
+    const next = {};
+    for (const [pid, v] of Object.entries(src).slice(0, 200)) {
+      if (!pid || pid.length > 256 || ['__proto__', 'prototype', 'constructor'].includes(pid)) continue;
+      const item = {};
+      const usd = Number(v && v.monthlyUsd);
+      if (Number.isFinite(usd) && usd > 0) item.monthlyUsd = Math.min(1e7, Math.round(usd * 100) / 100);
+      // 窗口额度（5 小时窗的本地近似，对齐订阅窗口的用法）
+      const win = Number(v && v.windowUsd);
+      if (Number.isFinite(win) && win > 0) {
+        item.windowUsd = Math.min(1e7, Math.round(win * 100) / 100);
+        const hrs = Number(v && v.windowHours);
+        item.windowHours = Number.isFinite(hrs) && hrs >= 1 ? Math.min(168, Math.floor(hrs)) : 5;
+      }
+      if (Object.keys(item).length) next[pid] = item;
+    }
+    settings.data.providerLimits = next;
+  }
+  // 自定义模型单价（对齐 t3code usagePricing 的覆盖能力）：优先于 cc-switch 定价表
+  if (has('modelPricing')) {
+    const src = isRecord(body.modelPricing) ? body.modelPricing : {};
+    const next = {};
+    for (const [model, v] of Object.entries(src).slice(0, 300)) {
+      if (!model || model.length > 256 || ['__proto__', 'prototype', 'constructor'].includes(model)) continue;
+      const inp = Number(v && v.in);
+      const out = Number(v && v.out);
+      if (!Number.isFinite(inp) || !Number.isFinite(out) || inp < 0 || out < 0) continue;
+      next[model] = { in: Math.min(1e6, inp), out: Math.min(1e6, out) };
+    }
+    settings.data.modelPricing = next;
+  }
   settings.save();
   // Agent 的 bin/自定义列表可能变了，缓存里的探测结果立即失效
   agents.clearAgentsCache();
@@ -1547,10 +4237,107 @@ app.get('/api/wsl', async (req, res) => {
 });
 
 // ---------- sessions ----------
+// 会话四段的服务端半边：清理过期休眠；按 autoSettleDays 自动收起闲置会话。
+// 运行中/置顶/已休眠/已收起的会话一律不动——绝不把正在用的会话藏起来。
+function settleIdleSessions() {
+  const days = Number(settings.data.autoSettleDays);
+  const now = Date.now();
+  let changed = false;
+  for (const s of sessionsStore.data.sessions) {
+    if (!s) continue;
+    if (Number(s.snoozedUntil) > 0 && Number(s.snoozedUntil) <= now) { s.snoozedUntil = 0; changed = true; }
+    if (!(days > 0) || s.pinned || s.settledAt || Number(s.snoozedUntil) > now || running.has(s.id)) continue;
+    const idleMs = now - (Number(s.updatedAt) || 0);
+    if (idleMs > days * 24 * 3600 * 1000) { s.settledAt = now; changed = true; }
+  }
+  if (changed) sessionsStore.save();
+}
 app.get('/api/sessions', (req, res) => {
+  // 自动收起闲置会话要写 sessions.json，是个藏在 GET 里的副作用。
+  // 只读令牌承诺「仅可查看」，不该因为别人在手机上刷列表就改动会话状态。
+  if (!req.readOnly) settleIdleSessions();
   let list = sessionsStore.data.sessions;
   if (req.query.agent) list = list.filter(s => s.agent === req.query.agent);
   res.json(list.map(s => ({ ...s, messages: undefined, msgCount: (s.messages || []).length })));
+});
+// 归档单个会话（批量操作与单条共用）。规则与容量归档一致：
+// 正文必须一起写进归档 JSONL 才能移除正文文件；正文存在却读不出来时整条拒绝，
+// 宁可少归档一条，也不能把「索引说在归档里、正文已经没了」的会话造出来。
+function archiveSession(s, reason) {
+  const index = sessionsStore.data.sessions.findIndex(x => String(x.id) === String(s.id));
+  if (index < 0) throw new Error('会话不在活跃列表里');
+  let msgs = Array.isArray(s.messages) ? s.messages : null;
+  if (msgs === null) {
+    if (fs.existsSync(sessionFiles.fileFor(s.id))) {
+      msgs = sessionFiles.loadMessages(s.id);
+      if (msgs === null) throw new Error('会话正文不可读，已取消归档（保住现场）');
+    } else {
+      msgs = [];
+    }
+  }
+  const entry = { ...s, messages: msgs, archivedAt: Date.now(), archiveReason: reason || 'manual' };
+  fs.mkdirSync(path.dirname(SESSION_ARCHIVE_FILE), { recursive: true });
+  fs.appendFileSync(SESSION_ARCHIVE_FILE, JSON.stringify(entry) + '\n', 'utf8');
+  archivedSessionIds.add(String(s.id));
+  sessionsStore.data.sessions.splice(index, 1);
+  if (!sessionsStore.saveNow()) {
+    // 索引没落盘：把内存态和归档标记还原，附属文件一个都还没删
+    sessionsStore.data.sessions.splice(index, 0, s);
+    archivedSessionIds.delete(String(s.id));
+    throw new Error('索引落盘失败，已取消归档');
+  }
+  sessionFiles.removeMessages(s.id);
+  events.remove(s.id);
+  return entry;
+}
+
+// 批量操作（多选）：一次请求处理多个会话。逐条返回结果——部分成功要让用户
+// 看清楚哪几个没成，而不是笼统报错；有会话在跑时拒绝归档/删除/收起。
+app.post('/api/sessions/batch', (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '请求格式无效' });
+  const action = String(req.body.action || '');
+  const ids = Array.isArray(req.body.ids) ? [...new Set(req.body.ids.map(x => String(x || '')).filter(Boolean))].slice(0, 500) : [];
+  if (!ids.length) return res.status(400).json({ error: '请选择至少一个会话' });
+  const ACTIONS = ['archive', 'pin', 'unpin', 'settle', 'wake', 'unread', 'read', 'delete'];
+  if (!ACTIONS.includes(action)) return res.status(400).json({ error: '不支持的操作：' + action });
+  if (['archive', 'delete', 'settle'].includes(action)) {
+    const busy = ids.filter(id => running.has(id));
+    if (busy.length) return res.status(409).json({ error: '有会话正在运行，请先停止：' + busy.join('、') });
+  }
+  const results = [];
+  const base = Date.now();
+  ids.forEach((id, order) => {
+    const s = sessionsStore.data.sessions.find(x => String(x.id) === id);
+    if (!s) { results.push({ id, ok: false, error: '会话不存在' }); return; }
+    try {
+      if (action === 'archive') { archiveSession(s, 'batch'); results.push({ id, ok: true }); return; }
+      if (action === 'delete') {
+        const index = sessionsStore.data.sessions.findIndex(x => String(x.id) === id);
+        const copy = sessionsStore.data.sessions[index];
+        sessionsStore.data.sessions.splice(index, 1);
+        if (!sessionsStore.saveNow()) {
+          sessionsStore.data.sessions.splice(index, 0, copy);
+          throw new Error('索引落盘失败，已取消删除');
+        }
+        sessionFiles.removeMessages(id);
+        events.remove(id);
+        results.push({ id, ok: true });
+        return;
+      }
+      if (action === 'pin') { s.pinned = true; s.pinnedAt = base - order; }
+      else if (action === 'unpin') { s.pinned = false; s.pinnedAt = 0; }
+      else if (action === 'settle') s.settledAt = base;
+      else if (action === 'wake') { s.settledAt = 0; s.snoozedUntil = 0; }
+      else if (action === 'unread') s.unread = true;
+      else if (action === 'read') s.unread = false;
+      results.push({ id, ok: true });
+    } catch (e) {
+      results.push({ id, ok: false, error: e.message || '操作失败' });
+    }
+  });
+  if (['pin', 'unpin', 'settle', 'wake', 'unread', 'read'].includes(action)) sessionsStore.save();
+  const failed = results.filter(r => !r.ok).length;
+  res.json({ ok: failed === 0, action, total: results.length, failed, results });
 });
 app.get('/api/sessions/archive', (req, res) => {
   let list = readArchivedSessions();
@@ -1559,8 +4346,22 @@ app.get('/api/sessions/archive', (req, res) => {
 });
 app.get('/api/sessions/:id', (req, res) => {
   const s = sessionsStore.data.sessions.find(x => x.id === req.params.id);
-  if (!s) return res.status(404).json({ error: '会话不存在' });
-  res.json(s);
+  if (!s) {
+    const archived = readArchivedSessions().find(x => String(x.id) === String(req.params.id));
+    if (!archived) return res.status(404).json({ error: '会话不存在' });
+    return res.json({ ...archived, archived: true, evSeq: 0 });
+  }
+  // evSeq：前端打开会话时把事件 cursor 推进到最新，静态渲染的历史不与增量回放重叠
+  res.json({ ...s, evSeq: events.latest(s.id) });
+});
+// 增量回放（P1-A）：断线/切端的重连客户端用 since=cursor 只拉错过的事件。
+// 内存环形缓冲优先（含 delta 全量），服务器重启后回落磁盘 jsonl（持久化子集）。
+app.get('/api/sessions/:id/events', (req, res) => {
+  const id = String(req.params.id || '');
+  if (!/^[A-Za-z0-9:_-]{1,128}$/.test(id)) return res.status(400).json({ error: '会话 id 无效' });
+  const sinceN = Number(req.query.since);
+  const limitN = Number(req.query.limit);
+  res.json(events.since(id, Number.isFinite(sinceN) ? sinceN : 0, Number.isFinite(limitN) ? limitN : 400));
 });
 app.post('/api/sessions/:id/restore', (req, res) => {
   const active = sessionsStore.data.sessions.find(s => s.id === req.params.id);
@@ -1603,20 +4404,42 @@ app.post('/api/sessions', (req, res) => {
   if (providerKey && !chosenProvider) return res.status(404).json({ error: '供应商不存在' });
   if (providerKey && !providerFitsAgent(agentId, chosenProvider)) return res.status(400).json({ error: '该供应商不适用于当前 Agent' });
   if (body.permMode && !PERM_MODES.includes(body.permMode)) return res.status(400).json({ error: '权限模式无效' });
-  if (body.effort && !['minimal', 'low', 'medium', 'high', 'max'].includes(body.effort)) return res.status(400).json({ error: '推理强度无效' });
+  if (body.effort && !EFFORT_LEVELS.includes(body.effort)) return res.status(400).json({ error: '推理强度无效' });
   const hasBodyMode = Object.prototype.hasOwnProperty.call(body, 'permMode');
   const hasBodyAuto = Object.prototype.hasOwnProperty.call(body, 'autoPerms');
   const permission = normalizePermissionState(
     hasBodyAuto ? body.autoPerms : (hasBodyMode && body.permMode === 'auto'),
     hasBodyMode ? body.permMode : '',
   );
-  const effort = body.effort || '';
+  // 新会话未显式传入推理强度时，继承所选（或系统默认）供应商的默认值。
+  // 保存到会话后，发送栏仍可单独覆盖，不会反向修改供应商配置。
+  const defaultProvider = chosenProvider || (!providerKey ? defaultProviderForAgent(agentId) : null);
+  const effort = body.effort || (defaultProvider && defaultProvider.effort) || '';
+  // 助手（可选）：绑定后系统提示词按 Agent 能力注入，未指定的运行参数取助手默认值。
+  // 显式传参优先于助手默认值——助手是「默认值」，不是覆盖用户选择的强制项。
+  const assistantId = String(body.assistantId || '').trim().slice(0, 128);
+  const assistant = assistantId ? assistants.find(assistantId) : null;
+  if (assistantId && !assistant) return res.status(404).json({ error: '助手不存在：' + assistantId });
+  const assistantDefaults = assistant && assistant.defaults ? assistant.defaults : {};
+  const providerFinal = providerKey || assistantDefaults.providerId || '';
+  const resolvedProvider = providerFinal ? (chosenProvider || findProvider(providerFinal)) : null;
+  if (providerFinal && !resolvedProvider) return res.status(404).json({ error: '供应商不存在' });
+  if (providerFinal && !providerFitsAgent(agentId, resolvedProvider)) return res.status(400).json({ error: '该供应商不适用于当前 Agent' });
+  const effortFinal = effort || assistantDefaults.effort || '';
+  if (effortFinal && !EFFORT_LEVELS.includes(effortFinal)) return res.status(400).json({ error: '助手默认推理强度无效' });
+  const assistantPerm = assistantDefaults.permMode && PERM_MODES.includes(assistantDefaults.permMode) ? assistantDefaults.permMode : '';
+  const permissionFinal = (!hasBodyMode && !hasBodyAuto && assistantPerm)
+    ? normalizePermissionState(assistantPerm === 'auto', assistantPerm)
+    : permission;
   const s = {
     id: 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-    agent: agentId, title: String(title || '新会话').trim().slice(0, 200) || '新会话', model: String(model || '').trim().slice(0, 256), providerId: providerKey,
-    remoteHostId: remoteKey, cwd: cwdText, autoPerms: permission.autoPerms, permMode: permission.permMode, effort, titled: false, cliSessionId: '', createdAt: Date.now(), updatedAt: Date.now(),
+    agent: agentId, title: String(title || '新会话').trim().slice(0, 200) || '新会话',
+    model: String(model || assistantDefaults.model || '').trim().slice(0, 256), providerId: providerFinal,
+    remoteHostId: remoteKey, cwd: cwdText, autoPerms: permissionFinal.autoPerms, permMode: permissionFinal.permMode,
+    effort: effortFinal, titled: false, cliSessionId: '', createdAt: Date.now(), updatedAt: Date.now(),
     messages: [],
   };
+  if (assistant) s.assistantId = assistant.id;
   sessionsStore.data.sessions.unshift(s);
   sessionsStore.save();
   maybeArchiveSessions();
@@ -1625,15 +4448,22 @@ app.post('/api/sessions', (req, res) => {
 app.patch('/api/sessions/:id', (req, res) => {
   const s = sessionsStore.data.sessions.find(x => x.id === req.params.id);
   if (!s) return res.status(404).json({ error: '会话不存在' });
-  const allow = ['title', 'model', 'providerId', 'remoteHostId', 'cwd', 'autoPerms', 'permMode', 'effort', 'titled', 'pinned'];
+  const allow = ['title', 'model', 'providerId', 'remoteHostId', 'cwd', 'autoPerms', 'permMode', 'effort', 'titled', 'pinned', 'pinnedAt', 'unread', 'snoozedUntil', 'settledAt', 'assistantId'];
   const body = req.body;
   if (!isRecord(body)) return res.status(400).json({ error: '会话设置格式无效' });
   if ('agent' in body && body.agent !== s.agent) return res.status(400).json({ error: '会话 Agent 不可更换，请新建会话' });
-  for (const k of ['title', 'model', 'providerId', 'remoteHostId', 'cwd']) {
+  for (const k of ['title', 'model', 'providerId', 'remoteHostId', 'cwd', 'assistantId']) {
     if (k in body && body[k] != null && typeof body[k] !== 'string') return res.status(400).json({ error: k + ' 格式无效' });
   }
-  for (const k of ['autoPerms', 'titled', 'pinned']) {
+  for (const k of ['autoPerms', 'titled', 'pinned', 'unread']) {
     if (k in body && typeof body[k] !== 'boolean') return res.status(400).json({ error: k + ' 必须是布尔值' });
+  }
+  if ('pinnedAt' in body && (typeof body.pinnedAt !== 'number' || !Number.isFinite(body.pinnedAt) || body.pinnedAt < 0)) {
+    return res.status(400).json({ error: 'pinnedAt 必须是非负数字' });
+  }
+  // 会话四段：休眠到点（0=取消）与收起时间（0=恢复），只接受有限数字
+  for (const k of ['snoozedUntil', 'settledAt']) {
+    if (k in body && (typeof body[k] !== 'number' || !Number.isFinite(body[k]) || body[k] < 0)) return res.status(400).json({ error: k + ' 必须是非负数字' });
   }
   const normalized = {};
   for (const k of allow) if (k in body) normalized[k] = body[k];
@@ -1642,6 +4472,12 @@ app.patch('/api/sessions/:id', (req, res) => {
   if ('providerId' in normalized) normalized.providerId = String(normalized.providerId == null ? '' : normalized.providerId).trim().slice(0, 256);
   if ('remoteHostId' in normalized) normalized.remoteHostId = String(normalized.remoteHostId == null ? '' : normalized.remoteHostId).trim().slice(0, 256);
   if ('cwd' in normalized) normalized.cwd = String(normalized.cwd == null ? '' : normalized.cwd).trim().slice(0, 4096);
+  if ('assistantId' in normalized) {
+    const id = String(normalized.assistantId == null ? '' : normalized.assistantId).trim().slice(0, 128);
+    // 空串 = 解除助手绑定；非空必须是存在的助手（停用的也允许解绑前的留存值）
+    if (id && !assistants.find(id)) return res.status(404).json({ error: '助手不存在：' + id });
+    normalized.assistantId = id;
+  }
   if ('providerId' in normalized && normalized.providerId) {
     const p = findProvider(normalized.providerId);
     if (!p) return res.status(404).json({ error: '供应商不存在' });
@@ -1649,7 +4485,7 @@ app.patch('/api/sessions/:id', (req, res) => {
   }
   if ('remoteHostId' in normalized && !validRemoteHost(normalized.remoteHostId)) return res.status(404).json({ error: '远程主机不存在' });
   if ('permMode' in normalized && normalized.permMode && !PERM_MODES.includes(normalized.permMode)) return res.status(400).json({ error: '权限模式无效' });
-  if ('effort' in normalized && normalized.effort && !['minimal', 'low', 'medium', 'high', 'max'].includes(normalized.effort)) return res.status(400).json({ error: '推理强度无效' });
+  if ('effort' in normalized && normalized.effort && !EFFORT_LEVELS.includes(normalized.effort)) return res.status(400).json({ error: '推理强度无效' });
   if (Object.prototype.hasOwnProperty.call(normalized, 'permMode') || Object.prototype.hasOwnProperty.call(normalized, 'autoPerms')) {
     const hasMode = Object.prototype.hasOwnProperty.call(normalized, 'permMode');
     const hasAuto = Object.prototype.hasOwnProperty.call(normalized, 'autoPerms');
@@ -1696,15 +4532,41 @@ app.delete('/api/sessions/:id', (req, res) => {
   } catch (e) {
     return res.status(500).json({ error: '清理会话归档失败：' + (e.message || '无法写入归档文件') });
   }
+  // 顺序很重要：先把「索引里已经没有这个会话」同步写进磁盘，再删正文和事件文件。
+  // 反过来做（原先的写法）时，200ms 防抖窗口里进程被杀，重启后 sessions.json 还列着
+  // 这个会话、正文却已经没了——被删掉的会话复活成一个空壳，历史再也找不回来。
+  // 先落盘的最坏结果只是留下几个孤儿正文文件，下次启动 sweepOrphans 会清掉。
+  const kept = sessionsStore.data.sessions;
+  sessionsStore.data.sessions = kept.filter(s => s.id !== req.params.id);
+  if (!sessionsStore.saveNow()) {
+    sessionsStore.data.sessions = kept;
+    return res.status(500).json({ error: '会话索引写入失败，已保留全部文件，请重试' });
+  }
+  sessionFiles.removeMessages(req.params.id);
+  events.remove(req.params.id);
   // 空闲的原生桥也要一起回收；否则删除会话后 app-server 会继续占用进程，
   // 直到十分钟 idle timer 才退出。
   destroyNativeBridge(req.params.id, 'delete');
-  sessionsStore.data.sessions = sessionsStore.data.sessions.filter(s => s.id !== req.params.id);
-  sessionsStore.save();
   res.json({ ok: true });
 });
 
 // ---------- 文件撤销 ----------
+// 撤销写回的是用户自己的源文件，必须原子：远程撤销脚本早就是「同目录临时文件 +
+// chmod + mv」，本机却直接 writeFileSync——进程写到一半被杀，源文件就成了半截，
+// 而这恰恰是用户点「撤销」时最不能接受的结果。顺带保留原文件的权限位。
+function writeUserFileAtomic(target, data) {
+  const tmp = path.join(path.dirname(target), '.agenthub-undo-' + process.pid + '-' + crypto.randomBytes(6).toString('hex') + '.tmp');
+  let mode = null;
+  try { mode = fs.statSync(target).mode; } catch {}
+  try {
+    fs.writeFileSync(tmp, data, 'utf8');
+    if (mode != null) { try { fs.chmodSync(tmp, mode); } catch {} }
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
+}
 app.post('/api/files/undo', async (req, res) => {
   if (!isRecord(req.body)) return res.status(400).json({ error: '撤销请求格式无效' });
   const { sessionId, msgTs, fileIdx } = req.body;
@@ -1712,7 +4574,8 @@ app.post('/api/files/undo', async (req, res) => {
   const s = sessionsStore.data.sessions.find(x => x.id === sessionId);
   if (!s) return res.status(404).json({ error: '会话不存在' });
   if (running.has(sessionId)) return res.status(409).json({ error: '会话正在运行中，请等待本轮结束后再撤销文件' });
-  const msg = (s.messages || []).find(m => m.ts === msgTs);
+  const msgAt = messageIndexForAction(s.messages, req.body);
+  const msg = msgAt >= 0 ? s.messages[msgAt] : null;
   if (!msg || !msg.files || !msg.files[fileIdx]) return res.status(404).json({ error: '找不到文件修改记录' });
   const f = msg.files[fileIdx];
   if (!isRecord(f) || typeof f.path !== 'string' || f.path.length > 4096 || (f.oldStr != null && typeof f.oldStr !== 'string') || (f.newStr != null && typeof f.newStr !== 'string')) return res.status(400).json({ error: '文件修改记录格式无效' });
@@ -1724,7 +4587,9 @@ app.post('/api/files/undo', async (req, res) => {
       const result = await runRemoteUndo(s, f);
       if (result.code === 0 && result.stdout.includes('AGENTHUB_UNDO_OK')) {
         f.undone = true;
-        sessionsStore.save();
+        // 文件已经在磁盘上回退了：save() 的 200ms 防抖如果正好赶上进程被杀，磁盘上的
+        // undone 标记就没了。破坏性动作之后同步落盘，别把结果押在定时器上。
+        sessionsStore.saveNow();
         return res.json({ ok: true, path: f.path, remote: true });
       }
       if (result.stdout.includes('AGENTHUB_UNDO_CHANGED')) return res.status(400).json({ error: '远程文件内容已变化，无法自动撤销' });
@@ -1736,7 +4601,7 @@ app.post('/api/files/undo', async (req, res) => {
       return res.status(400).json({ error: '远程撤销失败: ' + e.message });
     }
   }
-  const cwd = s.cwd || process.cwd();
+  const cwd = s.cwd || defaultWorkspaceDir();
   const p = resolveTargetPath(cwd, f.path, true);
   if (!fs.existsSync(p)) return res.status(400).json({ error: '文件不存在: ' + p });
   let content;
@@ -1755,13 +4620,13 @@ app.post('/api/files/undo', async (req, res) => {
       const at = content.indexOf(f.newStr);
       if (at < 0) return res.status(400).json({ error: '文件内容已变化，找不到修改后的文本，无法自动撤销' });
       if (content.indexOf(f.newStr, at + f.newStr.length) >= 0) return res.status(400).json({ error: '修改后的文本出现多处，无法安全判断撤销位置' });
-      fs.writeFileSync(p, content.slice(0, at) + f.oldStr + content.slice(at + f.newStr.length), 'utf8');
+      writeUserFileAtomic(p, content.slice(0, at) + f.oldStr + content.slice(at + f.newStr.length));
     }
   } catch (e) {
     return res.status(400).json({ error: '写入失败: ' + e.message });
   }
   f.undone = true;
-  sessionsStore.save();
+  sessionsStore.saveNow();
   res.json({ ok: true, path: f.path });
 });
 
@@ -1801,6 +4666,18 @@ async function validateWorkspaceForSession(s, remoteCfg) {
     return;
   }
   if (!remoteCfg) throw new Error('远程主机不存在');
+  if (await ssh.getRemotePlatform(remoteCfg) === 'windows') {
+    const literal = ssh.windowsPowerShellLiteral(cwd);
+    const script = [
+      "$ErrorActionPreference = 'Stop'",
+      '$item = Get-Item -LiteralPath ' + literal + ' -ErrorAction Stop',
+      'if (-not $item.PSIsContainer) { exit 2 }',
+      'if (-not (Test-Path -LiteralPath ' + literal + ' -PathType Container)) { exit 3 }',
+    ].join('; ');
+    const result = await collectRemoteOutput(ssh.execStream(remoteCfg, ssh.windowsPowerShellCommand(script), ''), 15000, 64 * 1024);
+    if (result.code !== 0) throw new Error('Windows 远程工作目录不存在或无法访问：' + cwd);
+    return;
+  }
   const q = shq(cwd);
   const result = await collectRemoteOutput(ssh.execStream(remoteCfg, 'test -d ' + q + ' && test -r ' + q, ''), 15000, 64 * 1024);
   if (result.code !== 0) throw new Error('远程工作目录不存在或无法访问：' + cwd);
@@ -1841,6 +4718,28 @@ function remoteUndoScript(targetPath) {
   ].join('\n');
 }
 
+function windowsRemoteUndoScript(targetPath) {
+  const literal = ssh.windowsPowerShellLiteral(targetPath);
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    '$expectedB64 = [Console]::In.ReadLine()',
+    '$replacementB64 = [Console]::In.ReadLine()',
+    '$removeFile = [Console]::In.ReadLine()',
+    "if ([string]::IsNullOrEmpty($expectedB64) -or $replacementB64 -eq $null -or $removeFile -eq $null) { Write-Output 'AGENTHUB_UNDO_INVALID'; exit 2 }",
+    '$target = ' + literal,
+    "if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { Write-Output 'AGENTHUB_UNDO_MISSING'; exit 3 }",
+    'try { $expected = [Convert]::FromBase64String($expectedB64) } catch { Write-Output \'AGENTHUB_UNDO_INVALID\'; exit 2 }',
+    '$current = [IO.File]::ReadAllBytes($target)',
+    '$sha = [Security.Cryptography.SHA256]::Create()',
+    'if (-not ([Convert]::ToBase64String($sha.ComputeHash($current)) -ceq [Convert]::ToBase64String($sha.ComputeHash($expected)))) { Write-Output \'AGENTHUB_UNDO_CHANGED\'; exit 4 }',
+    "if ($removeFile -eq '1') { Remove-Item -LiteralPath $target -Force; Write-Output 'AGENTHUB_UNDO_OK'; exit 0 }",
+    'try { $replacement = [Convert]::FromBase64String($replacementB64) } catch { Write-Output \'AGENTHUB_UNDO_INVALID\'; exit 2 }',
+    '$dir = [IO.Path]::GetDirectoryName($target)',
+    '$tmp = Join-Path $dir (\'.agenthub-undo-\' + [Guid]::NewGuid().ToString(\'N\') + \'.tmp\')',
+    'try { [IO.File]::WriteAllBytes($tmp, $replacement); Move-Item -LiteralPath $tmp -Destination $target -Force; Write-Output \'AGENTHUB_UNDO_OK\' } catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; Write-Output \'AGENTHUB_UNDO_FAILED\'; exit 5 }',
+  ].join('\n');
+}
+
 const MAX_REMOTE_UNDO_BYTES = 12 * 1024 * 1024;
 function remoteUndoTarget(s, f) {
   const joined = resolveTargetPath(s && s.cwd, f.path, false);
@@ -1850,6 +4749,30 @@ function remoteUndoTarget(s, f) {
 async function readRemoteUndoFile(s, f) {
   const targetPath = remoteUndoTarget(s, f);
   const target = wslShellPath(targetPath);
+  if (s.remoteHostId !== 'wsl') {
+    const cfg = ssh.getHostCfg(s.remoteHostId);
+    if (!cfg) throw new Error('远程主机不存在');
+    if (await ssh.getRemotePlatform(cfg) === 'windows') {
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        '$target = ' + ssh.windowsPowerShellLiteral(targetPath),
+        "if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { Write-Output 'AGENTHUB_UNDO_MISSING'; exit 0 }",
+        '[Convert]::ToBase64String([IO.File]::ReadAllBytes($target))',
+        "Write-Output 'AGENTHUB_UNDO_END'",
+      ].join('\n');
+      const result = await collectRemoteOutput(ssh.execStream(cfg, ssh.windowsPowerShellCommand(script), ''), 30000, 20 * 1024 * 1024);
+      const out = String(result.stdout || '');
+      if (out.trimEnd() === 'AGENTHUB_UNDO_MISSING') return { missing: true };
+      if (result.code !== 0) throw new Error('远程文件读取失败');
+      const end = out.lastIndexOf('\nAGENTHUB_UNDO_END');
+      if (end < 0) throw new Error('远程文件快照无效');
+      const encoded = out.slice(0, end).replace(/\s/g, '');
+      if (encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error('远程文件快照无效');
+      const buffer = Buffer.from(encoded, 'base64');
+      if (buffer.length > MAX_REMOTE_UNDO_BYTES) throw new Error('远程文件超过 12MB，无法安全撤销');
+      return { buffer };
+    }
+  }
   // 用标记而不是依赖远端 stderr/exit code，避免 wsl.exe 在 stdout 为空时
   // 把“文件不存在”包装成 Node 异常；输出上限略高于 12MB 文件的 base64 大小。
   const command = 'if [ ! -f ' + target + "; then printf 'AGENTHUB_UNDO_MISSING\\n'; "
@@ -1905,6 +4828,9 @@ async function runRemoteUndo(s, f) {
   }
   const cfg = ssh.getHostCfg(s.remoteHostId);
   if (!cfg) throw new Error('远程主机不存在');
+  if (await ssh.getRemotePlatform(cfg) === 'windows') {
+    return collectRemoteOutput(ssh.execStream(cfg, ssh.windowsPowerShellCommand(windowsRemoteUndoScript(targetPath)), payload), 30000, 512 * 1024);
+  }
   const command = 'bash -lc ' + shq(remoteUndoScript(targetPath));
   return collectRemoteOutput(ssh.execStream(cfg, command, payload), 30000, 512 * 1024);
 }
@@ -1915,8 +4841,7 @@ app.post('/api/sessions/:id/regenerate', async (req, res) => {
   const s = sessionsStore.data.sessions.find(x => x.id === req.params.id);
   if (!s) return res.status(404).json({ error: '会话不存在' });
   if (running.has(s.id)) return res.status(400).json({ error: '会话正在运行中' });
-  const msgTs = req.body && req.body.msgTs;
-  const idx = (s.messages || []).findIndex(m => m.ts === msgTs && m.role === 'assistant');
+  const idx = messageIndexForAction(s.messages, req.body, 'assistant');
   if (idx < 0) return res.status(404).json({ error: '找不到要重试的回复' });
   let li = -1;
   for (let i = idx - 1; i >= 0; i--) if (s.messages[i].role === 'user') { li = i; break; }
@@ -1957,10 +4882,26 @@ app.get('/api/usage', (req, res) => {
     source: req.query.source || 'all',
   }));
 });
+app.get('/api/usage/session/:id', (req, res) => {
+  const id = String(req.params.id || '');
+  if (!sessionsStore.data.sessions.some(s => s.id === id) && !readArchivedSessions().some(s => String(s.id) === id)) {
+    return res.status(404).json({ error: '会话不存在' });
+  }
+  res.json(usage.sessionEstimate(id));
+});
 app.post('/api/usage/scan', async (req, res) => {
   try { res.json(await usage.scanLocalAsync()); }
   catch (e) { res.status(500).json({ error: '用量扫描失败：' + (e.message || '未知错误') }); }
 });
+
+function usageProjectForSession(session) {
+  const cwd = String(session && session.cwd || '').trim();
+  const location = session && session.remoteHostId ? String(session.remoteHostId) : '';
+  if (location && cwd) return location + ' · ' + cwd;
+  if (cwd) return cwd;
+  if (location) return location + ' · 未指定目录';
+  return '默认项目';
+}
 
 // ---------- ssh ----------
 app.get('/api/ssh/hosts', (req, res) => res.json(ssh.listHosts()));
@@ -1995,11 +4936,11 @@ app.post('/api/ssh/test', async (req, res) => {
       return res.json((r.stdout || '').includes('ok') ? { ok: true, info: 'WSL 可用' } : { ok: false, error: 'WSL 无响应，请确认已安装发行版' });
     } catch (e) { return res.json({ ok: false, error: 'WSL 无响应：' + e.message }); }
   }
-  if (!body.id) {
-    if (typeof body.host !== 'string' || typeof body.user !== 'string' || !body.host.trim() || !body.user.trim()) return res.status(400).json({ error: '主机和用户名不能为空' });
-    if (body.port != null && (!Number.isInteger(Number(body.port)) || Number(body.port) < 1 || Number(body.port) > 65535)) return res.status(400).json({ error: '端口应为 1 到 65535' });
-  }
-  const cfg = body.id ? ssh.getHostCfg(body.id) : body;
+  // 只允许测已保存的主机：前端两处调用都只传 id。旧的「临时配置」分支会把
+  // 请求体原样当 SSH 配置去拨号，等于给持有令牌的人一个内网端口探测器和
+  // 凭据投递口，而且没有 id 的配置在连接缓存里会共用同一个键。
+  if (typeof body.id !== 'string' || !body.id.trim()) return res.status(400).json({ error: '缺少主机 ID：请先保存主机再测试连接' });
+  const cfg = ssh.getHostCfg(body.id);
   if (!cfg) return res.status(404).json({ error: '主机不存在' });
   res.json(await ssh.testHost(cfg));
 });
@@ -2007,13 +4948,79 @@ app.post('/api/ssh/test', async (req, res) => {
 // ---------- ACP 权限审批响应 ----------
 const acp = require('./lib/acp-agent');
 const apiAgent = require('./lib/api-agent');
+function permissionSession(sessionId) {
+  return sessionsStore.data.sessions.find(s => s && s.id === String(sessionId || '')) || null;
+}
+function pendingPermissionCard(sessionId, pid) {
+  const key = String(pid || '');
+  const api = apiAgent.pendingPermissions(sessionId).find(card => String(card && card.pid || '') === key);
+  if (api) return api;
+  const acpCard = acp.pendingFor(sessionId).find(card => String(card && card.pid || '') === key);
+  if (acpCard) return acpCard;
+  const zcodeCard = zcodeBridge.getPending(sessionId).find(card => String(card && card.pid || '') === key);
+  if (zcodeCard) return zcodeCard;
+  const codexCard = codexBridge.getPending(sessionId).find(card => String(card && card.pid || '') === key);
+  if (codexCard) return codexCard;
+  const claude = claudeBridge.getSession(sessionId);
+  const native = claude && claude.pendingPerms && claude.pendingPerms.get(key);
+  if (native && native.request) return { tool: native.request.tool_name || '', question: native.request.tool_name === 'AskUserQuestion', pid: key };
+  return null;
+}
+function rememberPermissionFromBody(sessionId, card, body) {
+  if (!body || body.remember !== 'project' || !card || card.question === true) return { remembered: false };
+  if (body.action && body.action !== 'allow') return { remembered: false, warning: '只有允许操作才能保存权限记忆' };
+  if (!body.action && body.optionId != null && Array.isArray(card.options)) {
+    const selected = card.options.find(o => String(o && o.optionId) === String(body.optionId));
+    const label = selected && [selected.kind, selected.name, selected.optionId,
+      selected.response && selected.response.decision].filter(Boolean).join(' ');
+    if (!selected || /deny|reject|decline|cancel|拒绝|取消/i.test(label)) {
+      return { remembered: false, warning: '只有允许选项才能保存权限记忆' };
+    }
+  }
+  const session = permissionSession(sessionId);
+  const tool = card.tool || '';
+  if (!session || !tool) return { remembered: false, warning: '该审批没有可记忆的工具标识' };
+  const result = permissionMemory.remember(session, tool);
+  return result.ok
+    ? { remembered: true, project: result.project, tool: result.tool }
+    : { remembered: false, warning: result.error || '权限记忆保存失败' };
+}
+function autoApproveRememberedPermission(session, ev) {
+  if (!session || !ev || ev.question === true || !ev.tool || !ev.pid) return false;
+  if (!permissionMemory.allows(session, ev.tool)) return false;
+  const sessionId = String(session.id || '');
+  let result = false;
+  if (ev.apiAgent === true) {
+    result = apiAgent.respondPermission(sessionId, ev.pid, 'allow');
+  } else if (ev.acp === true) {
+    const opts = Array.isArray(ev.options) ? ev.options : [];
+    const option = opts.find(o => !/deny|reject|decline|cancel|拒绝|取消/i.test(
+      [o && o.kind, o && o.optionId, o && o.name].filter(Boolean).join(' ')));
+    if (option && option.optionId != null) result = acp.respondPermission(sessionId, ev.pid, option.optionId);
+  } else if (ev.bridge === true) {
+    const body = { sessionId, requestId: ev.pid, action: 'allow' };
+    const option = (Array.isArray(ev.options) ? ev.options : []).find(o =>
+      !/deny|reject|decline|cancel|拒绝|取消/i.test(
+        [o && o.kind, o && o.optionId, o && o.name, o && o.response && o.response.decision].filter(Boolean).join(' ')));
+    if (option && option.optionId != null) body.optionId = option.optionId;
+    const response = zcodeBridge.hasSession(sessionId)
+      ? zcodeBridge.respond(sessionId, ev.pid, body)
+      : codexBridge.hasSession(sessionId)
+        ? codexBridge.respond(sessionId, ev.pid, body)
+        : claudeBridge.respond(sessionId, ev.pid, body);
+    result = !!response && response.ok !== false;
+  }
+  return result;
+}
 app.post('/api/acp/respond', (req, res) => {
   if (!isRecord(req.body)) return res.status(400).json({ error: 'ACP 应答请求格式无效' });
   const { agentId, pid, optionId } = req.body;
   if (typeof agentId !== 'string' || typeof pid !== 'string' || typeof optionId !== 'string') return res.status(400).json({ error: 'ACP 应答参数无效' });
+  if (req.body.remember != null && req.body.remember !== 'project') return res.status(400).json({ error: '权限记忆范围无效' });
+  const card = pendingPermissionCard(agentId, pid);
   const ok = acp.respondPermission(agentId, pid, optionId);
   if (!ok) return res.status(404).json({ ok: false, error: '该 ACP 审批请求不存在或已失效' });
-  res.json({ ok: true });
+  res.json({ ok: true, ...rememberPermissionFromBody(agentId, card, req.body) });
 });
 
 // ---------- 内置 Agent 工具权限审批响应 ----------
@@ -2023,9 +5030,12 @@ app.post('/api/api-agent/respond', (req, res) => {
   if (typeof sessionId !== 'string' || !sessionId.trim() || sessionId.length > 256
     || typeof pid !== 'string' || !pid || pid.length > 256
     || !['allow', 'deny'].includes(action)) return res.status(400).json({ error: '内置 Agent 应答参数无效' });
-  const ok = apiAgent.respondPermission(sessionId.trim(), pid, action);
+  if (req.body.remember != null && req.body.remember !== 'project') return res.status(400).json({ error: '权限记忆范围无效' });
+  const sid = sessionId.trim();
+  const card = pendingPermissionCard(sid, pid);
+  const ok = apiAgent.respondPermission(sid, pid, action);
   if (!ok) return res.status(404).json({ ok: false, error: '该内置 Agent 审批请求不存在或已失效' });
-  res.json({ ok: true });
+  res.json({ ok: true, ...rememberPermissionFromBody(sid, card, req.body) });
 });
 
 // ---------- claude/zcode/codex 流式桥：权限/提问应答 ----------
@@ -2042,13 +5052,44 @@ app.post('/api/bridge/respond', (req, res) => {
     || (typeof b.requestId === 'number' && Number.isSafeInteger(b.requestId));
   if (typeof b.sessionId !== 'string' || !b.sessionId.trim() || b.sessionId.length > 256 || !validRequestId) return res.status(400).json({ error: 'sessionId/requestId 格式无效' });
   if (b.action != null && (typeof b.action !== 'string' || !['allow', 'deny', 'cancel'].includes(b.action))) return res.status(400).json({ error: '应答动作无效' });
+  if (b.remember != null && b.remember !== 'project') return res.status(400).json({ error: '权限记忆范围无效' });
   if (b.optionId != null && !['string', 'number'].includes(typeof b.optionId)) return res.status(400).json({ error: '选项 ID 格式无效' });
   for (const key of ['selections', 'notes', 'content']) if (b[key] != null && !isRecord(b[key])) return res.status(400).json({ error: key + ' 格式无效' });
   for (const key of ['freeText', 'denyMessage', 'reason']) if (b[key] != null && (typeof b[key] !== 'string' || b[key].length > 20000)) return res.status(400).json({ error: key + ' 格式无效' });
+  // 提问卡附件（路径注入）：Claude/Codex 的提问协议不收附件二进制，但答案/注释
+  // 会进模型上下文——把已保存文件的**本机路径**拼进去，agent 自行用工具读取。
+  // 只接受 uploads 目录下真实存在的文件；已有答案时作为注释附加，避免覆盖选项。
+  if (b.attachments != null) {
+    if (!Array.isArray(b.attachments) || b.attachments.length > 8) return res.status(400).json({ error: 'attachments 格式无效' });
+    const list = [];
+    for (const a of b.attachments) {
+      const raw = a && typeof a.path === 'string' ? a.path : '';
+      const resolved = raw ? path.resolve(raw) : '';
+      if (!resolved || !resolved.startsWith(UPLOAD_DIR + path.sep)) continue;
+      try { if (!fs.statSync(resolved).isFile()) continue; } catch { continue; }
+      list.push({ path: resolved, name: (a && typeof a.name === 'string' ? a.name : path.basename(resolved)).slice(0, 120) });
+    }
+    if (list.length) {
+      const text = '[用户附件]\n' + list.map(a => '- ' + a.path + '（' + a.name + '）').join('\n');
+      if (isRecord(b.notes) && Object.keys(b.notes).length) {
+        const k = Object.keys(b.notes)[0];
+        b.notes[k] = String(b.notes[k] || '') + '\n\n' + text;
+      } else if (typeof b.freeText === 'string' && b.freeText.trim()) {
+        b.freeText = b.freeText + '\n\n' + text;
+      } else if (!b.selections || !Object.keys(b.selections).length) {
+        b.freeText = text;
+      } else {
+        const k = Object.keys(b.selections)[0];
+        b.notes = { ...(b.notes || {}), [k]: text };
+      }
+    }
+    delete b.attachments;
+  }
   if (b.suggestionIndex != null && (!Number.isInteger(b.suggestionIndex) || b.suggestionIndex < 0 || b.suggestionIndex > 1000)) return res.status(400).json({ error: 'suggestionIndex 格式无效' });
   // 各桥使用同一个网页入口；sessionId 不会冲突，按已存在的原生桥路由。
   // 去掉首尾空白，避免前端/代理把同一个会话误发成两个不同的键。
   const sessionId = b.sessionId.trim();
+  const card = pendingPermissionCard(sessionId, b.requestId);
   const result = zcodeBridge.hasSession(sessionId)
     ? zcodeBridge.respond(sessionId, b.requestId, b)
     : codexBridge.hasSession(sessionId)
@@ -2057,6 +5098,23 @@ app.post('/api/bridge/respond', (req, res) => {
   // 不能把桥接层的 {ok:false} 当成 HTTP 成功返回，否则前端会把审批卡
   // 永久锁死，用户也看不到“请求已失效/进程已回收”的错误。
   if (!result || result.ok === false) return res.status(409).json(result || { ok: false, error: '应答失败' });
+  res.json({ ...result, ...rememberPermissionFromBody(sessionId, card, b) });
+});
+app.get('/api/permissions/memory', (req, res) => {
+  const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId.trim() : '';
+  const session = permissionSession(sessionId);
+  if (!session) return res.status(404).json({ error: '会话不存在' });
+  res.json({ ok: true, project: permissionMemory.sessionProject(session), agent: session.agent || '', grants: permissionMemory.list(session) });
+});
+app.delete('/api/permissions/memory', (req, res) => {
+  if (!isRecord(req.body)) return res.status(400).json({ error: '权限记忆请求格式无效' });
+  const sessionId = typeof req.body.sessionId === 'string' ? req.body.sessionId.trim() : '';
+  const tool = typeof req.body.tool === 'string' ? req.body.tool : '';
+  const session = permissionSession(sessionId);
+  if (!session) return res.status(404).json({ error: '会话不存在' });
+  if (!tool.trim() || tool.length > 128) return res.status(400).json({ error: '工具标识无效' });
+  const result = permissionMemory.revoke(session, tool);
+  if (!result.ok) return res.status(500).json({ ok: false, error: '权限记忆保存失败' });
   res.json(result);
 });
 // WS 断线重连/刷新页面后，重新拉取仍在等待用户操作的权限/提问卡
@@ -2088,25 +5146,67 @@ app.get('/api/bridge/pending', (req, res) => {
 const scheduledStore = new Store('scheduled', { tasks: [] });
 if (!isRecord(scheduledStore.data)) scheduledStore.data = {};
 if (!Array.isArray(scheduledStore.data.tasks)) scheduledStore.data.tasks = [];
-scheduledStore.data.tasks = scheduledStore.data.tasks.filter(isRecord).filter(t => t.id && t.sessionId && t.prompt).map(t => {
+// 任务字段规范化。第七轮新增：
+// - kind: interval | daily | cron（5 段标准 cron，见 lib/cron.js）
+// - executionMode: continue（默认，续用绑定会话）| new（每次新建会话再发指令）
+// - runs: 最近 20 次运行历史（时间/成败/耗时/结果摘要）
+// - notify: 完成后是否发桌面通知；source: user | agent（agent 提议的任务默认停用）
+function normalizeScheduledTask(t) {
   const minutes = Math.min(10080, Math.max(1, Number(t.minutes) || 60));
-  const time = typeof t.time === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(t.time) ? t.time : '09:00';
+  const time = typeof t.time === 'string' && /^(?:[01]d|2[0-3]):[0-5]d$/.test(t.time) ? t.time : '09:00';
   const lastRunAt = Number(t.lastRunAt);
   const createdAt = Number(t.createdAt);
   const safeCreatedAt = Number.isFinite(createdAt) && createdAt >= 0 ? createdAt : Date.now();
   const storedLastDay = typeof t.lastDay === 'string' ? t.lastDay.slice(0, 16) : '';
+  const kind = t.kind === 'cron' ? 'cron' : t.kind === 'daily' ? 'daily' : 'interval';
+  let cronExpr = '';
+  if (kind === 'cron') {
+    const check = cron.validate(t.cron);
+    // 存不下合法表达式就退回 interval：宁可慢一点，也不静默按错误节奏跑
+    cronExpr = check.ok ? check.raw : '';
+  }
+  const runs = (Array.isArray(t.runs) ? t.runs : []).filter(isRecord).slice(-20).map(r => ({
+    at: Number(r.at) || 0, ok: r.ok === true, ms: Number(r.ms) || 0,
+    result: String(r.result || '').slice(0, 300), sessionId: String(r.sessionId || '').slice(0, 256),
+  }));
   return {
     ...t,
-    id: String(t.id).slice(0, 128), sessionId: String(t.sessionId).slice(0, 256), prompt: String(t.prompt).slice(0, 4000),
-    kind: t.kind === 'daily' ? 'daily' : 'interval', minutes, time,
+    id: String(t.id).slice(0, 128), sessionId: String(t.sessionId || '').slice(0, 256), prompt: String(t.prompt).slice(0, 4000),
+    title: String(t.title || '').slice(0, 200),
+    kind: kind === 'cron' && !cronExpr ? 'interval' : kind,
+    minutes, time, cron: cronExpr,
+    executionMode: t.executionMode === 'new' ? 'new' : 'continue',
+    // 新建会话模式要用到的会话模板（continue 模式忽略）
+    sessionTemplate: isRecord(t.sessionTemplate) ? {
+      agent: String(t.sessionTemplate.agent || '').slice(0, 128),
+      cwd: String(t.sessionTemplate.cwd || '').slice(0, 4096),
+      model: String(t.sessionTemplate.model || '').slice(0, 256),
+      providerId: String(t.sessionTemplate.providerId || '').slice(0, 256),
+      remoteHostId: String(t.sessionTemplate.remoteHostId || '').slice(0, 256),
+      permMode: String(t.sessionTemplate.permMode || 'auto').slice(0, 16),
+      effort: String(t.sessionTemplate.effort || '').slice(0, 32),
+    } : null,
+    notify: t.notify !== false,
+    source: t.source === 'agent' ? 'agent' : 'user',
     enabled: typeof t.enabled === 'boolean' ? t.enabled : true,
     lastRunAt: Number.isFinite(lastRunAt) && lastRunAt >= 0 ? lastRunAt : 0,
-    lastDay: storedLastDay || (t.kind === 'daily' && safeCreatedAt >= scheduleTargetAt(time, safeCreatedAt) ? scheduleDayKey(safeCreatedAt) : ''),
+    lastDay: storedLastDay || (kind === 'daily' && safeCreatedAt >= scheduleTargetAt(time, safeCreatedAt) ? scheduleDayKey(safeCreatedAt) : ''),
+    lastMinute: typeof t.lastMinute === 'string' ? t.lastMinute.slice(0, 32) : '',
     createdAt: safeCreatedAt,
+    runs,
   };
-});
+}
+scheduledStore.data.tasks = scheduledStore.data.tasks
+  .filter(isRecord)
+  // continue 模式必须有会话；new 模式允许没有 sessionId（每次自建）
+  .filter(t => t.id && t.prompt && (t.sessionId || (t.sessionTemplate && t.sessionTemplate.agent)))
+  .map(normalizeScheduledTask);
 
 function schedSummary(t) {
+  if (t.kind === 'cron') {
+    const check = cron.validate(t.cron);
+    return check.ok ? ('cron ' + t.cron + ' · ' + check.description) : ('cron ' + t.cron);
+  }
   return t.kind === 'daily' ? ('每天 ' + t.time) : ('每 ' + t.minutes + ' 分钟');
 }
 const scheduledActive = new Set();
@@ -2127,40 +5227,98 @@ function schedDue(t, now) {
     const last = t.lastRunAt || 0;
     return now - last >= (t.minutes || 60) * 60000;
   }
+  if (t.kind === 'cron') {
+    // 分钟粒度 + minuteKey 去重：30 秒的 tick 落在同一分钟里只触发一次
+    let parsed = null;
+    try { parsed = cron.parse(t.cron); } catch { return false; }
+    if (!cron.matches(parsed, new Date(now))) return false;
+    return t.lastMinute !== cron.minuteKey(now);
+  }
   const today = scheduleDayKey(now);
   // 不要求定时器恰好落在那一分钟；服务忙、电脑唤醒或系统调度延迟
   // 时，只要当天尚未执行且已经过了目标时间，就补执行一次。
   return now >= scheduleTargetAt(t.time, now) && t.lastDay !== today;
 }
+// 到期推进：忙/跳过时也要把「下次到期」往前推，否则每 30 秒重试一次
+function schedAdvance(t, now) {
+  t.lastRunAt = now;
+  if (t.kind === 'daily') t.lastDay = scheduleDayKey(now);
+  if (t.kind === 'cron') t.lastMinute = cron.minuteKey(now);
+}
+// 运行历史：只留最近 20 条，避免任务卡无限膨胀
+function schedRecordRun(t, entry) {
+  if (!Array.isArray(t.runs)) t.runs = [];
+  t.runs.push(entry);
+  if (t.runs.length > 20) t.runs = t.runs.slice(-20);
+}
 async function schedFire(t) {
+  if (restoreState) return;
   if (!t || scheduledActive.has(t.id)) return;
-  const s = sessionsStore.data.sessions.find(x => x.id === t.sessionId);
-  if (!s) {
-    t.lastResult = '跳过：会话不存在';
-    t.enabled = false;
-    scheduledStore.save();
-    return;
-  }
   const runAt = Date.now();
+  const startedAt = Date.now();
+
+  // ---------- 目标会话：continue 续用绑定会话；new 每次都开一个新会话 ----------
+  let sessionId = t.sessionId;
+  let createdSession = null;
+  if (t.executionMode === 'new') {
+    const tpl = t.sessionTemplate || {};
+    // 新建会话模式要求模板里有可用的 Agent；没有就跳过并说明，不静默失败
+    if (!tpl.agent || !knownAgent(tpl.agent)) {
+      schedAdvance(t, runAt);
+      t.lastResult = '跳过：新建会话模式缺少有效的 Agent 配置';
+      schedRecordRun(t, { at: runAt, ok: false, ms: 0, result: t.lastResult });
+      scheduledStore.save();
+      return;
+    }
+    const permission = normalizePermissionState(tpl.permMode === 'auto', tpl.permMode || 'auto');
+    // 定时任务必须能自己跑完：权限模式固定为自动（否则会被交互请求卡住）
+    createdSession = {
+      id: 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      agent: tpl.agent,
+      title: String(t.title || t.prompt.slice(0, 40) || '定时任务').slice(0, 200),
+      model: String(tpl.model || '').slice(0, 256),
+      providerId: String(tpl.providerId || '').slice(0, 256),
+      remoteHostId: String(tpl.remoteHostId || '').slice(0, 256),
+      cwd: String(tpl.cwd || '').slice(0, 4096),
+      autoPerms: true, permMode: 'auto', effort: String(tpl.effort || '').slice(0, 32),
+      titled: !!t.title, cliSessionId: '', createdAt: runAt, updatedAt: runAt,
+      messages: [], _scheduledTaskId: t.id,
+    };
+    sessionsStore.data.sessions.unshift(createdSession);
+    sessionsStore.save();
+    sessionId = createdSession.id;
+  } else {
+    const s = sessionsStore.data.sessions.find(x => x.id === t.sessionId);
+    if (!s) {
+      t.lastResult = '跳过：会话不存在';
+      t.enabled = false;
+      schedRecordRun(t, { at: runAt, ok: false, ms: 0, result: t.lastResult });
+      scheduledStore.save();
+      return;
+    }
+  }
+
+  const s = sessionsStore.data.sessions.find(x => x.id === sessionId);
+  if (!s) return;
   if (s.autoPerms !== true) {
-    t.lastRunAt = runAt;
-    if (t.kind === 'daily') t.lastDay = scheduleDayKey(runAt);
+    // continue 模式的会话必须是自动权限：定时运行没人点审批卡
+    schedAdvance(t, runAt);
     t.lastResult = '跳过：会话需要人工授权或提问';
+    schedRecordRun(t, { at: runAt, ok: false, ms: 0, result: t.lastResult, sessionId });
     scheduledStore.save();
     return;
   }
-  if (running.has(t.sessionId)) {
-    // “跳过”必须推进下次到期时间；否则间隔任务会每 30 秒重复尝试，
-    // 每日任务也会在忙闲切换时重复或错过。
-    t.lastRunAt = runAt;
-    if (t.kind === 'daily') t.lastDay = scheduleDayKey(runAt);
+  if (running.has(sessionId)) {
+    // 「跳过」也要推进下次到期：否则间隔任务每 30 秒重试一次，
+    // 每日/cron 任务会在忙闲切换时重复或错过。
+    schedAdvance(t, runAt);
     t.lastResult = '跳过：会话忙';
+    schedRecordRun(t, { at: runAt, ok: false, ms: 0, result: t.lastResult, sessionId });
     scheduledStore.save();
     return;
   }
   scheduledActive.add(t.id);
-  t.lastRunAt = runAt;
-  if (t.kind === 'daily') t.lastDay = scheduleDayKey(runAt);
+  schedAdvance(t, runAt);
   t.lastResult = '运行中…';
   scheduledStore.save();
   let interactionDenied = false;
@@ -2174,56 +5332,65 @@ async function schedFire(t) {
         if (!ev || ev.kind !== 'permission') return;
         interactionDenied = true;
         if (ev.bridge) {
-          const body = { sessionId: t.sessionId, requestId: ev.pid, action: 'deny', denyMessage: '定时任务不支持交互式确认或提问' };
-          const result = zcodeBridge.hasSession(t.sessionId)
-            ? zcodeBridge.respond(t.sessionId, ev.pid, body)
-            : codexBridge.hasSession(t.sessionId)
-              ? codexBridge.respond(t.sessionId, ev.pid, body)
-              : claudeBridge.respond(t.sessionId, ev.pid, body);
+          const body = { sessionId, requestId: ev.pid, action: 'deny', denyMessage: '定时任务不支持交互式确认或提问' };
+          const result = zcodeBridge.hasSession(sessionId)
+            ? zcodeBridge.respond(sessionId, ev.pid, body)
+            : codexBridge.hasSession(sessionId)
+              ? codexBridge.respond(sessionId, ev.pid, body)
+              : claudeBridge.respond(sessionId, ev.pid, body);
           if (!result || result.ok === false) throw new Error(result && result.error || '原生审批请求已失效');
           return;
         }
         if (ev.apiAgent) {
-          if (!apiAgent.respondPermission(t.sessionId, ev.pid, 'deny')) throw new Error('内置 Agent 审批请求已失效');
+          if (!apiAgent.respondPermission(sessionId, ev.pid, 'deny')) throw new Error('内置 Agent 审批请求已失效');
           return;
         }
         const opts = Array.isArray(ev.options) ? ev.options : [];
         const reject = opts.find(o => /deny|reject|decline|cancel|拒绝/i.test([o && o.kind, o && o.optionId, o && o.name].filter(Boolean).join(' ')));
         if (reject && reject.optionId != null) {
-          if (!acp.respondPermission(t.sessionId, ev.pid, reject.optionId)) throw new Error('ACP 审批请求已失效');
+          if (!acp.respondPermission(sessionId, ev.pid, reject.optionId)) throw new Error('ACP 审批请求已失效');
         } else {
-          const run = running.get(t.sessionId);
+          const run = running.get(sessionId);
           if (run) run.cancel();
         }
       } catch {
-        const run = running.get(t.sessionId);
+        const run = running.get(sessionId);
         if (run) run.cancel();
       }
     },
   };
   let timeoutId = null;
+  let ok = false;
   try {
-    const chatPromise = handleChat(fakeWs, { sessionId: t.sessionId, text: t.prompt, images: [] });
+    const chatPromise = handleChat(fakeWs, { sessionId, text: t.prompt, images: [] });
     const timeoutPromise = new Promise((_, reject) => {
       timeoutId = setTimeout(() => {
-        const run = running.get(t.sessionId);
+        const run = running.get(sessionId);
         if (run) run.cancel();
         reject(new Error('定时任务超过 15 分钟，已自动取消；请检查是否需要人工回答'));
       }, SCHEDULE_TIMEOUT_MS);
       if (timeoutId && typeof timeoutId.unref === 'function') timeoutId.unref();
     });
     const result = await Promise.race([chatPromise, timeoutPromise]);
-    t.lastResult = interactionDenied
-      ? '失败：任务触发了交互请求，已自动拒绝'
-      : result && result.ok === false
-      ? '失败: ' + (result.error || '任务未执行')
-      : '上次运行成功 · ' + new Date().toLocaleTimeString();
+    if (interactionDenied) {
+      t.lastResult = '失败：任务触发了交互请求，已自动拒绝';
+    } else if (result && result.ok === false) {
+      t.lastResult = '失败: ' + (result.error || '任务未执行');
+    } else {
+      ok = true;
+      t.lastResult = '上次运行成功 · ' + new Date().toLocaleTimeString();
+    }
   } catch (e) {
     t.lastResult = '失败: ' + e.message;
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
     scheduledActive.delete(t.id);
+    schedRecordRun(t, { at: runAt, ok, ms: Date.now() - startedAt, result: t.lastResult, sessionId });
     scheduledStore.save();
+    // 完成后按任务的 notify 开关提醒（前端收到 scheduled.done 后决定是否弹桌面通知）
+    if (t.notify !== false) {
+      try { broadcastSystem({ type: 'scheduled.done', taskId: t.id, sessionId, ok, result: t.lastResult, title: t.title || '', sessionTitle: s.title || '' }); } catch (e) { console.error('[scheduled] notify failed:', e.message); }
+    }
   }
 }
 setInterval(() => {
@@ -2239,32 +5406,143 @@ app.get('/api/scheduled', (req, res) => {
     return { ...t, sessionTitle: s ? s.title : '（已删除）', sessionAgent: s ? s.agent : '' };
   }));
 });
+// 任务创建：三种频率（interval / daily / cron）+ 两种执行方式
+// （continue 续用会话 / new 每次新建会话）。校验原则：宁可在创建时报错，
+// 也不要存下一个运行期才炸的任务。
 app.post('/api/scheduled', (req, res) => {
   if (!isRecord(req.body)) return res.status(400).json({ error: '定时任务请求格式无效' });
-  const { sessionId, prompt, kind, minutes, time } = req.body;
-  if (typeof sessionId !== 'string' || !sessionId.trim() || typeof prompt !== 'string' || !prompt.trim()) return res.status(400).json({ error: '会话与提示词必填' });
+  const { sessionId, prompt, minutes, time, executionMode, sessionTemplate, notify, title } = req.body;
+  const cronExpr = req.body.cron;
+  if (typeof prompt !== 'string' || !prompt.trim()) return res.status(400).json({ error: '提示词必填' });
   if (prompt.length > 4000) return res.status(400).json({ error: '提示词不能超过 4000 字符' });
-  const session = sessionsStore.data.sessions.find(s => s.id === sessionId);
-  if (!session) return res.status(404).json({ error: '会话不存在' });
-  if (session.autoPerms !== true || !supportsManagedPermissions(session.agent)) return res.status(400).json({ error: '定时任务仅支持有统一自动权限控制的会话；请使用 Claude/Codex/ZCode、ACP 或内置 Agent 的自动权限模式' });
-  if (kind !== 'interval' && kind !== 'daily') return res.status(400).json({ error: '频率类型错误' });
+  const kind = req.body.kind === 'cron' ? 'cron' : req.body.kind === 'daily' ? 'daily' : 'interval';
+  const mode = executionMode === 'new' ? 'new' : 'continue';
+
+  let template = null;
+  if (mode === 'new') {
+    if (!isRecord(sessionTemplate)) return res.status(400).json({ error: '新建会话模式需要 sessionTemplate（至少含 agent）' });
+    const agent = String(sessionTemplate.agent || '').trim();
+    if (!knownAgent(agent)) return res.status(400).json({ error: '未知 Agent：' + (agent || '(空)') });
+    if (!supportsManagedPermissions(agent)) return res.status(400).json({ error: '该 Agent 没有统一自动权限控制，无法无人值守运行' });
+    const tplRemote = String(sessionTemplate.remoteHostId || '').trim();
+    if (!validRemoteHost(tplRemote)) return res.status(404).json({ error: '远程主机不存在' });
+    const tplProvider = String(sessionTemplate.providerId || '').trim();
+    if (tplProvider && !findProvider(tplProvider)) return res.status(404).json({ error: '供应商不存在' });
+    if (tplProvider && !providerFitsAgent(agent, findProvider(tplProvider))) return res.status(400).json({ error: '该供应商不适用于所选 Agent' });
+    const effort = String(sessionTemplate.effort || '').trim().slice(0, 32);
+    if (effort && !EFFORT_LEVELS.includes(effort)) return res.status(400).json({ error: '推理强度无效' });
+    template = {
+      agent, cwd: String(sessionTemplate.cwd || '').trim().slice(0, 4096),
+      model: String(sessionTemplate.model || '').trim().slice(0, 256),
+      providerId: tplProvider, remoteHostId: tplRemote,
+      permMode: 'auto', effort,
+    };
+  } else {
+    if (typeof sessionId !== 'string' || !sessionId.trim()) return res.status(400).json({ error: '续用会话模式需要 sessionId' });
+    const session = sessionsStore.data.sessions.find(s => s.id === sessionId);
+    if (!session) return res.status(404).json({ error: '会话不存在' });
+    if (session.autoPerms !== true || !supportsManagedPermissions(session.agent)) return res.status(400).json({ error: '定时任务仅支持有统一自动权限控制的会话；请使用 Claude/Codex/ZCode、ACP 或内置 Agent 的自动权限模式' });
+  }
   if (kind === 'interval' && (!(typeof minutes === 'number' || (typeof minutes === 'string' && minutes.trim())) || !(+minutes >= 1) || +minutes > 10080)) return res.status(400).json({ error: '分钟数应为 1 到 10080' });
   if (kind === 'daily' && (typeof time !== 'string' || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time))) return res.status(400).json({ error: '时间格式 HH:MM' });
+  let cronRaw = '';
+  if (kind === 'cron') {
+    const check = cron.validate(cronExpr);
+    if (!check.ok) return res.status(400).json({ error: 'cron 表达式无效：' + check.error });
+    cronRaw = check.raw;
+  }
   const createdAt = Date.now();
   const normalizedTime = time || '09:00';
-  const t = { id: 't' + createdAt.toString(36) + Math.random().toString(36).slice(2, 5), sessionId: sessionId.trim(), prompt: prompt.trim().slice(0, 4000), kind, minutes: +minutes || 60, time: normalizedTime, enabled: true, lastRunAt: createdAt, lastDay: kind === 'daily' && createdAt >= scheduleTargetAt(normalizedTime, createdAt) ? scheduleDayKey(createdAt) : '', createdAt };
+  const t = {
+    id: 't' + createdAt.toString(36) + Math.random().toString(36).slice(2, 5),
+    sessionId: mode === 'continue' ? String(sessionId).trim() : '',
+    prompt: prompt.trim().slice(0, 4000),
+    title: String(title || '').trim().slice(0, 200),
+    kind, minutes: +minutes || 60, time: normalizedTime, cron: cronRaw,
+    executionMode: mode, sessionTemplate: template,
+    notify: notify !== false,
+    source: req.body.source === 'agent' ? 'agent' : 'user',
+    enabled: req.body.enabled !== false,
+    lastRunAt: createdAt,
+    lastDay: kind === 'daily' && createdAt >= scheduleTargetAt(normalizedTime, createdAt) ? scheduleDayKey(createdAt) : '',
+    lastMinute: kind === 'cron' ? cron.minuteKey(createdAt) : '',
+    createdAt,
+    runs: [],
+  };
   scheduledStore.data.tasks.push(t);
   scheduledStore.save();
-  res.json(t);
+  res.json({ ...t, summary: schedSummary(t) });
+});
+// cron 预览：给界面做校验与「下一次运行时间」提示，不落库
+app.post('/api/cron/preview', (req, res) => {
+  if (!isRecord(req.body) || typeof req.body.cron !== 'string') return res.status(400).json({ error: '缺少 cron 字符串' });
+  const check = cron.validate(req.body.cron);
+  if (!check.ok) return res.status(400).json({ error: check.error });
+  const next = [];
+  let cursor = Date.now();
+  for (let i = 0; i < 5; i++) {
+    const at = cron.nextRun(cron.parse(check.raw), cursor);
+    if (!at) break;
+    next.push(at);
+    cursor = at;
+  }
+  res.json({ ok: true, raw: check.raw, description: check.description, next, presets: cron.PRESETS });
 });
 app.patch('/api/scheduled/:id', (req, res) => {
   const t = scheduledStore.data.tasks.find(x => x.id === req.params.id);
   if (!t) return res.status(404).json({ error: '任务不存在' });
   if (!isRecord(req.body)) return res.status(400).json({ error: '定时任务请求格式无效' });
-  if ('enabled' in req.body && typeof req.body.enabled !== 'boolean') return res.status(400).json({ error: 'enabled 必须是布尔值' });
-  if ('enabled' in req.body) t.enabled = req.body.enabled;
+  const body = req.body;
+  if ('enabled' in body) {
+    if (typeof body.enabled !== 'boolean') return res.status(400).json({ error: 'enabled 必须是布尔值' });
+    t.enabled = body.enabled;
+  }
+  if ('notify' in body) {
+    if (typeof body.notify !== 'boolean') return res.status(400).json({ error: 'notify 必须是布尔值' });
+    t.notify = body.notify;
+  }
+  if ('title' in body) t.title = String(body.title || '').trim().slice(0, 200);
+  if ('prompt' in body) {
+    if (typeof body.prompt !== 'string' || !body.prompt.trim()) return res.status(400).json({ error: '提示词不能为空' });
+    if (body.prompt.length > 4000) return res.status(400).json({ error: '提示词不能超过 4000 字符' });
+    t.prompt = body.prompt.trim();
+  }
+  // 显式传了 cron 就先校验：哪怕任务当前不是 cron 模式，也不接受存下非法表达式
+  if ('cron' in body && body.cron) {
+    const check = cron.validate(body.cron);
+    if (!check.ok) return res.status(400).json({ error: 'cron 表达式无效：' + check.error });
+  }
+  if ('kind' in body || 'cron' in body || 'minutes' in body || 'time' in body) {
+    const rawKind = 'kind' in body ? body.kind : t.kind;
+    const kind = rawKind === 'cron' ? 'cron' : rawKind === 'daily' ? 'daily' : 'interval';
+    if (kind === 'cron') {
+      const check = cron.validate('cron' in body ? body.cron : t.cron);
+      if (!check.ok) return res.status(400).json({ error: 'cron 表达式无效：' + check.error });
+      t.cron = check.raw;
+    }
+    if (kind === 'daily') {
+      const time = 'time' in body ? body.time : t.time;
+      if (typeof time !== 'string' || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time)) return res.status(400).json({ error: '时间格式 HH:MM' });
+      t.time = time;
+    }
+    if (kind === 'interval') {
+      const minutes = 'minutes' in body ? +body.minutes : t.minutes;
+      if (!(minutes >= 1) || minutes > 10080) return res.status(400).json({ error: '分钟数应为 1 到 10080' });
+      t.minutes = minutes;
+    }
+    t.kind = kind;
+    // 频率变了就重置去重水位，否则刚改完可能被旧的 lastDay/lastMinute 挡住
+    t.lastDay = '';
+    t.lastMinute = '';
+  }
+  if ('executionMode' in body) {
+    const mode = body.executionMode === 'new' ? 'new' : 'continue';
+    if (mode === 'new' && !(t.sessionTemplate && t.sessionTemplate.agent)) return res.status(400).json({ error: '该任务没有会话模板，无法切换为新建会话模式' });
+    if (mode === 'continue' && !sessionsStore.data.sessions.some(s => s.id === t.sessionId)) return res.status(400).json({ error: '绑定的会话不存在，无法切换为续用会话模式' });
+    t.executionMode = mode;
+  }
   scheduledStore.save();
-  res.json(t);
+  res.json({ ...t, summary: schedSummary(t) });
 });
 app.delete('/api/scheduled/:id', (req, res) => {
   const before = scheduledStore.data.tasks.length;
@@ -2276,6 +5554,13 @@ app.delete('/api/scheduled/:id', (req, res) => {
 app.post('/api/scheduled/:id/run', (req, res) => {
   const t = scheduledStore.data.tasks.find(x => x.id === req.params.id);
   if (!t) return res.status(404).json({ error: '任务不存在' });
+  if (t.executionMode === 'new') {
+    // 新建会话模式：只校验模板——每次运行自己开会话，不存在「会话忙」
+    if (!(t.sessionTemplate && knownAgent(t.sessionTemplate.agent))) return res.status(400).json({ error: '任务缺少有效的会话模板' });
+    if (scheduledActive.has(t.id)) return res.status(409).json({ error: '定时任务正在运行中' });
+    void schedFire(t);
+    return res.status(202).json({ ok: true, started: true, task: t });
+  }
   const session = sessionsStore.data.sessions.find(s => s.id === t.sessionId);
   if (!session) return res.status(404).json({ error: '关联会话不存在' });
   if (session.autoPerms !== true || !supportsManagedPermissions(session.agent)) return res.status(400).json({ error: '定时任务仅支持有统一自动权限控制的会话；请使用 Claude/Codex/ZCode、ACP 或内置 Agent 的自动权限模式' });
@@ -2299,13 +5584,68 @@ app.use((err, req, res, next) => {
 
 // ---------- HTTP 服务 + WebSocket ----------
 const server = http.createServer(app);
+// 文件快照不再有 2MB 上限，但它只走服务端→浏览器的事件下行，浏览器对收到的
+// 帧大小没有客户端侧限制；入站消息（chat.send 等）仍很小，8MB 保持原值。
+// 浏览器端会在长时间 CDP/文件操作后复用 HTTP keep-alive 连接；默认 5 秒空闲
+// 回收容易让下一次请求撞上已被服务端关闭的 socket，表现成 fetch failed。
+server.keepAliveTimeout = 30000;
+server.headersTimeout = 35000;
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 8 * 1024 * 1024, verifyClient: (info) => {
-  if (!TOKEN) return true;
+  if (!TOKEN && !RO_TOKEN && !auth.enabled()) return true;
   const url = new URL(info.req.url, 'http://x');
-  return url.searchParams.get('token') === TOKEN;
+  const t = url.searchParams.get('token');
+  if (TOKEN && t === TOKEN) return true;
+  // 账户会话 Cookie：浏览器发起的 WS 会自动带上
+  const cookies = auth.parseCookies(info.req.headers.cookie);
+  if (auth.enabled() && cookies[auth.COOKIE_SID] && auth.verifySession(cookies[auth.COOKIE_SID])) return true;
+  if (RO_TOKEN && t === RO_TOKEN) return true; // 只读令牌可连 WS，仅能收广播
+  return false;
 } });
 
 const running = new Map(); // sessionId -> {cancel}
+// 所有存活 WS 连接：chat.* 事件在原路下发之外同时广播（P1-A）。多端/断线
+// 重连后新连接从「连接时刻」起就能收到直播事件，历史缺口用 events?since 补。
+const liveWs = new Set();
+
+// 终端 scrollback 服务端保留（P2-D）：行数 + 字节双上限——行数上限挡不住
+// 单条超长未换行输出（t3code 同款陷阱），必须同时限字节。保留内容只用于
+// 重连/重开终端时回放；回放前剥离设备查询/应答序列，避免历史里的
+// CPR/DSR 被再次写进终端后诱骗 shell 回复出一串乱码。PTY 本身仍随 WS
+// 断开而结束（保持现有生命周期），这里保住的是「屏幕内容」不是进程。
+const TERM_HISTORY_MAX_LINES = 5000;
+const TERM_HISTORY_MAX_BYTES = 8 * 1024 * 1024;
+const TERM_QUERY_REPLY_RE = /\x1b\[\d+;\d+R|\x1b\[6n|\x1b\[\?6n/g;
+const termHistory = new Map(); // key -> { text, bytes, lines }
+function termHistoryAppend(key, chunk) {
+  if (!chunk) return;
+  const clean = String(chunk).replace(TERM_QUERY_REPLY_RE, '');
+  if (!clean) return;
+  const st = termHistory.get(key) || { text: '', bytes: 0, lines: 0 };
+  st.text += clean;
+  st.bytes += Buffer.byteLength(clean, 'utf8');
+  for (let i = clean.indexOf('\n'); i >= 0; i = clean.indexOf('\n', i + 1)) st.lines++;
+  // 行数超限：从头部按整行丢弃
+  while (st.lines > TERM_HISTORY_MAX_LINES) {
+    const idx = st.text.indexOf('\n');
+    if (idx < 0) break;
+    const dropped = st.text.slice(0, idx + 1);
+    st.bytes -= Buffer.byteLength(dropped, 'utf8');
+    st.lines--;
+    st.text = st.text.slice(idx + 1);
+  }
+  // 单条超长行顶爆字节上限：按字符硬切后重算字节数（罕见路径，允许一次 O(n)）
+  if (st.bytes > TERM_HISTORY_MAX_BYTES) {
+    st.text = st.text.slice(st.text.length - TERM_HISTORY_MAX_BYTES);
+    st.bytes = Buffer.byteLength(st.text, 'utf8');
+    st.lines = 0;
+    for (let i = st.text.indexOf('\n'); i >= 0; i = st.text.indexOf('\n', i + 1)) st.lines++;
+  }
+  termHistory.set(key, st);
+  if (termHistory.size > 64) {
+    const oldest = termHistory.keys().next().value;
+    if (oldest !== undefined && oldest !== key) termHistory.delete(oldest);
+  }
+}
 
 // 输入到达时，原生提问卡可能还没来得及在浏览器端完成渲染。此时不能把
 // 用户的回答误当成第二轮 chat；在服务端再做一次精确的单题兜底路由，
@@ -2361,6 +5701,22 @@ function answerPendingNativeQuestion(ws, msg) {
 process.on('unhandledRejection', (reason) => {
   console.error('[unhandledRejection]', reason && reason.stack || reason);
 });
+
+// store.save() 是 200ms 防抖写入：Ctrl+C、systemd/服务管理器停进程时，定时器
+// 直接消失，最后那次改动（新建会话、改设置、存供应商）就丢了。
+let storesFlushed = false;
+function flushStoresOnExit() {
+  if (storesFlushed) return;
+  storesFlushed = true;
+  flushAllStores();
+  // SQLite 是常驻连接（WAL）：正常退出时显式关掉，让 -wal/-shm 合并回主库。
+  // 被强杀时 OS 会释放句柄，库本身仍可用（WAL 可恢复），不会丢数据。
+  try { db.close(); } catch {}
+}
+process.on('exit', flushStoresOnExit);
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => { flushStoresOnExit(); process.exit(0); });
+}
 let wsCounter = 0;
 
 app.get('/api/running', (req, res) => {
@@ -2370,18 +5726,53 @@ app.get('/api/running', (req, res) => {
   })) });
 });
 
-wss.on('connection', (ws) => {
-  const my = { id: ++wsCounter, terms: new Map(), activeKey: null };
+wss.on('connection', (ws, req) => {
+  const my = { id: ++wsCounter, terms: new Map(), activeKey: null, ro: false };
+  try {
+    const u = new URL((req && req.url) || '/ws', 'http://x');
+    const t = u.searchParams.get('token');
+    my.ro = !!(RO_TOKEN && t === RO_TOKEN && t !== TOKEN);
+  } catch {}
+  liveWs.add(ws);
   ws.on('message', async (raw) => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
     if (!isRecord(msg) || typeof msg.type !== 'string' || msg.type.length > 64) return;
+    if (restoreState && !RO_WS_TYPES.has(msg.type)) return send(ws, { type: 'denied', op: msg.type, error: '恢复备份后请重启 AgentHub' });
+    // 只读令牌的 WS 防线：HTTP 403 之外，聊天/终端输入在 WS 层再挡一次。
+    // 用白名单而不是黑名单——黑名单每加一种写操作都要记得回来补，漏一次就是
+    // 只读令牌能写；白名单里只留纯本地状态的消息，新增类型默认拒绝。
+    if (my.ro && !RO_WS_TYPES.has(msg.type)) {
+      if (msg.type === 'chat') {
+        const clientId = typeof msg.clientId === 'string' && /^[A-Za-z0-9:_-]{1,128}$/.test(msg.clientId) ? msg.clientId : '';
+        return send(ws, { type: 'chat.event', sessionId: typeof msg.sessionId === 'string' ? msg.sessionId : '', ...(clientId ? { clientId } : {}), ev: { kind: 'error', text: '当前为只读令牌：不能发送消息' } });
+      }
+      return send(ws, { type: 'denied', op: msg.type });
+    }
     try {
       if (msg.type === 'chat') {
         if (typeof msg.sessionId !== 'string' || msg.sessionId.length > 256 || (msg.text != null && typeof msg.text !== 'string') || (msg.text && msg.text.length > 2 * 1024 * 1024)) {
           const clientId = typeof msg.clientId === 'string' && /^[A-Za-z0-9:_-]{1,128}$/.test(msg.clientId) ? msg.clientId : '';
           return send(ws, { type: 'chat.event', sessionId: typeof msg.sessionId === 'string' ? msg.sessionId : '', ...(clientId ? { clientId } : {}), ev: { kind: 'error', text: '消息格式无效或过长' } });
         }
-        if (!answerPendingNativeQuestion(ws, msg)) await handleChat(ws, msg);
+        // 服务端幂等（A2）：带 qid 的重复投递不再起第二个回合，直接回执 duplicate
+        const qid = typeof msg.qid === 'string' && /^[A-Za-z0-9:_-]{1,128}$/.test(msg.qid) ? msg.qid : '';
+        if (qid) {
+          const rec = receipts.accept(msg.sessionId, qid);
+          if (rec.duplicate) {
+            return send(ws, { type: 'receipt', sessionId: msg.sessionId, qid, duplicate: true, status: rec.status, ...(typeof msg.clientId === 'string' ? { clientId: msg.clientId } : {}) });
+          }
+          send(ws, { type: 'receipt', sessionId: msg.sessionId, qid, duplicate: false, status: 'accepted', ...(typeof msg.clientId === 'string' ? { clientId: msg.clientId } : {}) });
+        }
+        if (!answerPendingNativeQuestion(ws, msg)) {
+          handleChat(ws, msg)
+            .then(result => { if (qid) receipts.finish(msg.sessionId, qid, result && result.ok === true ? 'done' : 'failed'); })
+            .catch(e => {
+              if (qid) receipts.finish(msg.sessionId, qid, 'failed');
+              console.error('[chat]', (e && e.message) || e);
+            });
+        } else if (qid) {
+          receipts.finish(msg.sessionId, qid, 'done');   // 被当作提问回答消费掉了
+        }
       }
       else if (msg.type === 'chat.cancel') {
         if (typeof msg.sessionId !== 'string' || msg.sessionId.length > 256) return;
@@ -2420,6 +5811,7 @@ wss.on('connection', (ws) => {
     }
   });
   ws.on('close', () => {
+    liveWs.delete(ws);
     for (const t of my.terms.values()) { try { t.end(); t.kill && t.kill(); } catch {} }
     my.terms.clear();
   });
@@ -2433,6 +5825,12 @@ async function handleTermOpen(ws, my, msg) {
   const prev = my.terms.get(key);
   if (prev) { try { prev.end(); prev.kill && prev.kill(); } catch {} my.terms.delete(key); }
   my.activeKey = key;
+  // scrollback 回放（P2-D）：先发历史再起进程，客户端按序写入 xterm。
+  // 断线重连的客户端（replay:false）本地已保有屏幕内容，重放会整屏重复。
+  if (msg.replay !== false && termHistory.has(key)) {
+    const h = termHistory.get(key);
+    if (h && h.text) send(ws, { type: 'term.history', hostId: key, data: h.text.slice(-512 * 1024) });
+  }
 
   // WSL 终端（key: wsl 或 wsl:<distro>）
   if (key === 'wsl' || key.startsWith('wsl:')) {
@@ -2450,7 +5848,7 @@ async function handleTermOpen(ws, my, msg) {
     }
     my.terms.set(key, p);
     send(ws, { type: 'term.opened', hostId: key, name: key === 'wsl' ? 'WSL' : 'WSL:' + key.slice(4) });
-    p.onData(d => send(ws, { type: 'term.data', hostId: key, data: d.toString('utf8') }));
+    p.onData(d => { const s = d && d.toString('utf8'); termHistoryAppend(key, s); send(ws, { type: 'term.data', hostId: key, data: s }); });
     p.onExit(() => { send(ws, { type: 'term.exit', hostId: key }); my.terms.delete(key); });
     return;
   }
@@ -2463,14 +5861,14 @@ async function handleTermOpen(ws, my, msg) {
     try {
       p = pty.spawn(shell.command, shell.args, {
       name: 'xterm-256color', cols, rows,
-      cwd: process.cwd(), env: process.env,
+      cwd: defaultWorkspaceDir(), env: process.env,
       });
     } catch (e) {
       return send(ws, { type: 'term.exit', hostId: key, error: '本机终端启动失败：' + e.message });
     }
     my.terms.set(key, p);
     send(ws, { type: 'term.opened', hostId: key, name: shell.name + '（本机）' });
-    p.onData(d => send(ws, { type: 'term.data', hostId: key, data: d.toString('utf8') }));
+    p.onData(d => { const s = d && d.toString('utf8'); termHistoryAppend(key, s); send(ws, { type: 'term.data', hostId: key, data: s }); });
     p.onExit(() => { send(ws, { type: 'term.exit', hostId: key }); my.terms.delete(key); });
     return;
   }
@@ -2482,7 +5880,7 @@ async function handleTermOpen(ws, my, msg) {
     const stream = await ssh.openShell(cfg, { cols, rows });
     my.terms.set(key, stream);
     send(ws, { type: 'term.opened', hostId: cfg.id, name: cfg.name });
-    stream.on('data', d => send(ws, { type: 'term.data', hostId: key, data: d.toString('utf8') }));
+    stream.on('data', d => { const s = d && d.toString('utf8'); termHistoryAppend(key, s); send(ws, { type: 'term.data', hostId: key, data: s }); });
     stream.on('close', () => { send(ws, { type: 'term.exit', hostId: key }); my.terms.delete(key); });
     stream.stderr && stream.stderr.on('data', d => send(ws, { type: 'term.data', hostId: key, data: d.toString('utf8') }));
   } catch (e) {
@@ -2529,7 +5927,7 @@ async function handleChatUnsafe(ws, msg) {
   const inputText = typeof msg.text === 'string' ? msg.text : String(msg.text == null ? '' : msg.text);
   const imgs = (Array.isArray(msg.images) ? msg.images : [])
     .filter(i => i && typeof i === 'object' && i.path)
-    .slice(0, 6)
+    .slice(0, 8)
     .map(i => ({ path: String(i.path).slice(0, 4096), url: isSafeImageSource(i.url ? String(i.url).slice(0, 4096) : '') ? String(i.url).slice(0, 4096) : '' }))
     .filter(i => i.path);
   if (!inputText.trim() && !imgs.length) {
@@ -2576,6 +5974,11 @@ async function handleChatUnsafe(ws, msg) {
   const localOnly = builtinLocal || acpLocal;
   const isWsl = !localOnly && s.remoteHostId === 'wsl';
   const remoteCfg = !localOnly && s.remoteHostId && !isWsl ? ssh.getHostCfg(s.remoteHostId) : null;
+  let remotePlatform = '';
+  if (remoteCfg) {
+    try { remotePlatform = await ssh.getRemotePlatform(remoteCfg); }
+    catch (e) { return failBeforeRun('远程主机连接失败：' + (e.message || '无法识别远程系统')); }
+  }
   if (!s.remoteHostId && s.cwd) {
     const expanded = expandLocalPath(s.cwd);
     if (expanded !== s.cwd) {
@@ -2610,7 +6013,7 @@ async function handleChatUnsafe(ws, msg) {
       const route = await agents.prepareNativeRoute({
         agent: s.agent,
         wsl: isWsl,
-        remote: remoteExec ? { label: remoteCfg.name, targetId: remoteCfg.id, exec: remoteExec } : null,
+        remote: remoteExec ? { label: remoteCfg.name, targetId: remoteCfg.id, platform: remotePlatform, exec: remoteExec } : null,
         settings: settings.data,
         isCancelled: () => runSlot.cancelled,
        }, ev => send(ws, { type: 'chat.event', sessionId: s.id, ...clientMeta, ev }));
@@ -2624,17 +6027,24 @@ async function handleChatUnsafe(ws, msg) {
   const userMsg = { role: 'user', text: inputText, ts: Date.now(), images: imgs.map(i => ({ path: i.path, url: i.url })).filter(i => i.url), ...clientMeta };
   currentUserMsg = userMsg;
   s.messages.push(userMsg);
+  // 有新回合 = 会话回到活跃：自动取消休眠与收起（四段的「活动即唤醒」）
+  if (s.settledAt) s.settledAt = 0;
+  if (Number(s.snoozedUntil) > 0) s.snoozedUntil = 0;
   if (!s.titled) { s.title = (inputText || '图片会话').slice(0, 30) || s.title || '新会话'; s.titled = true; titleChanged = true; }
   s.updatedAt = Date.now();
   sessionsStore.save();
-  send(ws, { type: 'chat.event', sessionId: s.id, ...clientMeta, ev: { kind: 'user-echo' } });
+  send(ws, { type: 'chat.event', sessionId: s.id, ...clientMeta, ev: { kind: 'user-echo', text: userMsg.text, ts: userMsg.ts, images: userMsg.images } });
 
   // 图片附件策略（原生化）：
   // - Claude bridge：原生 content block（base64）随消息进模型上下文
   // - ZCode 官方 CLI：--attach 原生文件附件（本机/WSL）；SSH 远端拿不到本机文件
   // - codex：app-server 用 localImage 原生附加；旧版 exec 路径再翻译为 -i
   // - 老版 claude CLI（无 stream-json 输入）本地会话：回落 Read 工具注入；其余场景无法传图则明确提示
-  let prompt = inputText;
+  const mentionSources = mentionSessionMap();
+  const mentionExpansion = messageFeatures.expandMentions(inputText, s.id,
+    id => featureSession(mentionSources.get(String(id))),
+    { maxMentions: 8, maxDepth: 3, maxChars: 48000, maxMessages: 24, perMessageChars: 4000 });
+  let prompt = mentionExpansion.text;
   // 远程/WSL 的能力必须以目标 CLI 探测结果为准；不能因为 Windows 本机
   // 安装了新 Claude，就误判旧远程 CLI 支持流式图片/权限桥。
   const claudeStream = chatOnly ? false : (s.remoteHostId ? nativeRemote : await agents.claudeUsesStreamAsync(s.agent, settings.data));
@@ -2653,10 +6063,10 @@ async function handleChatUnsafe(ws, msg) {
       send(ws, { type: 'chat.event', sessionId: s.id, ...clientMeta, ev: { kind: 'error', text: '远程 ZCode 会话暂不支持本机图片附件，已忽略图片' } });
     } else if (s.agent === 'zcode') {
       // ZCode 的 --attach 在 agents.js 中处理，保留原始 prompt。
-    } else if (!claudeStream && !s.remoteHostId) {
+    } else if (!claudeStream && !s.remoteHostId && !builtinLocal) {
       // 旧版 claude/zcode CLI：用 Read 工具查看本地图片文件（等效贴图，多一轮工具调用）
-      prompt = inputText + '\n\n[用户附加了截图，请先用 Read 工具查看以下图片文件再回答：\n' + imgs.map(i => i.path).join('\n') + '\n]';
-    } else if (!claudeStream) {
+      prompt = mentionExpansion.text + '\n\n[用户附加了截图，请先用 Read 工具查看以下图片文件再回答：\n' + imgs.map(i => i.path).join('\n') + '\n]';
+    } else if (!claudeStream && !builtinLocal) {
       send(ws, { type: 'chat.event', sessionId: s.id, ...clientMeta, ev: { kind: 'error', text: '远程会话使用的 CLI 版本过旧（不支持流式输入），无法传图，已忽略图片' } });
     }
   }
@@ -2685,7 +6095,7 @@ async function handleChatUnsafe(ws, msg) {
   const replayPrompt = contextReplay(s, prompt);
   // 首轮没有原生 id 时，直接使用回放；有 id 时先保持原始输入，只有
   // app-server/CLI 的原生 resume 明确失败后，桥才会使用 replayPrompt。
-  if (!chatOnly && !s.cliSessionId) prompt = replayPrompt;
+  if (!builtinLocal && !s.cliSessionId) prompt = replayPrompt;
 
   const agentSettings = (settings.data.agents || {})[s.agent] || null;
   const customCfg = customAgentCfg;
@@ -2747,6 +6157,8 @@ async function handleChatUnsafe(ws, msg) {
         cacheRead: nonNegative(value.cacheRead), cacheCreate: nonNegative(value.cacheCreate),
         context: nonNegative(value.context),
       };
+      const genMs = nonNegative(value.genMs);
+      if (genMs > 0) out.genMs = genMs;
       if (typeof value.model === 'string') out.model = value.model.slice(0, 256);
       return out;
     };
@@ -2760,7 +6172,7 @@ async function handleChatUnsafe(ws, msg) {
           const { oldStr, newStr, ...rest } = f;
           return { ...rest, snapshotUnavailable: true };
         }
-        const target = resolveTargetPath(s.cwd || process.cwd(), f.path, true);
+        const target = resolveTargetPath(s.cwd || defaultWorkspaceDir(), f.path, true);
         let existed = true;
         try { existed = fs.existsSync(target); } catch {}
         if (existed) {
@@ -2768,15 +6180,6 @@ async function handleChatUnsafe(ws, msg) {
           return { ...rest, created: false, snapshotUnavailable: true };
         }
         f = { ...f, created: true };
-      }
-      const tooLarge = (typeof f.oldStr === 'string' && f.oldStr.length > MAX_FILE_SNAPSHOT_BYTES)
-        || (typeof f.newStr === 'string' && f.newStr.length > MAX_FILE_SNAPSHOT_BYTES);
-      if (tooLarge) {
-        // 超大快照不能安全用于自动撤销；保留路径/工具信息，让用户仍能看到
-        // 发生了文件变更，但不制造“部分内容快照”导致的破坏性回滚。
-        const { oldStr, newStr, ...rest } = f;
-        rest.snapshotUnavailable = true;
-        return rest;
       }
       if (typeof f.diff === 'string' && f.diff.length > MAX_EVENT_DIFF_BYTES) {
         return { ...f, diff: f.diff.slice(0, MAX_EVENT_DIFF_BYTES), diffTruncated: true };
@@ -2791,6 +6194,8 @@ async function handleChatUnsafe(ws, msg) {
       outEv.reason = safeText(ev.reason).slice(0, 4000);
       outEv.bridge = ev.bridge === true;
       outEv.apiAgent = ev.apiAgent === true;
+      outEv.acp = ev.acp === true;
+      outEv.tool = safeText(ev.tool).slice(0, 128);
       outEv.options = Array.isArray(ev.options) ? ev.options.filter(isRecord).slice(0, 32) : [];
       outEv.questions = Array.isArray(ev.questions) ? ev.questions.filter(isRecord).slice(0, 32).map(q => ({
         ...q,
@@ -2801,11 +6206,23 @@ async function handleChatUnsafe(ws, msg) {
           ...o, label: safeText(o.label).slice(0, 500), description: safeText(o.description).slice(0, 2000),
         })) : [],
       })) : [];
+      if (autoApproveRememberedPermission(s, outEv)) {
+        chatEvent({ kind: 'status', text: '已按项目权限记忆允许：' + outEv.tool });
+        return;
+      }
     }
     // 文本增量事件本身不重复落盘，但要确保 assistant 消息体尽早创建；
     // 思考增量会合并到 assistant.blocks，回合结束后随会话一起保存。
     if (kind === 'delta' || kind === 'text') { const now = Date.now(); if (!genStats.first) genStats.first = now; genStats.last = now; }
     if (kind === 'delta') ensureAssistant();
+    if (kind === 'status' && ev.resetCliSession === true) {
+      // 原生 resume 失效后，桥会用 replayPrompt 重建上下文。先清掉旧 id，
+      // 避免回放期间或进程再次异常退出时把失效 id 持久化回去。
+      s.cliSessionId = '';
+      s.cliSessionStartTs = 0;
+      sessionsStore.save();
+      outEv.resetCliSession = true;
+    }
     if (kind === 'thinkdelta') {
       // 增量仍实时推送给前端；同时合并进内存中的 assistant.blocks，
       // 回合结束时统一保存，避免每个 token 都写磁盘。
@@ -2950,6 +6367,7 @@ async function handleChatUnsafe(ws, msg) {
     return 200000;
   };
   if (providerMappedNote) emit({ kind: 'status', text: providerMappedNote });
+  for (const warning of mentionExpansion.warnings || []) emit({ kind: 'status', text: warning });
 
   // ===== 内置 API 对话（无需 CLI，直连供应商 API） =====
   // builtin 可以调用 AgentHub 工具；chatgpt-web 只是普通聊天，使用同一
@@ -3010,6 +6428,8 @@ async function handleChatUnsafe(ws, msg) {
         cwd: localOnly && s.remoteHostId ? undefined : (s.cwd || undefined),
          history, images: b64Images, sessionKey: s.id,
          autoPerms: s.autoPerms === true, permMode: s.permMode || '', effort: s.effort || '',
+         permissionGrants: permissionMemory.list(s).map(x => x.tool),
+         systemPrompt: assistantPromptFor(s),
       }, emit);
     } catch (e) {
       emit({ kind: 'error', text: e.message || '内置 Agent 启动失败' });
@@ -3030,11 +6450,10 @@ async function handleChatUnsafe(ws, msg) {
     // 与 CLI 路径一致：手动停止的回合显式留一条「已停止」痕迹并实时下发。
     if (handle.cancelled) emit({ kind: 'stopped' });
     const u0 = usageSum;
-    if (u0.input || u0.output) {
-      usage.record({ agent: s.agent, model: u0.model || s.model || 'unknown', provider: provider ? provider.name : '', input: u0.input, output: u0.output, cacheRead: u0.cacheRead, cacheCreate: u0.cacheCreate, sessionId: s.id, source: 'live' });
-    }
+    usage.record({ agent: s.agent, model: u0.model || s.model || 'unknown', provider: provider ? provider.name : '', providerId: provider ? provider.id : '', input: u0.input, output: u0.output, cacheRead: u0.cacheRead, cacheCreate: u0.cacheCreate, sessionId: s.id, sessionKey: s.id, project: usageProjectForSession(s), elapsedMs: Date.now() - roundStart, success: code0 === 0, source: 'live' });
     if (assistant) {
-      assistant.usage = { input: u0.input, output: u0.output, cacheRead: u0.cacheRead, cacheCreate: u0.cacheCreate, model: (u0.model || s.model || ''), requested: s.model || '', context: lastCtx || (u0.input + u0.output), contextMax: contextWindowFor(s.model || '') };
+      const apiGenMs = genStats.last > genStats.first ? genStats.last - genStats.first : 0;
+      assistant.usage = { input: u0.input, output: u0.output, cacheRead: u0.cacheRead, cacheCreate: u0.cacheCreate, model: (u0.model || s.model || ''), requested: s.model || '', context: lastCtx || (u0.input + u0.output), contextMax: contextWindowFor(s.model || ''), ...(apiGenMs > 0 ? { genMs: apiGenMs } : {}) };
       assistant.elapsed = Date.now() - roundStart;
       delete assistant._runStart;
     }
@@ -3059,6 +6478,7 @@ async function handleChatUnsafe(ws, msg) {
     cwd: localOnly && s.remoteHostId ? undefined : (s.cwd || undefined),
     custom: customCfg,
     nativeRemote,
+    systemPrompt: assistantPromptFor(s),
     // 图片：claude/zcode 流式桥转原生 base64 块（远程也可）；codex 走 -i（远程已被上方拦截忽略）；
     // 其余 agent（ACP/内置/自定义）的图片参数形态不同，不传路径
     images: imgs.length && !(s.agent === 'claude' && s.remoteHostId && !nativeRemote)
@@ -3068,6 +6488,7 @@ async function handleChatUnsafe(ws, msg) {
     remote: remoteCfg ? {
       label: remoteCfg.name,
       targetId: remoteCfg.id,
+      platform: remotePlatform,
       exec: remoteExec,
     } : null,
     settings: settings.data,
@@ -3103,13 +6524,13 @@ async function handleChatUnsafe(ws, msg) {
   // 记录用量：codex 只报一次/轮；claude 的 result.usage 为整轮合计，优先用
   // claude：done.usage 为整轮合计（不与各消息重复）；codex：usageSum 为当轮唯一一次
   let u = resultUsage && (resultUsage.input || resultUsage.output) ? resultUsage : usageSum;
-  if (u.input || u.output) {
-    usage.record({
-      agent: s.agent, model: u.model || s.model || s.agent, provider: provider ? provider.name : '',
-      input: u.input, output: u.output, cacheRead: u.cacheRead, cacheCreate: u.cacheCreate,
-      sessionId: s.cliSessionId || s.id, source: 'live',
-    });
-  }
+  usage.record({
+    agent: s.agent, model: u.model || s.model || s.agent, provider: provider ? provider.name : '',
+    providerId: provider ? provider.id : '',
+    input: u.input, output: u.output, cacheRead: u.cacheRead, cacheCreate: u.cacheCreate,
+    sessionId: s.cliSessionId || s.id, sessionKey: s.id, project: usageProjectForSession(s),
+    elapsedMs: Date.now() - roundStart, success: code === 0, source: 'live',
+  });
   if (assistant) {
     assistant.usage = { input: u.input, output: u.output, cacheRead: u.cacheRead, model: u.model || s.model || '', requested: s.model || '', context: lastCtx || (u.input || 0) + (u.output || 0), contextMax: contextWindowFor(u.model || s.model || ''), genMs: genStats.last > genStats.first ? genStats.last - genStats.first : 0 };
     assistant.elapsed = Date.now() - roundStart; // 从回合起点算（含 CLI 启动），与 ZCode/harness 语义一致
@@ -3152,7 +6573,38 @@ async function handleChat(ws, msg) {
   }
 }
 
-function send(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch {} }
+// chat.* 统一出口：分配 seq 并进事件环形缓冲（P1-A），同时广播给其他连接。
+// 广播副本剥离 clientId——它只用于发起方的乐观消息对账，别端不应触发
+// restoreOutbox 之类的本地逻辑；seq 去重保证同一事件多次投递也无害。
+function broadcastChat(msg, exclude) {
+  const copy = { ...msg };
+  delete copy.clientId;
+  let data;
+  try { data = JSON.stringify(copy); } catch { return; }
+  for (const c of liveWs) {
+    if (c === exclude || c.readyState !== 1) continue;
+    try { c.send(data); } catch {}
+  }
+}
+// 非 chat.* 的系统广播（如定时任务完成）：不进事件流（没有 seq 语义），
+// 只是给所有已连接页面推一条提示，断线期间错过也没关系（任务卡片里仍有记录）。
+function broadcastSystem(msg) {
+  let data;
+  try { data = JSON.stringify(msg); } catch { return; }
+  for (const c of liveWs) {
+    if (c.readyState !== 1) continue;
+    try { c.send(data); } catch {}
+  }
+}
+function send(ws, obj) {
+  try {
+    if (obj && typeof obj.type === 'string' && obj.type.startsWith('chat.')) {
+      const recorded = events.record(obj);
+      if (recorded) broadcastChat(recorded, ws);
+    }
+    ws.send(JSON.stringify(obj));
+  } catch {}
+}
 
 // 后台预热：WSL 冷启动 + CLI 能力探测缓存（避免首条消息时同步探测阻塞服务器）
 if (process.platform === 'win32') {
@@ -3173,7 +6625,6 @@ setImmediate(() => maybeArchiveSessions());
 
 // 局域网访问：AGENTHUB_HOST=0.0.0.0 开放给局域网；配 AGENTHUB_TOKEN 则所有 API/WS 需带令牌
 const HOST = process.env.AGENTHUB_HOST || '127.0.0.1';
-const TOKEN = process.env.AGENTHUB_TOKEN || '';
 const isLoopbackHost = host => ['127.0.0.1', 'localhost', '::1'].includes(String(host).toLowerCase());
 if (!isLoopbackHost(HOST) && !TOKEN) {
   console.error('AgentHub 拒绝在非本机地址监听：请同时设置 AGENTHUB_TOKEN，避免远程用户访问文件、命令和供应商凭据。');
@@ -3183,6 +6634,7 @@ server.listen(PORT, HOST, () => {
   console.log('');
   console.log('  ⬡ AgentHub 已启动:  http://' + (HOST === '0.0.0.0' ? '0.0.0.0' : HOST) + ':' + PORT + (HOST === '0.0.0.0' ? '  （已开放局域网，手机/其他电脑可用本机 IP 访问）' : ''));
   if (TOKEN) console.log('  访问令牌已启用（AGENTHUB_TOKEN）');
+  if (RO_TOKEN) console.log('  只读令牌已启用（AGENTHUB_RO_TOKEN）：仅可查看');
   console.log('  cc-switch: ' + (ccswitch.dbPath() || '未找到'));
   console.log('');
 });

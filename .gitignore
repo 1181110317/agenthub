@@ -16,10 +16,22 @@ data/ssh.json
 data/settings.json
 data/model-cache.json
 data/uploads/
+data/sessions/
 data/tmp-settings/
+gui-test-screenshots/
 data/providers.json
 data/sessions-archive.jsonl
 data/sessions-archive.jsonl.*
+# SQLite 索引（可重建的派生物，不入库）与文件回收站（本机误删补救）
+data/agenthub.db
+data/agenthub.db-wal
+data/agenthub.db-shm
+data/trash/
+
+# 运行时日志：统一放 data/logs/，不要再落到仓库根目录
+data/logs/
+*.log
+!/test/**/*.log
 
 # 万一以后还有别的运行时数据落进 data/，整目录兜底
 # 如果未来需要提交某些示例/种子数据，再单独 !data/xxx.json 放行
@@ -92,3 +104,10 @@ config.toml
 # English versions live as README.md (no .zh.md) on the repo
 # =========================
 *.zh.md
+
+# Internal handoff, audit, and planning notes (keep local; do not publish)
+/FEATURES-NEXT.md
+/HANDOFF-*.md
+/INVARIANTS.md
+/TEST-AUDIT-*.md
+/THIRD-PARTY-NOTICES.md
