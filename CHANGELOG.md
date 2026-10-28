@@ -2,7 +2,7 @@
 
 ## 2026-10-28
 
-- Refresh the README with one animated demo and a grouped feature guide; keep the page compact and easy to scan.
+- Split the README into a compact landing page plus focused guides under `docs/` (deployment, features, configuration, architecture, testing, troubleshooting).
 - Add a shared model center, Magpie catalog discovery, Agent model routes and saved assignment profiles. Keep credentials in their existing encrypted stores.
 - Preserve native Claude, Codex and ZCode session protocols, cancellation and startup feedback. Recover failed SSH sends and retain unconfirmed drafts.
 - Add target-side workspace operations, accurate Git change counts and immutable turn diffs, with explicit unknown/binary states.
