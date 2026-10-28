@@ -5,8 +5,8 @@ const { spawnSync } = require('child_process');
 const root = path.resolve(__dirname, '..');
 const files = [
   'server.js',
-  'public/app.js',
-  ...fs.readdirSync(path.join(root, 'lib')).filter(name => name.endsWith('.js')).map(name => path.join('lib', name)),
+  ...fs.readdirSync(path.join(root, 'public')).filter(name => name.endsWith('.js')).map(name => path.join('public', name)),
+  ...fs.readdirSync(path.join(root, 'lib')).filter(name => /\.(?:js|cjs)$/.test(name)).map(name => path.join('lib', name)),
 ];
 
 let failed = false;

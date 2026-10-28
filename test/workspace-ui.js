@@ -11,9 +11,10 @@ fs.writeFileSync(path.join(DATA, 'providers.json'), JSON.stringify({ list: [], m
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 let server;
 async function api(route, method = 'GET', body) {
-  const r = await fetch(BASE + route, { method, headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(35000) });
-  assert(r.ok, `${method} ${route}: ${r.status}`);
-  return r.json();
+  const r = await fetch(BASE + route, { method, headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(route === '/api/browser/open' ? 90000 : 35000) });
+  const data = await r.json();
+  assert(r.ok, `${method} ${route}: ${r.status} ${JSON.stringify(data).slice(0, 1200)}`);
+  return data;
 }
 const browser = (route, body = {}) => api('/api/browser/' + route, 'POST', body);
 async function evaluate(expression) { const r = await browser('evaluate', { expression }); assert(r.ok, r.error); return r.value; }
@@ -35,6 +36,19 @@ async function delayed(route, method, action) {
     if (!(await api('/api/browser/status')).browser) { console.log('[workspace-ui] skipped: Chrome/Edge unavailable'); return; }
     const session = await api('/api/sessions', 'POST', { agent: 'builtin', autoPerms: true, permMode: 'auto' });
     await browser('open', { url: BASE }); await ready(); await evaluate(`openSession(${JSON.stringify(session.id)})`);
+    const projectIndent = await evaluate(`(()=>{const head=document.querySelector('#sessionList .proj-head:not(.shelf-head) .proj-name');const title=document.querySelector('#sessionList .session-item.project-child .si-title');return head&&title?{head:Math.round(head.getBoundingClientRect().x),child:Math.round(title.getBoundingClientRect().x)}:null})()`);
+    assert(projectIndent, 'project session fixture must render a project and child row');
+    assert(Math.abs(projectIndent.head - projectIndent.child) <= 1, `project child title must align with project name: ${JSON.stringify(projectIndent)}`);
+    console.log('  ✓ project child titles align under the project name');
+    const runningState = await evaluate(`(()=>{
+      S.running.add(${JSON.stringify(session.id)});renderSessions();
+      const row=document.querySelector('.session-item[data-sid="${session.id}"]');
+      const state={marker:!!row?.querySelector('.si-run'),label:row?.querySelector('.si-time')?.textContent};
+      S.running.delete(${JSON.stringify(session.id)});renderSessions();
+      return state;
+    })()`);
+    assert.deepEqual(runningState, { marker: true, label: '运行中' }, 'running sessions should show a marker and status label');
+    console.log('  ✓ running sessions are marked in the project list');
     const themes = await evaluate(`(()=>{
       openThemeMenu();const rows=[];const probe=document.createElement('span');document.body.append(probe);
       const rgb=value=>{probe.style.color=value;return getComputedStyle(probe).color.match(/[0-9.]+/g).slice(0,3).map(Number);};

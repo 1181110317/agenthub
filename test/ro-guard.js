@@ -29,13 +29,18 @@ const ok = (cond, label) => {
   server.stderr.on('data', () => {});
   try {
     let up = false;
-    for (let i = 0; i < 40; i++) {
+    // 60 秒预算：满载机器上冷启动可能远超 20 秒
+    for (let i = 0; i < 120; i++) {
       try { const r = await fetch(`${BASE}/api/health?token=full-token`); if (r.ok) { up = true; break; } } catch {}
       await new Promise(r => setTimeout(r, 500));
     }
     ok(up, '带令牌实例启动');
     const ro = await fetch(`${BASE}/api/backup?token=ro-token`);
     ok(ro.status === 403, '只读令牌导出备份 → 403');
+    const roMetrics = await fetch(`${BASE}/api/system/metrics`, { headers: { 'x-agenthub-token': 'ro-token' } });
+    ok(roMetrics.status === 403, '只读令牌不能读取电脑硬件或启动资源采集器');
+    const noMetrics = await fetch(`${BASE}/api/system/metrics`);
+    ok(noMetrics.status === 401, '未认证不能读取电脑资源');
     const full = await fetch(`${BASE}/api/backup?token=full-token`);
     ok(full.status === 200 && /application\/zip/.test(full.headers.get('content-type') || ''), '全权令牌导出备份 → 200 zip');
     const roSweep = await fetch(`${BASE}/api/uploads/sweep?token=ro-token`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });

@@ -6,8 +6,8 @@
 //
 // 安全前提：压缩包内容不可信。所有文本走全局 esc()；所有进 style 的取值
 // 先经过数值收敛或 6 位十六进制白名单，绝不把文件里的字符串直接拼进 HTML。
-// 依赖 app.js 的 esc()：本文件必须在 app.js 之后调用（defer 顺序见 index.html），
-// 但不在顶层引用它，避免加载顺序变化时踩 TDZ。
+// 依赖 app.js 的 esc()：本文件在 app.js **之前**加载（见 index.html），顶层绝不
+// 引用它——esc 只在预览被调用时才解析，那时 app.js 早已就绪（没有 TDZ 风险）。
 
 const OFFICE_EMU_PER_PX = 9525;              // 914400 EMU = 1 英寸 = 96px
 // 内联预算按「一次预览」算，不是按页算：每页重置预算会让 30 页各带满额图片，
@@ -492,7 +492,15 @@ function docxRunHtml(r, ctx) {
     else if (tag === 'w:cr') inner.push('<br>');
     else if (tag === 'w:tab') inner.push(ctx.leaderTab ? '<span class="docx-tab-fill"></span>' : '<span class="docx-tab"></span>');
     else if (tag === 'w:noBreakHyphen') inner.push('-');
-    else if (tag === 'w:sym') inner.push(esc(node.getAttribute('w:char') || ''));
+    else if (tag === 'w:sym') {
+      // Word 符号运行：char 是 Unicode 私有区码点（F020=实心圆 等），
+      // 减 0xF000 映射回可见字符；显示 "F020" 字面文本对读者毫无意义
+      const sym = node.getAttribute('w:char') || '';
+      const code = parseInt(sym, 16);
+      inner.push(esc(Number.isFinite(code) && code >= 0xF000 && code <= 0xF0FF
+        ? String.fromCharCode(code - 0xF000)
+        : sym));
+    }
     else if (tag === 'w:drawing') inner.push(docxDrawingHtml(node, ctx));
     else if (tag === 'w:pict' || tag === 'w:object') inner.push(docxVmlHtml(node, ctx));
     else if (tag === 'w:txbxContent') inner.push(docxRunsHtml(node, ctx));
@@ -877,7 +885,8 @@ function docxSliceBody(xml, maxBytes) {
   const head = xml.slice(0, start);
   const tail = '</w:body></w:document>';
   const slices = [];
-  const tagRe = /<(\/?)(w:p|w:tbl|w:sdt|w:tr|w:tc)\b[^>]*?(\/?)>/g;
+  // 平衡跟踪要覆盖所有可能包裹顶层块的内联容器：漏一种，跨边界切片就会不平衡
+  const tagRe = /<(\/?)((?:w:p|w:tbl|w:sdt|w:tr|w:tc|w:ins|w:del|w:smartTag|w:bdo|w:hyperlink|w:sdtContent)\b)[^>]*?(\/?)>/g;
   tagRe.lastIndex = start;
   let depth = 0;
   let from = start;
@@ -1139,7 +1148,7 @@ async function xlsxToHtml(zip, opts) {
       const width = Number(col.getAttribute('width'));
       const min = Number(col.getAttribute('min')), max = Number(col.getAttribute('max'));
       if (!Number.isFinite(width) || width <= 0) continue;
-      const px = Math.min(420, Math.max(28, Math.round(width * 7 * 96 / 96)));
+      const px = Math.min(420, Math.max(28, Math.round(width * 7)));
       for (let c = (Number.isFinite(min) ? min : 1) - 1; c < (Number.isFinite(max) ? max : min) && c < MAXC; c++) widths.set(c, px);
     }
     const rows = [...d.getElementsByTagName('row')];
@@ -1620,13 +1629,15 @@ async function pptxToHtml(zip, opts) {
     const inner = tree ? pptxShapesHtml(tree, ctx) : pptxFallbackText(doc, ctx);
     // 每页解析完让出一次：页面在解析过程中仍可滚动、可响应关闭。
     await officeYield();
-    skipped += media.skipped();
     if (!inner && !bg) { out.push(`<div class="pptx-slide-wrap"><div class="pptx-slide pptx-empty" style="width:${slideW}px;height:${slideH}px">（第 ${index + 1} 页没有可渲染的内容）</div></div>`); continue; }
     out.push(`<div class="pptx-slide-wrap">`
       + `<div class="pptx-slide" data-pptx-w="${slideW}" data-pptx-h="${slideH}" style="width:${slideW}px;height:${slideH}px${bg ? ';background:' + bg : ''}">${inner}</div>`
       + `</div><div class="pptx-caption">第 ${index + 1} 页 / ${ordered.length}</div>`);
   }
   const notes = [];
+  // media.skipped() 是**累计**值（整个 deck 共用一个 media store）：放在每页里
+  // 累加会把一张超限图片按页数重复上报（3 页越限 1 张会显示成 3 张）。
+  skipped = media.skipped();
   if (skipped) notes.push(`${skipped} 张图片超出内联上限，未显示`);
   if (ordered.length > shown.length) notes.push(`共 ${ordered.length} 页，仅显示前 ${shown.length} 页`);
   if (!out.length) return '<p class="empty-doc">（没有幻灯片）</p>';

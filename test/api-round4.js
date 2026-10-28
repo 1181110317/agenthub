@@ -16,6 +16,8 @@ const IMPORT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-import-'));
 // 设备动作的「成功路径」需要一个真实存在的 emulator 二进制：用 cmd.exe 改名伪造，
 // 让 findOnPath 找得到、spawn 能成功、detach 不阻塞服务（adb 故意不伪造 → 走错误分支）
 const STUB_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-stub-'));
+// 无供应商的幂等用例只验证回执。禁止首次启动迁移真实账户后意外发起模型调用。
+fs.writeFileSync(path.join(DATA_DIR, 'providers.json'), JSON.stringify({ list: [], meta: { ccswitchImportDone: true } }));
 try {
   fs.copyFileSync(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe'), path.join(STUB_DIR, 'emulator.exe'));
 } catch {}
@@ -35,14 +37,16 @@ const ok = (cond, label) => {
 function startServer() {
   server = spawn(process.execPath, ['server.js'], {
     cwd: ROOT,
-    env: { ...process.env, AGENTHUB_PORT: String(PORT), AGENTHUB_DATA_DIR: DATA_DIR, AGENTHUB_IMPORT_DIRS: IMPORT_DIR, PATH: STUB_DIR + path.delimiter + (process.env.PATH || '') },
+    env: { ...process.env, AGENTHUB_PORT: String(PORT), AGENTHUB_DATA_DIR: DATA_DIR, AGENTHUB_WORKSPACE: WORK_DIR,
+      AGENTHUB_CCSWITCH_DIR: path.join(DATA_DIR, 'ccswitch'), AGENTHUB_IMPORT_DIRS: IMPORT_DIR, PATH: STUB_DIR + path.delimiter + (process.env.PATH || '') },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stderr.on('data', () => {});
 }
 
 async function waitHealthy() {
-  for (let i = 0; i < 40; i++) {
+  // 60 秒预算：满载机器上冷启动可能远超 20 秒
+  for (let i = 0; i < 120; i++) {
     try { const r = await fetch(`${BASE}/api/health`); if (r.ok) return true; } catch {}
     await new Promise(r => setTimeout(r, 500));
   }
@@ -55,13 +59,19 @@ const post = (p, obj) => body(p, { method: 'POST', headers: { 'Content-Type': 'a
 const put = (p, obj) => body(p, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(obj || {}) });
 const get = p => body(p, {});
 
-async function waitRunningIdle(timeoutMs = 10000) {
+// 等 running 槽真正清空。预算放宽到 60 秒：机器同时跑几十个脚本时，一个回合的
+// chat.done 要几秒钟才到，10 秒预算会把「慢」误报成「泄漏」。
+async function waitRunningIdle(timeoutMs = 60000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const state = await body('/api/running').catch(() => null);
     if (state && state.code === 200 && Array.isArray(state.data && state.data.sessions) && !state.data.sessions.length) return true;
     await new Promise(resolve => setTimeout(resolve, 100));
   }
+  const stuck = await body('/api/running').catch(() => null);
+  console.error('[debug] running not idle:', JSON.stringify(stuck && stuck.data).slice(0, 600));
+  const sess = await body('/api/sessions').catch(() => null);
+  console.error('[debug] sessions:', JSON.stringify((sess && sess.data || []).map(x => ({ id: x.id, agent: x.agent, title: x.title }))).slice(0, 600));
   return false;
 }
 
@@ -218,8 +228,13 @@ function gitAvailable() {
     ok(tooMany.code === 400, '提问卡附件超过 8 个 → 400');
     const outside = await post('/api/bridge/respond', { sessionId: 'nope', requestId: 'r1', action: 'allow', freeText: 'x', attachments: [{ path: 'C:\\Windows\\win.ini' }] });
     ok(outside.code === 409, 'uploads 之外的附件路径被过滤（落到桥层 409，不注入上下文）');
-    const oversize = await post('/api/upload-file', { name: 'x.bin', dataUrl: 'data:application/octet-stream;base64,' + Buffer.alloc(20 * 1024 * 1024).toString('base64') });
-    ok([400, 413].includes(oversize.code), '超大附件被拦下（400/413）');
+    // 修复后 ≤25MB 的附件能真正到达路由（以前 17MB JSON 上限把有效上限压到 ~12.7MB，
+    // 旧断言 20MB 被 413 误杀正是当时记录的缺陷）。超限路径按契约验证：
+    // >25MB → 路由自身 400；body 超过 40MB 解析上限（约 30MB 二进制）→ 413
+    const oversize = await post('/api/upload-file', { name: 'x.bin', dataUrl: 'data:application/octet-stream;base64,' + Buffer.alloc(26 * 1024 * 1024).toString('base64') });
+    ok(oversize.code === 400, '附件超过 25MB → 400');
+    const oversize2 = await post('/api/upload-file', { name: 'x.bin', dataUrl: 'data:application/octet-stream;base64,' + Buffer.alloc(31 * 1024 * 1024).toString('base64') });
+    ok(oversize2.code === 413, '请求体超过解析上限 → 413');
 
     // ---- 外部 CLI 会话导入（只读扫描 + 导入为可续接会话） ----
     const scan = await body('/api/import/scan');
@@ -362,21 +377,24 @@ function gitAvailable() {
       // 让页面打开「导入的 claude 会话」（含消息），再真实导航一次
       await post('/api/browser/evaluate', { expression: `localStorage.setItem('ah.session', ${JSON.stringify(imported.data.id)}); 'ok'` });
       await post('/api/browser/open', { url: BASE + '/' });
-      const uiReady = await post('/api/browser/evaluate', {
-        expression: `(async () => {
-          // 列表、消息、引用按钮、分区标题是分几拍渲染的：等它们都出现再断言（避免竞态）
-          for (let i = 0; i < 40; i++) {
-            if (document.querySelectorAll('.msg').length > 0 && document.querySelector('[data-quote]') && document.querySelector('.shelf-head')) break;
-            await new Promise(r => setTimeout(r, 250));
-          }
-          return {
-            heads: [...document.querySelectorAll('.shelf-head')].map(el => el.textContent.replace(/\\s+/g, ' ').trim()),
-            msgCount: document.querySelectorAll('.msg').length,
-            hasQuoteBtn: !!document.querySelector('[data-quote]'),
-            hasComposer: !!document.getElementById('inpText'),
-          };
-        })()`,
-      });
+      // 列表、消息、引用按钮、分区标题是分几拍渲染的：等它们都出现再断言。
+      // 必须由 Node 侧轮询：单次 evaluate 有 20 秒上限，页内长轮询会超时。
+      const uiStateExpr = `(() => ({
+        heads: [...document.querySelectorAll('.shelf-head')].map(el => el.textContent.replace(/\\s+/g, ' ').trim()),
+        msgCount: document.querySelectorAll('.msg').length,
+        hasQuoteBtn: !!document.querySelector('[data-quote]'),
+        hasComposer: !!document.getElementById('inpText'),
+      }))()`;
+      let uiReadyValue = null;
+      for (let i = 0; i < 60; i++) {
+        const r = await post('/api/browser/evaluate', { expression: uiStateExpr });
+        const v = r.data && r.data.value;
+        if (v) uiReadyValue = v;
+        if (v && v.hasComposer && v.msgCount > 0 && v.hasQuoteBtn
+          && v.heads.some(h => /休眠中/.test(h)) && v.heads.some(h => /已收起/.test(h))) break;
+        await new Promise(res => setTimeout(res, 1000));
+      }
+      const uiReady = { data: { value: uiReadyValue } };
       const u = uiReady.data && uiReady.data.value;
       ok(u && u.hasComposer, 'UI：真实导航后工作台正常加载');
       ok(u && u.heads.some(h => /休眠中/.test(h)) && u.heads.some(h => /已收起/.test(h)), 'UI：侧栏渲染出「休眠中 / 已收起」两段');
@@ -590,64 +608,92 @@ function gitAvailable() {
       if (projectBrowser.code === 200 && projectBrowser.data.ok) {
         await post('/api/browser/evaluate', { expression: `localStorage.setItem('ah.agent','claude'); localStorage.setItem('ah.session',${JSON.stringify(imported.data.id)}); 'ok'` });
         await post('/api/browser/open', { url: BASE + '/' });
-        const projectUi = await post('/api/browser/evaluate', { expression: `(async () => {
+        // 注意：单次 /api/browser/evaluate 有 20 秒硬上限（lib/browser-cdp.js 的 pending 超时），
+        // 所以「等界面出现」不能写成页内长轮询——页内循环最多只等 10 秒，剩下的交给
+        // Node 侧反复求值（每次一个短 evaluate），总预算可以很长而不会撞上限时。
+        await post('/api/browser/evaluate', { expression: `(async () => {
           for (let i = 0; i < 40; i++) {
             const btn = document.getElementById('btnGit');
-            if (btn && btn.style.display !== 'none') { btn.click(); break; }
+            if (btn && btn.style.display !== 'none') {
+              btn.click();
+              // The header now opens the requested compact changes popover;
+              // enter the full workbench through its visible menu action.
+              for (let j = 0; j < 40; j++) {
+                const full = [...document.querySelectorAll('#flyMenu .fly-item')].find(el => el.textContent.includes('打开项目变更中心'));
+                if (full) { full.click(); break; }
+                await new Promise(r => setTimeout(r, 150));
+              }
+              break;
+            }
             await new Promise(r => setTimeout(r, 250));
           }
-          for (let i = 0; i < 40; i++) {
-            if (document.querySelector('.git-overview-stats')) break;
-            await new Promise(r => setTimeout(r, 250));
-          }
-          return { title: document.querySelector('.dlg-title')?.textContent || '',
-            overview: !!document.querySelector('.git-overview-stats'),
-            sessions: document.querySelectorAll('[data-project-session]').length };
+          return true;
         })()` });
-        const view = projectUi.data && projectUi.data.value;
+        const overviewExpr = `(() => ({ title: document.querySelector('.dlg-title')?.textContent || '',
+            overview: !!document.querySelector('.git-overview-stats'),
+            sessions: document.querySelectorAll('[data-project-session]').length }))()`;
+        let view = null;
+        for (let i = 0; i < 60 && !view; i++) {
+          const r = await post('/api/browser/evaluate', { expression: overviewExpr });
+          const v = r.data && r.data.value;
+          if (v && v.overview && v.sessions > 0) view = v;
+          else await new Promise(res => setTimeout(res, 1000));
+        }
+        if (!view) {
+          const last = await post('/api/browser/evaluate', { expression: overviewExpr });
+          console.error('    [debug] 项目变更中心:', JSON.stringify(last.data && last.data.value), 'err=', JSON.stringify(last.data && last.data.error));
+        }
         ok(view && view.overview && view.sessions > 0, 'UI：项目变更中心展示相关会话');
-        const compareUi = await post('/api/browser/evaluate', { expression: `(async () => {
+        const compareStart = await post('/api/browser/evaluate', { expression: `(async () => {
           document.getElementById('gitCompare')?.click();
+          await new Promise(r => setTimeout(r, 120));
           const form = !!document.getElementById('comparePrompt');
           if (document.getElementById('compareAgentA')) document.getElementById('compareAgentA').value = 'cmp_a';
           if (document.getElementById('compareAgentB')) document.getElementById('compareAgentB').value = 'cmp_b';
           const prompt = document.getElementById('comparePrompt');
           if (prompt) prompt.value = '只回复一句测试结果，不修改文件';
           document.getElementById('compareStart')?.click();
-          for (let i = 0; i < 60; i++) {
-            if (document.getElementById('compareBoard')) break;
-            await new Promise(r => setTimeout(r, 250));
-          }
+          return { form };
+        })()` });
+        const compareExpr = `(() => {
           const group = JSON.parse(localStorage.getItem('ah.comparisons') || '[]')[0];
-          return { form, board: !!document.getElementById('compareBoard'),
+          return { board: !!document.getElementById('compareBoard'),
             sides: document.querySelectorAll('.compare-card').length,
             paths: group && group.items && group.items.map(x => x.cwd),
             sessionIds: group && group.items && group.items.map(x => x.sessionId),
             baseSha: group && group.baseSha };
-        })()` });
-        const compared = compareUi.data && compareUi.data.value;
+        })()`;
+        let compared = null;
+        for (let i = 0; i < 90 && !(compared && compared.board && compared.sides === 2); i++) {
+          const r = await post('/api/browser/evaluate', { expression: compareExpr });
+          const v = r.data && r.data.value;
+          if (v && v.board && v.sides === 2) compared = v;
+          else { compared = v || compared; await new Promise(res => setTimeout(res, 1000)); }
+        }
+        if (compared) compared.form = !!(compareStart.data && compareStart.data.value && compareStart.data.value.form);
+        if (!compared || !compared.board || compared.sides !== 2) console.error('    [debug] 多 Agent 对比:', JSON.stringify(compared), 'err=', JSON.stringify(compareStart.data && compareStart.data.error));
         ok(compared && compared.form && compared.board && compared.sides === 2
           && Array.isArray(compared.paths) && compared.paths.length === 2
           && compared.paths[0] !== compared.paths[1] && /^[0-9a-f]{40}$/.test(compared.baseSha || ''),
         'UI：两个 Agent 从同一快照创建独立工作树并打开并排结果');
         if (compared && compared.board) {
-          const replies = await post('/api/browser/evaluate', { expression: `(async () => {
-            for (let i = 0; i < 80; i++) {
-              const text = [...document.querySelectorAll('.compare-answer')].map(x => x.textContent);
-              if (text.some(x => x.includes('COMPARE_A:')) && text.some(x => x.includes('COMPARE_B:'))) return text;
-              await new Promise(r => setTimeout(r, 250));
-            }
-            return [...document.querySelectorAll('.compare-answer')].map(x => x.textContent);
-          })()` });
-          const answers = replies.data && replies.data.value || [];
+          const answersExpr = `(() => [...document.querySelectorAll('.compare-answer')].map(x => x.textContent))()`;
+          let replyTexts = [];
+          for (let i = 0; i < 90; i++) {
+            const r = await post('/api/browser/evaluate', { expression: answersExpr });
+            replyTexts = (r.data && r.data.value) || [];
+            if (replyTexts.some(x => x.includes('COMPARE_A:')) && replyTexts.some(x => x.includes('COMPARE_B:'))) break;
+            await new Promise(res => setTimeout(res, 1000));
+          }
+          const answers = replyTexts;
           ok(answers.some(x => x.includes('COMPARE_A:')) && answers.some(x => x.includes('COMPARE_B:')),
             'UI：两条独立会话并行运行并显示各自回复');
-          if (Array.isArray(compared.paths) && Array.isArray(compared.sessionIds)) {
-            const changed = await body('/api/git/compare-changes?cwd=' + encodeURIComponent(compared.paths[0]) + '&base=' + compared.baseSha);
-            const metered = await body('/api/usage/session/' + encodeURIComponent(compared.sessionIds[0]));
-            ok(changed.code === 200 && changed.data.ok && Array.isArray(changed.data.files), '对比差异接口返回文件清单');
-            ok(metered.code === 200 && Number.isFinite(metered.data.costUsd), '对比会话返回费用估算');
-          }
+        }
+        if (compared && Array.isArray(compared.paths) && Array.isArray(compared.sessionIds)) {
+          const changed = await body('/api/git/compare-changes?cwd=' + encodeURIComponent(compared.paths[0]) + '&base=' + compared.baseSha);
+          const metered = await body('/api/usage/session/' + encodeURIComponent(compared.sessionIds[0]));
+          ok(changed.code === 200 && changed.data.ok && Array.isArray(changed.data.files), '对比差异接口返回文件清单');
+          ok(metered.code === 200 && Number.isFinite(metered.data.costUsd), '对比会话返回费用估算');
         }
         await post('/api/browser/close', {});
         if (compared && Array.isArray(compared.paths)) {
@@ -712,7 +758,7 @@ function gitAvailable() {
     const restoredData = await restored.json().catch(() => null);
     if (restored.status !== 200) console.error('  restore response:', restored.status, restoredData);
     ok(restored.status === 200 && restoredData && restoredData.restored > 0 && restoredData.restartRequired === true, 'POST /api/restore?confirm=1 覆盖并提示重启');
-    ok(restoredData && fs.existsSync(restoredData.snapshot), '恢复前快照目录存在');
+    ok(restoredData && typeof restoredData.snapshot === 'string' && fs.existsSync(restoredData.snapshot), '恢复前快照目录存在');
     ok((await put('/api/settings', { sound: false })).code === 409, '恢复后拒绝旧内存写入，等待重启');
   } catch (e) {
     failed++;

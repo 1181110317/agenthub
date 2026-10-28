@@ -25,7 +25,8 @@ function startServer(port, dataDir, extraEnv = {}) {
 
 async function waitHealthy(base, token = '') {
   const url = `${base}/api/health${token ? `?token=${encodeURIComponent(token)}` : ''}`;
-  for (let i = 0; i < 40; i++) {
+  // 60 秒预算：满载机器上 Node 冷启动 + 读 cc-switch 可能远超 20 秒（曾误报"实例未启动"）
+  for (let i = 0; i < 120; i++) {
     try { const r = await fetch(url); if (r.ok) return true; } catch {}
     await new Promise(r => setTimeout(r, 500));
   }
@@ -81,9 +82,9 @@ function wsHandshakeRejected(base, token) {
   let srv = null;
   // ---------- 实例 A：校验 + 定时 CRUD + 项目默认 + 归档恢复 ----------
   const dirA = tmpDir();
-  const BASE = 'http://127.0.0.1:7292';
+  const BASE = 'http://127.0.0.1:7293';
   try {
-    srv = startServer(7292, dirA, { AGENTHUB_MAX_ACTIVE_SESSIONS: '100' });
+    srv = startServer(7293, dirA, { AGENTHUB_MAX_ACTIVE_SESSIONS: '100' });
     ok(await waitHealthy(BASE), '实例 A 启动');
 
     // 参数校验（防脏数据入库）
@@ -176,9 +177,9 @@ function wsHandshakeRejected(base, token) {
 
   // ---------- 实例 C：全权令牌 ----------
   const dirC = tmpDir();
-  const BASE_C = 'http://127.0.0.1:7294';
+  const BASE_C = 'http://127.0.0.1:7296';
   try {
-    srv = startServer(7294, dirC, { AGENTHUB_TOKEN: 'full-secret' });
+    srv = startServer(7296, dirC, { AGENTHUB_TOKEN: 'full-secret' });
     ok(await waitHealthy(BASE_C, 'full-secret'), '实例 C（全权令牌）启动');
     ok((await body(BASE_C, '/api/sessions')).code === 401, '无令牌 → 401');
     ok((await body(BASE_C, '/api/sessions?token=full-secret')).code === 200, '全权令牌可读');
@@ -193,7 +194,7 @@ function wsHandshakeRejected(base, token) {
 
   // ---------- C5：0.0.0.0 无令牌必须拒绝启动 ----------
   await new Promise(resolve => {
-    const bad = startServer(7295, tmpDir(), { AGENTHUB_HOST: '0.0.0.0' });
+    const bad = startServer(7298, tmpDir(), { AGENTHUB_HOST: '0.0.0.0' });
     let stderr = '';
     bad.stderr.on('data', d => { stderr += d; });
     bad.stdout.on('data', () => {});

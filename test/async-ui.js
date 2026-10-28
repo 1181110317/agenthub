@@ -6,18 +6,138 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const ROOT = path.resolve(__dirname, '..');
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-async-ui-'));
-const BASE = 'http://127.0.0.1:18957';
+const BASE = 'http://127.0.0.1:18958';
 fs.writeFileSync(path.join(DATA, 'providers.json'), JSON.stringify({ list: [], meta: { ccswitchImportDone: true } }));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 let server, failures = 0, passed = 0;
 async function api(route, method = 'GET', body) {
-  const r = await fetch(BASE + route, { method, headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(35000) });
+  const r = await fetch(BASE + route, { method, headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(route === '/api/browser/open' ? 90000 : 35000) });
   assert(r.ok, `${method} ${route}: ${r.status}`); return r.json();
 }
 const browser = (route, body = {}) => api('/api/browser/' + route, 'POST', body);
 async function ev(expression) { const r = await browser('evaluate', { expression }); assert(r.ok, r.error); return r.value; }
 async function waitFor(fn) { for (let i = 0; i < 160; i++) { try { if (await fn()) return; } catch {} await sleep(150); } throw Error('Startup timeout'); }
 async function check(name, fn) { try { await fn(); passed++; console.log('  PASS ' + name); } catch (e) { failures++; console.error('  FAIL ' + name + ': ' + e.message); } }
+async function requestResourceChecks() {
+  const vm = require('node:vm');
+  const { getEventListeners } = require('node:events');
+  const source = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
+  const begin = source.indexOf('async function api(');
+  const end = source.indexOf('// ---------------- Markdown', begin);
+  assert(begin >= 0 && end > begin, 'frontend request helper must be available');
+  function fixture(fetchImpl) {
+    const timers = new Map();
+    let next = 0, authPrompts = 0;
+    const context = vm.createContext({
+      AbortController, storageGet: () => '', readCookie: () => '',
+      showAuthLayer: () => { authPrompts++; },
+      setTimeout: fn => { const id = ++next; timers.set(id, fn); return id; },
+      clearTimeout: id => timers.delete(id), fetch: fetchImpl,
+    });
+    vm.runInContext(source.slice(begin, end) + '\nglobalThis.request = api;', context);
+    return { request: context.request, timers, authPrompts: () => authPrompts };
+  }
+  function released(f, caller) {
+    assert.equal(f.timers.size, 0, 'request left a timeout behind');
+    assert.equal(getEventListeners(caller.signal, 'abort').length, 0, 'request retained its caller');
+  }
+  for (const kind of ['network', 'abort']) await check(kind + ' fetch failure releases timeout and cancel listener', async () => {
+    const caller = new AbortController();
+    const f = fixture(async () => { throw kind === 'network' ? new TypeError('fixture offline') : new DOMException('fixture aborted', 'AbortError'); });
+    await assert.rejects(f.request('/fixture', { signal: caller.signal }), kind === 'network' ? /fixture offline/ : /请求超时/);
+    released(f, caller);
+  });
+  await check('request timeout remains active until the response body completes', async () => {
+    const caller = new AbortController();
+    let complete;
+    const body = new Promise(resolve => { complete = resolve; });
+    const f = fixture(async () => ({ ok: true, json: () => body }));
+    const request = f.request('/fixture', { signal: caller.signal });
+    await Promise.resolve();
+    assert.equal(f.timers.size, 1); assert.equal(getEventListeners(caller.signal, 'abort').length, 1);
+    complete({ fixture: true });
+    assert.equal((await request).fixture, true);
+    released(f, caller);
+  });
+  await check('response body timeout aborts reading and releases request resources', async () => {
+    const caller = new AbortController();
+    let markReading;
+    const reading = new Promise(resolve => { markReading = resolve; });
+    const f = fixture(async (_url, options) => ({ ok: true, json: () => new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+      markReading();
+    }) }));
+    const request = f.request('/fixture', { signal: caller.signal });
+    const rejected = assert.rejects(request, /请求超时/);
+    await reading;
+    f.timers.values().next().value();
+    await rejected;
+    released(f, caller);
+  });
+  await check('invalid JSON keeps the existing fallback and releases resources', async () => {
+    const caller = new AbortController();
+    const f = fixture(async () => ({ ok: true, json: async () => { throw new SyntaxError('fixture invalid JSON'); } }));
+    assert.equal(Object.keys(await f.request('/fixture', { signal: caller.signal })).length, 0);
+    released(f, caller);
+  });
+  await check('caller cancellation reaches fetch and releases request resources', async () => {
+    const caller = new AbortController();
+    const f = fixture((_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+    }));
+    const rejected = assert.rejects(f.request('/fixture', { signal: caller.signal }), /请求超时/);
+    caller.abort(new DOMException('fixture cancelled', 'AbortError'));
+    await rejected;
+    released(f, caller);
+  });
+  await check('HTTP auth failure still opens login after releasing request resources', async () => {
+    const caller = new AbortController();
+    const f = fixture(async () => ({ ok: false, status: 401, json: async () => ({ error: 'fixture denied', authRequired: true }) }));
+    await assert.rejects(f.request('/fixture', { signal: caller.signal }), /fixture denied/);
+    assert.equal(f.authPrompts(), 1);
+    released(f, caller);
+  });
+}
+async function lazyResourceChecks() {
+  const vm = require('node:vm');
+  const source = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
+  const begin = source.indexOf('const _lazyScripts = new Map();');
+  const end = source.indexOf('// 分区域字体偏好', begin);
+  assert(begin >= 0 && end > begin, 'lazy resource helpers must be available');
+  function fixture() {
+    const scripts=[], links=[], timers=new Map();let next=0;
+    const context=vm.createContext({window:{},document:{
+      createElement:tag=>({tag,dataset:{},remove(){this.removed=true;}}),
+      querySelector:()=>links.length?links[0]:null,
+      head:{appendChild:element=>(element.tag==='script'?scripts:links).push(element)},
+    },setTimeout:fn=>{const id=++next;timers.set(id,fn);return id;},clearTimeout:id=>timers.delete(id)});
+    vm.runInContext(source.slice(begin,end)+'\nglobalThis.load=loadScriptOnce;globalThis.katex=ensureKatex;',context);
+    return {context,scripts,links,timers};
+  }
+  await check('concurrent lazy loads share one script and release their timeout after success',async()=>{
+    const f=fixture(),a=f.context.load('/fixture.js'),b=f.context.load('/fixture.js');
+    assert.strictEqual(a,b);assert.equal(f.scripts.length,1);assert.equal(f.timers.size,1);
+    f.scripts[0].onload();await a;assert.equal(f.timers.size,0);assert.strictEqual(f.context.load('/fixture.js'),a);
+  });
+  await check('a failed lazy load removes its script and permits a fresh retry',async()=>{
+    const f=fixture(),a=f.context.load('/fixture.js'),rejected=assert.rejects(a,/加载失败/);
+    f.scripts[0].onerror();await rejected;assert(f.scripts[0].removed);assert.equal(f.timers.size,0);
+    const b=f.context.load('/fixture.js');assert.notStrictEqual(b,a);assert.equal(f.scripts.length,2);
+    f.scripts[1].onload();await b;
+  });
+  await check('an unresponsive lazy load times out, ignores late events and permits retry',async()=>{
+    const f=fixture(),a=f.context.load('/fixture.js'),rejected=assert.rejects(a,/加载超时/),late=f.scripts[0].onload;
+    f.timers.values().next().value();await rejected;assert(f.scripts[0].removed);assert.equal(f.timers.size,0);
+    const b=f.context.load('/fixture.js');late();assert.equal(f.timers.size,1,'old load event must not settle the replacement');
+    f.scripts[1].onload();await b;assert.equal(f.timers.size,0);
+  });
+  await check('KaTeX retries after a transient load failure without duplicating its stylesheet',async()=>{
+    const f=fixture(),a=f.context.katex(),rejected=assert.rejects(a,/加载失败/);
+    f.scripts[0].onerror();await rejected;
+    const b=f.context.katex();assert.notStrictEqual(b,a);assert.equal(f.scripts.length,2);assert.equal(f.links.length,1);
+    f.scripts[1].onload();await b;assert.equal(f.timers.size,0);
+  });
+}
 async function delay(route, method, action) {
   return ev(`(async()=>{const original=window.fetch;window.fetch=async(...args)=>{const response=await original(...args);if(String(args[0]).startsWith(${JSON.stringify(route)})&&(args[1]?.method||'GET')===${JSON.stringify(method)})await new Promise(r=>setTimeout(r,350));return response;};try{${action}}finally{window.fetch=original;}})()`);
 }
@@ -32,13 +152,22 @@ async function priceLayoutChecks() {
   const command=(method,params={},sessionId)=>new Promise((resolve,reject)=>{const id=++next;pending.set(id,{resolve,reject});socket.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})}));});
   try {
     const {sessionId}=await command('Target.attachToTarget',{targetId:status.targetId,flatten:true});
-    for(const width of [1440,390,320])for(const theme of ['paper','ink'])await check(`pricing layout ${width}px ${theme}`,async()=>{
+    for(const width of [1440,390,320])for(const theme of ['paper','ink']) {
+      await check(`pricing layout ${width}px ${theme}`,async()=>{
       await command('Emulation.setDeviceMetricsOverride',{width,height:900,deviceScaleFactor:1,mobile:false},sessionId);
       await ev(`document.getElementById('toastWrap').replaceChildren();applyTheme(${JSON.stringify(theme)});openPricingDialog();document.getElementById('priceAdd').click();document.querySelector('.pm-name').value='long-model-name-for-real-world-config';true`);
       const metrics=await ev(`(()=>{const body=document.getElementById('dlgBody'),row=document.querySelector('.price-row');return {page:document.documentElement.scrollWidth<=innerWidth,body:body.scrollWidth<=body.clientWidth+1,fields:[...row.querySelectorAll('input,button')].every(el=>{const b=el.getBoundingClientRect(),r=row.getBoundingClientRect();return b.left>=r.left&&b.right<=r.right+1;})};})()`);
       assert.deepEqual(metrics,{page:true,body:true,fields:true});
       if(process.env.AH_ASYNC_SCREENSHOT_DIR){fs.mkdirSync(process.env.AH_ASYNC_SCREENSHOT_DIR,{recursive:true});const png=await command('Page.captureScreenshot',{format:'png'},sessionId);fs.writeFileSync(path.join(process.env.AH_ASYNC_SCREENSHOT_DIR,`pricing-${width}-${theme}.png`),Buffer.from(png.data,'base64'));}
-    });
+      });
+      await check(`file reference error layout ${width}px ${theme}`,async()=>{
+        const result=await ev(`(async()=>{while(dlgStack.length)closeDlg();if(!document.getElementById('overlay').classList.contains('hidden'))closeDlg();const original=window.fetch,input=document.getElementById('inpText'),draft=input.value;window.fetch=(url,opts)=>String(url).startsWith('/api/fs/files?')?Promise.resolve(new Response(JSON.stringify({error:'目录不存在或不可读：'+('long-directory-name/'.repeat(25))}),{status:400})):original(url,opts);try{input.value='@alpha';input.setSelectionRange(6,6);input.focus();await maybeFileRef();await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));const menu=document.getElementById('flyMenu'),note=menu.querySelector('[role=alert]'),b=menu.getBoundingClientRect();return {draft,visible:!!note&&getComputedStyle(menu).visibility==='visible',bounds:b.left>=0&&b.right<=innerWidth+1&&b.top>=0&&b.bottom<=innerHeight+1,wrap:menu.scrollWidth<=menu.clientWidth+1,focus:document.activeElement===input};}finally{window.fetch=original;}})()`);
+        try {
+          assert.deepEqual({visible:result.visible,bounds:result.bounds,wrap:result.wrap,focus:result.focus},{visible:true,bounds:true,wrap:true,focus:true});
+          if(process.env.AH_ASYNC_SCREENSHOT_DIR){const png=await command('Page.captureScreenshot',{format:'png'},sessionId);fs.writeFileSync(path.join(process.env.AH_ASYNC_SCREENSHOT_DIR,`file-reference-${width}-${theme}.png`),Buffer.from(png.data,'base64'));}
+        } finally {await ev(`closeFlyMenu();document.getElementById('inpText').value=${JSON.stringify(result.draft)};true`);}
+      });
+    }
   } finally {socket.close();}
 }
 const loaders = [
@@ -60,7 +189,9 @@ const nextDialog = `openDlg('NEXT','<p id="next-dialog">Keep this page</p>');`;
 const unchanged = `({title:document.getElementById('dlgTitle').textContent,body:!!document.getElementById('next-dialog')})`;
 (async()=>{
   try {
-    server=spawn(process.execPath,['server.js'],{cwd:ROOT,windowsHide:true,stdio:'ignore',env:{...process.env,AGENTHUB_PORT:'18957',AGENTHUB_HOST:'127.0.0.1',AGENTHUB_DATA_DIR:DATA,AGENTHUB_TOKEN:'',AGENTHUB_RO_TOKEN:''}});
+    await requestResourceChecks();
+    await lazyResourceChecks();
+    server=spawn(process.execPath,['server.js'],{cwd:ROOT,windowsHide:true,stdio:'ignore',env:{...process.env,AGENTHUB_PORT:'18958',AGENTHUB_HOST:'127.0.0.1',AGENTHUB_DATA_DIR:DATA,AGENTHUB_TOKEN:'',AGENTHUB_RO_TOKEN:''}});
     await waitFor(()=>api('/api/health'));
     if(!(await api('/api/browser/status')).browser){console.log('[async-ui] skipped: Chrome/Edge unavailable');return;}
     const provider=await api('/api/providers','POST',{agent:'builtin',name:'fixture',baseUrl:'http://127.0.0.1:1/v1',apiKey:'fixture-only',model:'fixture-model'});
@@ -73,6 +204,22 @@ const unchanged = `({title:document.getElementById('dlgTitle').textContent,body:
     for(const [name,action,route,data] of loaders)for(const fail of [false,true])await check(name+' late '+(fail?'error':'success')+' keeps next dialog',async()=>{
       const result=await ev(`(async()=>{const original=window.fetch;window.fetch=async(url,options)=>{if(String(url).startsWith(${JSON.stringify(route)})){await new Promise(r=>setTimeout(r,180));return new Response(JSON.stringify(${JSON.stringify(fail?{error:'fixture failure'}:data)}),{status:${fail?503:200},headers:{'content-type':'application/json'}});}return original(url,options);};try{const pending=${action};${nextDialog}await pending;return ${unchanged};}finally{window.fetch=original;}})()`);
       assert.deepEqual(result,{title:'NEXT',body:true});
+    });
+    await check('file references use the default local workspace and preserve a trailing Windows separator',async()=>{
+      const result=await ev(`(async()=>{while(dlgStack.length)closeDlg();if(!document.getElementById('overlay').classList.contains('hidden'))closeDlg();await openSession(${JSON.stringify(session.id)});const s=curSession(),cwd=s.cwd,root=S.defaultWorkspace,original=window.fetch,input=document.getElementById('inpText'),draft=input.value,requests=[];window.fetch=(url,opts)=>{if(String(url).startsWith('/api/fs/files?')){const p=new URL(url,location.origin).searchParams.get('path');requests.push(p);return Promise.resolve(new Response(JSON.stringify({files:[{path:p+(p.endsWith('\\\\')?'':'/')+'alpha.txt'}]})));}return original(url,opts);};try{s.cwd='';S.defaultWorkspace=${JSON.stringify(DATA)};input.value='@alpha';input.setSelectionRange(6,6);await maybeFileRef();const defaultLabel=document.querySelector('#flyMenu .fly-item')?.textContent;s.cwd='C:\\\\fixture\\\\';input.value='@alpha';input.setSelectionRange(6,6);await maybeFileRef();const trailingLabel=document.querySelector('#flyMenu .fly-item')?.textContent;return {requests,defaultLabel,trailingLabel};}finally{s.cwd=cwd;S.defaultWorkspace=root;window.fetch=original;closeFlyMenu();input.value=draft;}})()`);
+      assert.deepEqual(result.requests,[DATA,'C:\\fixture\\']);assert.equal(result.defaultLabel,'alpha.txt');assert.equal(result.trailingLabel,'alpha.txt');
+    });
+    await check('file reference errors are readable and escaped; retry and empty lists remain usable',async()=>{
+      const result=await ev(`(async()=>{const original=window.fetch,input=document.getElementById('inpText'),draft=input.value;let response={error:'Directory unavailable <img src=x onerror=alert(1)>'},status=400;window.fetch=(url,opts)=>String(url).startsWith('/api/fs/files?')?Promise.resolve(new Response(JSON.stringify(response),{status})):original(url,opts);try{input.value='@alpha';input.setSelectionRange(6,6);input.focus();await maybeFileRef();await new Promise(r=>requestAnimationFrame(r));const failed={text:document.querySelector('#flyMenu [role=alert]')?.textContent,image:!!document.querySelector('#flyMenu img'),draft:input.value,focus:document.activeElement===input};response={files:[]};status=200;await maybeFileRef();const empty=document.querySelector('#flyMenu [role=status]')?.textContent;response={files:[{path:curSession().cwd+'/alpha.txt'}]};await maybeFileRef();return {failed,empty,retried:!!document.querySelector('#flyMenu .fly-item')};}finally{window.fetch=original;closeFlyMenu();input.value=draft;}})()`);
+      assert.deepEqual(result.failed,{text:'Directory unavailable <img src=x onerror=alert(1)>',image:false,draft:'@alpha',focus:true});assert.match(result.empty,/没有匹配/);assert(result.retried);
+    });
+    for(const fail of [false,true])await check('late file reference '+(fail?'error':'success')+' cannot reopen above another dialog',async()=>{
+      const result=await ev(`(async()=>{const original=window.fetch,input=document.getElementById('inpText'),draft=input.value;window.fetch=async(url,opts)=>{if(String(url).startsWith('/api/fs/files?')){await new Promise(r=>setTimeout(r,100));return new Response(JSON.stringify(${JSON.stringify(fail?{error:'late failure'}:{files:[{path:'fixture/alpha.txt'}]})}),{status:${fail?400:200}});}return original(url,opts);};try{input.value='@alpha';input.setSelectionRange(6,6);const pending=maybeFileRef();${nextDialog}await pending;return {...${unchanged},menu:!!document.querySelector('#flyMenu:not(.hidden)')};}finally{window.fetch=original;input.value=draft;closeDlg();closeFlyMenu();}})()`);
+      assert.deepEqual(result,{title:'NEXT',body:true,menu:false});
+    });
+    await check('a remote file reference without cwd uses the target home, not the local workspace',async()=>{
+      const result=await ev(`(async()=>{while(dlgStack.length)closeDlg();if(!document.getElementById('overlay').classList.contains('hidden'))closeDlg();const s=curSession(),saved={cwd:s.cwd,remoteHostId:s.remoteHostId},original=window.fetch,input=document.getElementById('inpText'),draft=input.value;let query;window.fetch=(url,opts)=>{if(String(url).startsWith('/api/fs/files?')){const p=new URL(url,location.origin).searchParams;query={path:p.get('path'),host:p.get('host')};return Promise.resolve(new Response(JSON.stringify({files:[]})));}return original(url,opts);};try{s.cwd='';s.remoteHostId='remote-fixture';input.value='@';input.setSelectionRange(1,1);await maybeFileRef();return query;}finally{Object.assign(s,saved);window.fetch=original;closeFlyMenu();input.value=draft;}})()`);
+      assert.deepEqual(result,{path:'~',host:'remote-fixture'});
     });
     await check('profile submit creates once without overwriting next dialog',async()=>{
       await ev(`showProjectProfiles()`);
@@ -111,10 +258,10 @@ const unchanged = `({title:document.getElementById('dlgTitle').textContent,body:
       const result=await ev(`(async()=>{const original=window.fetch,calls=[];let concurrent=0,max=0;window.fetch=async(url,opts)=>{if(url===${JSON.stringify('/api/sessions/'+session.id)}&&opts?.method==='PATCH'){const p=JSON.parse(opts.body);calls.push(p.model);max=Math.max(max,++concurrent);await new Promise(r=>setTimeout(r,p.model==='bad'?150:20));concurrent--;return new Response(JSON.stringify(p.model==='bad'?{error:'fixture failure'}:{}),{status:p.model==='bad'?503:200});}return original(url,opts);};try{const s=curSession();const a=saveSessionPatch(s,{model:'bad'}).catch(()=>{}),b=saveSessionPatch(s,{model:'latest'});await Promise.all([a,b]);return {calls,max,model:curSession().model};}finally{window.fetch=original;}})()`);assert.deepEqual(result,{calls:['bad','latest'],max:1,model:'latest'});
     });
     await check('Git commit submits once and cannot refresh a later dialog',async()=>{
-      const result=await ev(`(async()=>{const original=window.fetch;let commits=0;window.fetch=async(url,opts)=>{if(String(url).startsWith('/api/git/')){if(url==='/api/git/commit'){commits++;await new Promise(r=>setTimeout(r,150));}return new Response(JSON.stringify({ok:true,files:[],items:[],sessions:[],branch:'fixture',sha:'fixture'}));}return original(url,opts);};try{await openGitPanel();document.getElementById('gitMsg').value='fixture';const btn=document.getElementById('gitCommit');const a=btn.onclick(),b=btn.onclick();${nextDialog}await Promise.all([a,b]);return {...${unchanged},commits};}finally{window.fetch=original;}})()`);assert.deepEqual(result,{title:'NEXT',body:true,commits:1});
+      const result=await ev(`(async()=>{const original=window.fetch;let commits=0;window.fetch=async(url,opts)=>{if(String(url).startsWith('/api/git/')){if(url==='/api/git/commit'){commits++;await new Promise(r=>setTimeout(r,150));}const status=String(url).startsWith('/api/git/status?');return new Response(JSON.stringify(status?{ok:true,files:[{path:'staged.txt',staged:true,unstaged:false,status:'A',added:1,deleted:0}],branch:'fixture'}:{ok:true,files:[],items:[],sessions:[],branch:'fixture',sha:'fixture'}));}return original(url,opts);};try{await openGitPanel();document.getElementById('gitMsg').value='fixture';const btn=document.getElementById('gitCommit');const a=btn.onclick(),b=btn.onclick();${nextDialog}await Promise.all([a,b]);return {...${unchanged},commits};}finally{window.fetch=original;}})()`);assert.deepEqual(result,{title:'NEXT',body:true,commits:1});
     });
     await check('latest Git diff wins over an earlier file',async()=>{
-      const result=await ev(`(async()=>{openDlg('diff','<div id="gitDiff"></div>');const original=window.fetch;window.fetch=async(url,opts)=>{if(String(url).startsWith('/api/git/diff?')){const p=new URL(url,location.origin).searchParams.get('path');await new Promise(r=>setTimeout(r,p==='first'?160:20));return new Response(JSON.stringify({text:p}));}return original(url,opts);};try{await Promise.all([showGitDiff('first'),showGitDiff('second')]);return document.getElementById('gitDiff').textContent;}finally{window.fetch=original;}})()`);assert(result.includes('second'));assert(!result.includes('first'));
+      const result=await ev(`(async()=>{openDlg('diff','<div id="gitDiff"></div>');const original=window.fetch;window.fetch=async(url,opts)=>{if(String(url).startsWith('/api/git/diff?')){const p=new URL(url,location.origin).searchParams.get('path');await new Promise(r=>setTimeout(r,p==='first'?160:20));return new Response(JSON.stringify({ok:true,text:p}));}return original(url,opts);};try{await Promise.all([showGitDiff('first'),showGitDiff('second')]);return document.getElementById('gitDiff').textContent;}finally{window.fetch=original;}})()`);assert(result.includes('second'));assert(!result.includes('first'));
     });
     await check('directory requests cannot cross hosts or leave expanded refresh stuck',async()=>{
       const result=await ev(`(async()=>{const original=window.fetch;window.fetch=async(url,opts)=>{if(String(url).startsWith('/api/fs/ls?')){const u=new URL(url,location.origin),remote=u.searchParams.get('host')==='wsl',path=u.searchParams.get('path');await new Promise(r=>setTimeout(r,remote?20:180));return new Response(JSON.stringify({dirs:path?[]:[{name:remote?'REMOTE':'LOCAL',path:remote?'/home':'C:\\\\fixture'}]}));}return original(url,opts);};try{showWorkspacePicker();showWorkspacePicker({hostId:'wsl'});await new Promise(r=>setTimeout(r,250));const roots=(wsTree.children.get('')||[]).map(x=>x.name);wsSelect('/home');await new Promise(r=>setTimeout(r,70));document.getElementById('wsRefresh').click();await new Promise(r=>setTimeout(r,100));return {roots,hasChild:wsTree.children.has('/home'),loading:document.getElementById('wsTree').textContent.includes('加载中')};}finally{window.fetch=original;}})()`);assert.deepEqual(result,{roots:['REMOTE'],hasChild:true,loading:false});
@@ -132,6 +279,7 @@ const unchanged = `({title:document.getElementById('dlgTitle').textContent,body:
       const result=await ev(`(async()=>{const original=window.fetch;localStorage.removeItem('ah.stash');window.fetch=async(url,opts)=>{if(url==='/api/upload-text'){await new Promise(r=>setTimeout(r,100));return new Response(JSON.stringify({error:'fixture failure'}),{status:503});}return original(url,opts);};try{document.getElementById('inpText').value='NEXT DRAFT';const pending=uploadPastedText('SOURCE TEXT').catch(()=>{});openSessionSeq++;await pending;const value=document.getElementById('inpText').value;restoreStash();return {value,recovered:document.getElementById('inpText').value};}finally{window.fetch=original;}})()`);assert.equal(result.value,'NEXT DRAFT');assert.equal(result.recovered,'SOURCE TEXT\nNEXT DRAFT');
     });
     await check('failed dialog save keeps input and enables retry',async()=>{
+      await ev(`(()=>{while(dlgStack.length)closeDlg();if(!document.getElementById('overlay').classList.contains('hidden'))closeDlg();})()`);
       const result=await ev(`(async()=>{openLimitDialog(${JSON.stringify(provider.id)});const input=document.getElementById('limUsd'),button=document.getElementById('limSave');input.value='17';const label=button.textContent,original=window.fetch;let calls=0;window.fetch=(url,opts)=>{if(url==='/api/settings'&&opts?.method==='PUT'){calls++;return Promise.resolve(new Response(JSON.stringify(calls===1?{error:'fixture failure'}:{}),{status:calls===1?503:200}));}return original(url,opts);};try{await button.onclick();const retry=!button.disabled&&button.textContent===label&&input.value==='17'&&!document.getElementById('overlay').classList.contains('hidden');await button.onclick();return {retry,calls,closed:document.getElementById('overlay').classList.contains('hidden')};}finally{window.fetch=original;}})()`);assert.deepEqual(result,{retry:true,calls:2,closed:true});
     });
     await check('skill search preserves focus and pending toggle after rerender',async()=>{
@@ -159,7 +307,7 @@ const unchanged = `({title:document.getElementById('dlgTitle').textContent,body:
       assert(result.geom.gear.len>100,'gear should be a cog outline, got length '+result.geom.gear.len);
     });
     await check('a turn that ends without a final text event still settles highlight and mermaid',async()=>{
-      const result=await ev(`(async()=>{const sid='__settle_fixture__',host=document.createElement('div');host.className='msg';host.innerHTML='<div class="blk-text live"><pre><code class="language-js">const answer = 42;</code></pre><div class="mermaid-box" data-mermaid="1"><pre class="mm-src" hidden>graph TD</pre><div class="mm-render"></div></div></div>';document.getElementById('messages').appendChild(host);const realNotify=window.notifyDone,realMermaid=window.mermaid;window.notifyDone=()=>{};window.mermaid={run:async()=>{}};S.streams.set(sid,{el:host,startAt:Date.now()});let threw='';try{await onChatDone({sessionId:sid,code:1});}catch(e){threw=String((e&&e.message)||e);}const code=host.querySelector('pre code'),box=host.querySelector('.mermaid-box');const out={marked:code.dataset.hl==='1',colored:/hljs-/.test(code.innerHTML),mermaidDone:box.dataset.done==='1',live:host.querySelectorAll('.live').length,streamGone:!S.streams.has(sid),threw};window.notifyDone=realNotify;window.mermaid=realMermaid;host.remove();return out;})()`);
+      const result=await ev(`(async()=>{const sid='__settle_fixture__',host=document.createElement('div');host.className='msg';host.innerHTML='<div class="blk-text live"><pre><code class="language-js">const answer = 42;</code></pre>'+mermaidBlockHtml('graph TD')+'</div>';document.getElementById('messages').appendChild(host);const realNotify=window.notifyDone,realMermaid=window.mermaid;window.notifyDone=()=>{};window.mermaid={run:async({nodes})=>{nodes.forEach(node=>node.innerHTML='<svg viewBox="0 0 10 10"></svg>');}};S.streams.set(sid,{el:host,startAt:Date.now()});let threw='';try{await onChatDone({sessionId:sid,code:1});await mermaidRenderQueue;}catch(e){threw=String((e&&e.message)||e);}const code=host.querySelector('pre code'),box=host.querySelector('.mermaid-box');const out={marked:code.dataset.hl==='1',colored:/hljs-/.test(code.innerHTML),mermaidDone:box.dataset.done==='1',live:host.querySelectorAll('.live').length,streamGone:!S.streams.has(sid),threw};window.notifyDone=realNotify;window.mermaid=realMermaid;host.remove();return out;})()`);
       assert.deepEqual(result,{marked:true,colored:true,mermaidDone:true,live:0,streamGone:true,threw:''});
     });
     await check('a cancel request the server no longer knows about is dropped',async()=>{
@@ -172,6 +320,10 @@ const unchanged = `({title:document.getElementById('dlgTitle').textContent,body:
     });
     await check('repeated notifications merge and cannot fill the page',async()=>{
       const result=await ev(`(()=>{const wrap=document.getElementById('toastWrap');wrap.replaceChildren();for(let i=0;i<8;i++)toast('same failure','err');const repeated=wrap.children.length;for(let i=0;i<8;i++)toast('notice '+i);return {repeated,count:wrap.children.length,last:wrap.lastElementChild.textContent};})()`);assert.deepEqual(result,{repeated:1,count:3,last:'notice 7'});
+    });
+    await check('update notices distinguish local commits and failed comparison from an up-to-date branch',async()=>{
+      const rows=await ev(`(async()=>{const realFetch=window.fetch,realToast=window.toast,rows=[];window.toast=(text,tone)=>rows.push({text,tone:tone||''});try{for(const value of [{isRepo:true,remote:'origin/main',ahead:4,behind:0},{isRepo:true,remote:'origin/main',compareFailed:true},{isRepo:true,remote:'origin/main',ahead:0,behind:0}]){window.fetch=async()=>new Response(JSON.stringify(value));await checkForUpdates(true);}return rows;}finally{window.fetch=realFetch;window.toast=realToast;}})()`);
+      assert.equal(rows.length,3);assert.match(rows[0].text,/本地领先.*4/);assert(!/一致|已是最新/.test(rows[0].text));assert.match(rows[1].text,/无法比较/);assert.equal(rows[1].tone,'err');assert.match(rows[2].text,/已是最新/);assert.equal(rows[2].tone,'ok');
     });
     await priceLayoutChecks();
     if(failures)throw Error(failures+' checks failed');console.log('[async-ui] '+passed+' checks passed');

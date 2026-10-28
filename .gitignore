@@ -35,7 +35,7 @@ data/logs/
 
 # 万一以后还有别的运行时数据落进 data/，整目录兜底
 # 如果未来需要提交某些示例/种子数据，再单独 !data/xxx.json 放行
-# data/
+data/
 
 # =========================
 # Temporary / debug scripts
@@ -111,3 +111,19 @@ config.toml
 /INVARIANTS.md
 /TEST-AUDIT-*.md
 /THIRD-PARTY-NOTICES.md
+
+# Local verification evidence, extracted issue documents and scratch scripts
+/.p/
+/zc-verify/
+/tmp_*.py
+/docs/verification/
+/AUDIT-USAGE-*.md
+/FIXES-*.md
+/BUGS.md
+/COMPARISON-*.md
+/FEATURE-*.md
+/FRONTEND-AUDIT-*.md
+/SECURITY-AUDIT-*.md
+/TEST-SUITE-VERIFICATION-*.md
+/agenthub-architecture.png
+/agenthub-architecture.svg

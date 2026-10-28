@@ -11,19 +11,38 @@ fs.writeFileSync(path.join(DATA, 'providers.json'), JSON.stringify({ list: [], m
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 let server, failures = 0;
 async function api(route, method = 'GET', body) {
-  const r = await fetch(BASE + route, { method, headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(35000) });
-  assert(r.ok, `${method} ${route}: ${r.status}`); return r.json();
+  try {
+    // 浏览器冷启动由后端给出最长 60 秒预算，调用者不能先在 35 秒截断。
+    const timeout = route === '/api/browser/open' ? 90000 : route === '/api/health' ? 2000 : 35000;
+    const r = await fetch(BASE + route, { method, headers: { 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(timeout) });
+    const data = await r.json(); assert(r.ok, `${method} ${route}: ${r.status} ${JSON.stringify(data).slice(0, 600)}`); return data;
+  } catch (e) { throw Error(`${method} ${route}: ${e.message}`); }
 }
 const browser = (route, body = {}) => api('/api/browser/' + route, 'POST', body);
 async function ev(expression) { const r = await browser('evaluate', { expression }); assert(r.ok, r.error); return r.value; }
-async function waitFor(fn) { for (let i = 0; i < 160; i++) { try { if (await fn()) return; } catch {} await sleep(150); } throw Error('Startup timeout'); }
+async function waitFor(fn) { const deadline = Date.now() + 60000; let error; while (Date.now() < deadline) { try { if (await fn()) return; } catch (e) { error = e; } await sleep(150); } throw Error('Startup timeout: ' + (error?.message || String(fn))); }
 async function check(name, fn) { try { await fn(); console.log('  PASS ' + name); } catch (e) { failures++; console.error('  FAIL ' + name + ': ' + e.message); } }
+let taskSequence = 0;
+async function uiTask(action) {
+  // Agent discovery can outlive one CDP evaluation on a loaded Windows host.
+  // Each task has its own completion slot so a late result cannot settle a
+  // different action after an earlier timeout.
+  const key = String(++taskSequence);
+  await ev(`(()=>{window.__settingsUiTasks||={};window.__settingsUiTasks[${JSON.stringify(key)}]={done:false};(async()=>{${action}})().then(value=>{window.__settingsUiTasks[${JSON.stringify(key)}]={done:true,value};},error=>{window.__settingsUiTasks[${JSON.stringify(key)}]={done:true,error:String(error?.stack||error)};});return true;})()`);
+  const end = Date.now() + 60000;
+  while (Date.now() < end) {
+    const task = await ev(`window.__settingsUiTasks[${JSON.stringify(key)}]`);
+    if (task.done) { await ev(`delete window.__settingsUiTasks[${JSON.stringify(key)}];true`); assert(!task.error, task.error); return task.value; }
+    await sleep(150);
+  }
+  throw Error('asynchronous settings action timed out');
+}
 async function delay(route, method, action) {
-  return ev(`(async()=>{const original=window.fetch;window.fetch=async(...args)=>{const response=await original(...args);if(String(args[0]).startsWith(${JSON.stringify(route)})&&(args[1]?.method||'GET')===${JSON.stringify(method)})await new Promise(r=>setTimeout(r,350));return response;};try{${action}}finally{window.fetch=original;}})()`);
+  return uiTask(`const original=window.fetch;window.fetch=async(...args)=>{const response=await original(...args);if(String(args[0]).startsWith(${JSON.stringify(route)})&&(args[1]?.method||'GET')===${JSON.stringify(method)})await new Promise(r=>setTimeout(r,350));return response;};try{${action}}finally{window.fetch=original;}`);
 }
 async function fixtures() {
   await api('/api/settings', 'PUT', { customAgents: ['first','second'].map(id => ({ id: 'c_' + id, name: id, bin: process.execPath, args: '--version', color: '#59687a' })) });
-  await ev('(async()=>{await refreshData();await showSettings();})()');
+  await uiTask('await refreshData();await showSettings();');
 }
 (async()=>{
   try {
@@ -55,7 +74,7 @@ async function fixtures() {
       await fixtures();
       const initial = await api('/api/settings');
       await api('/api/settings','PUT',{sound:initial.sound===false});
-      await ev('document.getElementById("setSave").onclick()');
+      await uiTask('await document.getElementById("setSave").onclick();');
       assert.equal((await api('/api/settings')).sound, initial.sound===false);
     });
     await check('failed workflow preference resets the displayed value', async()=>{
@@ -74,7 +93,16 @@ async function fixtures() {
       assert.equal(await ev(`lastUsageMsg({messages:[{usage:{context:100}},{usage:{context:0}}]}).usage.context`),0);
     });
     await check('ask queue mode waits, supports cancel and honors priority', async()=>{
-      const value = await ev(`(async()=>{closeDlg();await openSession(${JSON.stringify(session.id)});S.settings.workflowDefaults={queueMode:'ask',notify:'none'};S.queue={};S.queue[S.curSessionId]=[{text:'existing',qid:'fixture-existing'}];S.running.add(S.curSessionId);setSendBtn(true);const input=document.getElementById('inpText');input.value='priority fixture';await sendCurrent();const waiting=!document.getElementById('flyMenu').classList.contains('hidden')&&S.queue[S.curSessionId].length===1&&input.value==='priority fixture';[...document.querySelectorAll('#flyMenu .fly-item')].find(e=>e.textContent.includes('取消')).click();const retained=input.value;await sendCurrent();[...document.querySelectorAll('#flyMenu .fly-item')].find(e=>e.textContent.includes('队首')).click();await new Promise(r=>setTimeout(r,100));const first=S.queue[S.curSessionId][0].text;S.running.delete(S.curSessionId);setSendBtn(false);S.queue={};saveQueue();renderQueueTray(S.curSessionId);return {waiting,retained,first};})()`);
+      const value = await uiTask(`
+        closeDlg();await openSession(${JSON.stringify(session.id)});const sid=S.curSessionId,route='/api/sessions/'+sid+'/queue',prior=S.settings.workflowDefaults;
+        S.settings.workflowDefaults={queueMode:'ask',notify:'none'};await api(route,{method:'PATCH',body:{action:'pause'}});
+        acceptServerQueue(sid,await api(route,{method:'POST',body:{text:'existing',qid:'fixture-existing'}}));S.running.add(sid);setSendBtn(true);
+        try {const input=document.getElementById('inpText');input.value='priority fixture';await sendCurrent();const waiting=!document.getElementById('flyMenu').classList.contains('hidden')&&S.queue[sid].length===1&&input.value==='priority fixture';
+          [...document.querySelectorAll('#flyMenu .fly-item')].find(e=>e.textContent.includes('取消')).click();const retained=input.value;await sendCurrent();[...document.querySelectorAll('#flyMenu .fly-item')].find(e=>e.textContent.includes('队首')).click();
+          const end=Date.now()+5000;while(S.queueSubmitting?.has(sid)&&Date.now()<end)await new Promise(r=>setTimeout(r,50));
+          const first=(await api(route)).items[0].text;return {waiting,retained,first};
+        }finally {let q=await api(route);while(q.items.length)q=await api(route,{method:'PATCH',body:{action:'remove',qid:q.items[0].qid,expectedRevision:q.revision}});acceptServerQueue(sid,q);S.running.delete(sid);setSendBtn(false);S.settings.workflowDefaults=prior;}
+      `);
       assert.deepEqual(value,{waiting:true,retained:'priority fixture',first:'priority fixture'});
     });
     await check('switching sessions during send never sends to the new session', async()=>{
@@ -84,9 +112,14 @@ async function fixtures() {
     });
     await check('concurrent MCP toggles preserve both changes', async()=>{
       await api('/api/settings','PUT',{mcpTools:true,mcpDisabledTools:[]});
-      await ev('(async()=>{await refreshData();await showSettings("settings-preferences");await refreshMcpToolGrid();})()');
+      await uiTask('await refreshData();await showSettings("settings-preferences");await refreshMcpToolGrid();');
       const names=await delay('/api/settings','PUT',`const inputs=[...document.querySelectorAll('[data-mcp-tool]')].slice(0,2);if(inputs.length!==2)throw Error('MCP fixture missing');for(const input of inputs){input.checked=false;input.dispatchEvent(new Event('change',{bubbles:true}));}await settingsWriteQueue;return inputs.map(i=>i.dataset.mcpTool);`);
       assert.deepEqual((await api('/api/settings')).mcpDisabledTools.slice().sort(),names.sort());
+    });
+    await check('unreadable MCP configuration is shown as an error rather than an empty setup', async()=>{
+      await uiTask('await showSettings("settings-mcp-servers");');
+      const state = await uiTask(`const original=window.fetch;window.fetch=(...args)=>String(args[0]).startsWith('/api/mcp/servers')?Promise.resolve(new Response(JSON.stringify({servers:[],loadError:'fixture <script> corrupted credentials'}),{headers:{'content-type':'application/json'}})):original(...args);try{await refreshMcpServers();const list=document.getElementById('mcpServerList');return {alert:!!list.querySelector('[role=alert]'),empty:list.textContent.includes('还没有第三方 MCP'),escaped:list.querySelectorAll('script').length,text:list.textContent};}finally{window.fetch=original;}`);
+      assert.equal(state.alert, true); assert.equal(state.empty, false); assert.equal(state.escaped, 0); assert.match(state.text, /原文件已保留/);
     });
     await check('SSH form shows the chosen authentication fields and preserves input', async()=>{
       const modes=await ev(`(async()=>{await showSSH();const select=document.getElementById('shAuth');document.getElementById('shPass').value='fixture-password';const visible=()=>[...document.querySelectorAll('[data-ssh-auth]')].filter(e=>!e.classList.contains('hidden')).map(e=>e.dataset.sshAuth);const values={password:visible()};for(const mode of ['key','agent','password']){select.value=mode;select.dispatchEvent(new Event('change'));values[mode]=visible();}values.retained=document.getElementById('shPass').value;return values;})()`);

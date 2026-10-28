@@ -8,6 +8,8 @@ const path = require('node:path');
 const { execFileSync, spawn } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..');
+const UI_ZOOM = Number(process.env.AH_UI_ZOOM || 1);
+assert(UI_ZOOM >= .75 && UI_ZOOM <= 1.5, 'AH_UI_ZOOM must be between 0.75 and 1.5');
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-surface-ui-'));
 const WORK = path.join(DATA, 'workspace-with-an-extremely-long-project-name');
 const BASE = 'http://127.0.0.1:18957';
@@ -93,10 +95,11 @@ fs.writeFileSync(path.join(DATA, 'scheduled.json'), JSON.stringify({ tasks: [{ i
 async function api(route, method = 'GET', body) {
   const response = await fetch(BASE + route, {
     method, headers: { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(45000),
+    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(route === '/api/browser/open' ? 90000 : 45000),
   });
-  assert(response.ok, `${method} ${route}: ${response.status}`);
-  return response.json();
+  const data = await response.json();
+  assert(response.ok, `${method} ${route}: ${response.status} ${JSON.stringify(data).slice(0, 1200)}`);
+  return data;
 }
 const browser = (route, body = {}) => api('/api/browser/' + route, 'POST', body);
 async function evaluate(expression) {
@@ -114,7 +117,7 @@ function frameEval(source) {
 }
 async function resetSurface(width, height, theme) {
   await evaluate(`(()=>{const f=document.getElementById('surfaceFixture');f.style.width='${width}px';f.style.height='${height}px';return true})()`);
-  await frameEval(`(()=>{closeDlg();closePalette();closeFlyMenu();closeCtxPanel();closePage();closeReviewPanel();hideTermPanel();document.getElementById('confirmCancel')?.click();document.querySelectorAll('.toast').forEach(x=>x.remove());applyTheme(${JSON.stringify(theme)});toggleSidebar(false);return true})()`);
+  await frameEval(`(()=>{closeDlg();closePalette();closeFlyMenu();closeCtxPanel();closePage();closeReviewPanel();hideTermPanel();document.getElementById('confirmCancel')?.click();document.querySelectorAll('.toast').forEach(x=>x.remove());applyTheme(${JSON.stringify(theme)});storageSet('ah.zoom',${UI_ZOOM});applyZoom();toggleSidebar(false);return true})()`);
   await sleep(80);
 }
 async function inspect(kind) {
@@ -165,6 +168,29 @@ function assertSurface(name, state) {
     await evaluate(`(async()=>{const f=document.createElement('iframe');f.id='surfaceFixture';f.style.cssText='position:fixed;left:0;top:0;z-index:10000;border:0;width:390px;height:844px';f.src=location.origin;document.body.append(f);await new Promise(resolve=>f.onload=resolve);return true})()`);
     await waitFor(() => frameEval('typeof S!=="undefined"&&S.wsReady&&S.agents.length>0'), 'surface fixture startup');
     await frameEval(`(()=>{window.__surfaceErrors=[];window.addEventListener('error',e=>window.__surfaceErrors.push(e.message||'error'));window.addEventListener('unhandledrejection',e=>window.__surfaceErrors.push(String(e.reason&&e.reason.message||e.reason||'rejection')));return true})()`);
+    // 弹窗有入场动画：固定等 240ms 时，繁忙机器上可能正好在动画中途测量，拿到带
+    // 小数的 left/right（例如 386.47），把「正在滑入」误判成「越界」。改成等矩形
+    // 连续两次采样一致（动画结束）再断言。
+    await frameEval(`(()=>{window.settleSurface=async()=>{
+      const rootOf=()=>document.getElementById('dlg')||document.getElementById('confirmBox')||document.querySelector('#palette .pal-box')||document.getElementById('flyMenu')||document.getElementById('ctxPanel');
+      // 弹窗常先渲染「加载中…」再异步补内容，抽屉的入场动画会在补内容时重放：
+      // 只等「矩形稳定」会过早返回，随后动画重放又量到越界。先给异步加载一点时间，
+      // 再要求「没有正在运行的动画」且矩形与上一次采样一致。
+      await new Promise(r=>setTimeout(r,250));
+      let prev='';
+      const deadline=Date.now()+8000;
+      while(Date.now()<deadline){
+        await new Promise(r=>setTimeout(r,100));
+        const el=rootOf();
+        if(!el)return false;
+        const running=(el.getAnimations?el.getAnimations():[]).some(a=>a.playState==='running');
+        const rect=el.getBoundingClientRect();
+        const sig=[rect.left,rect.top,rect.width,rect.height].map(v=>Math.round(v)).join(',');
+        if(!running&&sig===prev)return true;
+        prev=sig;
+      }
+      return false;
+    };return true})()`);
 
     const dialogSurfaces = [
       ['theme', 'openThemeMenu()'], ['archives', 'await showArchivedSessions()'], ['quota-center', 'await showQuotaCenter()'],
@@ -182,12 +208,49 @@ function assertSurface(name, state) {
     for (const [width, height, theme] of [[1440, 900, 'paper'], [390, 844, 'ink'], [740, 390, 'ocean']]) {
       for (const [name, action] of dialogSurfaces) {
         await resetSurface(width, height, theme);
-        await frameEval(`(async()=>{await openSession(${JSON.stringify(SID)});${action};await new Promise(r=>setTimeout(r,240));return true})()`);
+        await frameEval(`(async()=>{await openSession(${JSON.stringify(SID)});${action};await window.settleSurface();return true})()`);
         assertSurface(`${width}x${height} ${name}`, await inspect('dialog'));
         checked++;
       }
     }
     console.log(`  ✓ ${checked} dialog combinations across desktop, mobile and landscape`);
+
+    for (const [width, height] of [[320, 640], [740, 390], [1440, 900]]) {
+      await resetSurface(width, height, 'paper');
+      await frameEval(`(async()=>{await showSettings('settings-preferences');await window.settleSurface();return true})()`);
+      const settings = await frameEval(`(()=>{
+        const select=document.getElementById('settingsSection'),content=document.querySelector('.settings-content'),dialog=document.getElementById('dlg');
+        const compact=getComputedStyle(select.parentElement).display!=='none';
+        const start=select.value;const states=[];
+        const zoom=document.getElementById('setZoom');zoom.value='0.9';
+        for(const option of select.options){select.value=option.value;select.dispatchEvent(new Event('change',{bubbles:true}));const pane=document.getElementById(option.value+'-panel');states.push(!pane.hidden&&document.querySelectorAll('.settings-pane:not([hidden])').length===1&&document.querySelector('.settings-quicknav .active').dataset.settingsJump===option.value&&storageGet('ah.settingsSection')===option.value);}
+        select.value=start;select.dispatchEvent(new Event('change',{bubbles:true}));
+        return {compact,start,count:select.options.length,states,draft:zoom.value,contentRatio:content.getBoundingClientRect().height/dialog.getBoundingClientRect().height};
+      })()`);
+      assert.equal(settings.compact, width <= 740);
+      assert.equal(settings.start, 'settings-preferences');
+      assert.equal(settings.count, 11);
+      assert(settings.states.every(Boolean), 'all setting sections remain reachable');
+      assert.equal(settings.draft, '0.9', 'switching setting sections must retain unsaved fields');
+      assert(settings.contentRatio >= .2, `${width}x${height}: navigation leaves too little room for settings ${JSON.stringify(settings)}`);
+      assertSurface(`${width}x${height} compact settings navigation`, await inspect('dialog'));
+      checked++;
+    }
+    console.log('  ✓ all 11 settings sections, retained drafts and usable content height');
+
+    for (const [width, height] of [[320, 640], [390, 844], [1440, 900]]) {
+      await resetSurface(width, height, 'ink');
+      await frameEval(`(async()=>{await showStats();await window.settleSurface();return true})()`);
+      const stats = await frameEval(`(()=>{const body=document.getElementById('dlgBody');return {fits:body.scrollWidth<=body.clientWidth+1,values:[...body.querySelectorAll('.stats-overview-cards .sc-value')].every(e=>e.scrollWidth<=e.clientWidth+1)}})()`);
+      assert.deepEqual(stats, { fits: true, values: true }, `${width}: statistics must display complete values without panel overflow`);
+      await resetSurface(width, height, 'paper');
+      await frameEval(`(async()=>{S.wsl={available:true,distros:['Ubuntu-22.04','docker-desktop']};await showSSH();await window.settleSurface();return true})()`);
+      const ssh = await frameEval(`(()=>{const title=document.querySelector('.ssh-local-copy strong'),heading=document.querySelector('.ssh-local-heading').getBoundingClientRect(),actions=document.querySelector('.ssh-local-actions').getBoundingClientRect();return {label:title.textContent,readable:title.scrollWidth<=title.clientWidth+1,buttons:[...document.querySelectorAll('.ssh-local-actions button')].every(e=>e.scrollWidth<=e.clientWidth+1),separate:heading.right<=actions.left+1||heading.bottom<=actions.top+1}})()`);
+      assert.deepEqual(ssh, { label: '本机 WSL', readable: true, buttons: true, separate: true });
+      assertSurface(`${width}x${height} WSL card`, await inspect('dialog'));
+      checked += 2;
+    }
+    console.log('  ✓ complete statistics values and readable local WSL cards');
 
     const floating = [
       ['confirm', 'confirm', `uiAsk({title:'确认一个很长的操作标题',message:'${'确认信息需要在窄屏完整换行。'.repeat(12)}',input:true,value:'fixture'});`],
@@ -198,7 +261,7 @@ function assertSurface(name, state) {
     for (const [width, height, theme] of [[320, 640, 'paper'], [390, 844, 'ink'], [1440, 900, 'paper']]) {
       for (const [name, kind, action] of floating) {
         await resetSurface(width, height, theme);
-        await frameEval(`(async()=>{await openSession(${JSON.stringify(SID)});${action};await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));return true})()`);
+        await frameEval(`(async()=>{await openSession(${JSON.stringify(SID)});${action};await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));await window.settleSurface();return true})()`);
         assertSurface(`${width}x${height} ${name}`, await inspect(kind));
         checked++;
       }
@@ -210,7 +273,8 @@ function assertSurface(name, state) {
       await frameEval(`(async()=>{
         await openSession(${JSON.stringify(SID)});
         document.querySelector('.turn-summary')?.click();
-        const s=curSession();S.queue[s.id]=[{text:'${'超长队列消息'.repeat(20)}',mode:'insert',images:[{url:${JSON.stringify(tinyPng)},path:'fixture.png'}]},{text:'第二条消息',mode:'now'}];renderQueueTray(s.id);
+        const s=curSession(),qr='/api/sessions/'+s.id+'/queue';await api(qr,{method:'PATCH',body:{action:'pause'}});
+        await api(qr,{method:'POST',body:{qid:'surface-first',text:'${'超长队列消息'.repeat(20)}',images:[{url:${JSON.stringify(tinyPng)},path:'fixture.png'}]}});acceptServerQueue(s.id,await api(qr,{method:'POST',body:{qid:'surface-second',text:'第二条消息'}}));
         S.attachments=[{url:${JSON.stringify(tinyPng)},path:'fixture.png'}];renderAttachments();
         const stream=ensureStreamingEl(),st=makeLiveStreamState(s.id,stream);st.extra.append(bridgePermCardHtml({pid:'fixture-q',question:true,title:'Agent 提问',questions:[{header:'范围',question:'${'请选择需要检查的全部界面'.repeat(4)}',multiSelect:true,options:[{label:'全部桌面界面',description:'包含弹窗、菜单和抽屉'},{label:'全部移动界面',description:'包含窄屏与横屏'}]}]},s.id));
         st.extra.append(bridgePermCardHtml({pid:'fixture-p',title:'需要确认工具操作',reason:'${'权限原因很长，需要安全换行。'.repeat(8)}',input:{command:'${'node --check very-long-file-name '.repeat(10)}'}},s.id));
@@ -220,6 +284,7 @@ function assertSurface(name, state) {
       const state = await inspect('workspace');
       assertSurface(`${width}x${height} rich workspace`, state);
       assert.equal(await frameEval(`document.querySelectorAll('.perm-card').length===2&&document.querySelectorAll('.queue-row').length===2&&document.querySelectorAll('.msg').length>=3`), true, `${width}: rich states rendered`);
+      assert.equal(await frameEval(`(()=>{const buttons=[...document.querySelectorAll('.msg-user .msg-foot .copy-btn')];return buttons.length>0&&buttons.every(b=>getComputedStyle(b).whiteSpace==='nowrap'&&b.scrollWidth<=b.clientWidth+1)})()`), true, `${width}: message actions retain readable labels`);
       checked++;
     }
     console.log('  ✓ rich messages, process steps, permission cards, queue, attachment, streaming and toast states');

@@ -25,11 +25,31 @@ try {
 
   const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
   ok(/process\.on\('exit',\s*flushStoresOnExit\)/.test(src), "server.js 注册了 exit 刷盘");
-  ok(/for \(const sig of \[[^\]]*'SIGINT'[^\]]*\][\s\S]{0,120}flushStoresOnExit\(\)/.test(src), 'server.js 在 SIGINT/TERM/HUP 前刷盘');
+  // Allow the bounded browser cleanup wrapper; audit-concurrency also verifies
+  // a real server exit preserves its last write and terminates the browser.
+  ok(/for \(const sig of \[[^\]]*'SIGINT'[^\]]*\][\s\S]{0,800}flushStoresOnExit\(\)/.test(src), 'server.js 在 SIGINT/TERM/HUP 前刷盘');
 
   // saveNow 必须把成败告诉调用方：删会话要靠它决定「能不能再去删正文文件」，
   // 吞掉异常就会留下「索引说还在、磁盘上正文已经没了」的空壳会话。
   ok(store.saveNow() === true, '写盘成功时 saveNow 返回 true');
+
+  // Windows 竞态：目标文件正被异步读取时 rename 会 EPERM（实测 20/20）。真实场景是
+  // /api/backup 一边异步读数据文件、一边有 store 防抖落盘触发——以前这次改动会静默
+  // 丢掉，还会让随后的 flushAllStores 失败（备份 500）。现在必须仍然落盘。
+  const racy = new Store('racy', { items: [] });
+  racy.saveNow();
+  const racyFile = path.join(dir, 'racy.json');
+  let persistedDuringRead = 0;
+  for (let i = 0; i < 8; i++) {
+    racy.data.items.push({ i });
+    const reading = fs.promises.readFile(racyFile); // 读取在飞
+    const wrote = racy.saveNow();
+    reading.catch(() => {});
+    if (wrote && fs.readFileSync(racyFile, 'utf8').includes('"i": ' + i)) persistedDuringRead++;
+  }
+  ok(persistedDuringRead === 8, '并发读取期间 saveNow 仍能落盘（Windows rename 占用退化）', persistedDuringRead);
+  ok(flushAllStores() === true, '并发读取后 flushAllStores 仍然成功（备份不会莫名 500）');
+
   fs.writeFileSync(path.join(dir, 'blocker'), '这是一个文件，不是目录');
   const stuck = new Store('blocker/stuck', { x: 1 });
   ok(stuck.saveNow() === false, '写不进去时 saveNow 返回 false 而不是静默');

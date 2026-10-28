@@ -77,15 +77,22 @@ async function main() {
     server = spawn(process.execPath, ['server.js'], {
       cwd: ROOT,
       env: { ...process.env, AGENTHUB_PORT: String(PORT), AGENTHUB_DATA_DIR: DATA, AGENTHUB_IMPORT_DIRS: IMPORT },
-      stdio: 'ignore',
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
+    // 捕获子进程输出：启动失败时只报「server did not start」是没法排查的。必须
+    // 持续排空两条管道，否则写满缓冲区会反过来卡住服务进程。
+    let serverErr = '';
+    server.stdout.on('data', () => {});
+    server.stderr.on('data', chunk => { serverErr = (serverErr + chunk).slice(-4000); });
+    // 60 秒预算：机器同时跑几十个测试时，Node 冷启动 + 读 cc-switch 可能远超 12 秒。
     let healthy = false;
-    for (let i = 0; i < 80; i++) {
+    for (let i = 0; i < 240; i++) {
       try {
         if ((await call('/api/health')).code === 200) { healthy = true; break; }
       } catch {}
-      await sleep(150);
+      await sleep(250);
     }
+    if (!healthy && serverErr.trim()) console.error('[isolated server]\n' + serverErr.trim());
     assert(healthy, 'server did not start');
 
     const imported = await call('/api/import', 'POST', { path: fixture, agent: 'claude' });

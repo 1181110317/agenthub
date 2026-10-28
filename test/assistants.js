@@ -187,7 +187,8 @@ async function check(name, fn) {
       assert.deepEqual(lib.claudeSystemArgs('你是审查者', { streamInput: false }), [], '老版本 CLI 不应传该旗标');
       const src = fs.readFileSync(path.join(ROOT, 'lib', 'claude-bridge.js'), 'utf8');
       assert(/claudeSystemArgs\(o\.systemPrompt/.test(src), 'claude-bridge 必须在参数里使用助手提示词');
-      assert(/o\.systemPrompt \? String\(o\.systemPrompt\)/.test(src), 'systemPrompt 必须进 spawnSig（换助手要重启进程）');
+      // spawnSig 里 systemPrompt 可以是截断也可以是哈希（哈希更强：同前缀的不同提示词也能触发重建）
+      assert(/o\.systemPrompt \? (String\(o\.systemPrompt\)|crypto\.createHash\('sha1'\)\.update\(String\(o\.systemPrompt\)\))/.test(src), 'systemPrompt 必须进 spawnSig（换助手要重启进程）');
     });
 
     await check('不支持系统提示词的 Agent 不假装生效（参数里不带）', async () => {

@@ -15,13 +15,17 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const server = spawn(process.execPath, ['server.js'], {
   cwd: ROOT,
   env: { ...process.env, AGENTHUB_PORT: String(PORT), AGENTHUB_DATA_DIR: DATA },
-  stdio: 'ignore',
+  stdio: ['ignore', 'pipe', 'pipe'],
 });
+// 启动失败时只报「服务没起来」是没法排查的；持续排空管道避免写满缓冲区卡住子进程。
+let serverErr = '';
+server.stdout.on('data', () => {});
+server.stderr.on('data', chunk => { serverErr = (serverErr + chunk).slice(-4000); });
 
 async function api(route, method = 'GET', body) {
   const r = await fetch(BASE + route, {
     method, headers: { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(30000),
+    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(route === '/api/browser/open' ? 90000 : 30000),
   });
   return { code: r.status, data: await r.json().catch(() => null) };
 }
@@ -41,10 +45,12 @@ async function check(name, fn) {
   const made = [];
   try {
     let healthy = false;
-    for (let i = 0; i < 80; i++) {
+    // 60 秒预算：满载机器上 Node 冷启动 + 读 cc-switch 可能远超 20 秒。
+    for (let i = 0; i < 240; i++) {
       try { healthy = (await api('/api/health')).code === 200; if (healthy) break; } catch {}
       await sleep(250);
     }
+    if (!healthy && serverErr.trim()) console.error('[isolated server]\n' + serverErr.trim());
     assert(healthy, 'server did not start');
     for (let i = 0; i < 4; i++) {
       const r = await api('/api/sessions', 'POST', { agent: 'builtin', title: '列表夹具 ' + (i + 1) });
@@ -110,7 +116,7 @@ async function check(name, fn) {
     const status = await (await fetch(BASE + '/api/browser/status')).json();
     if (!status.browser) { console.log('[list-details] browser unavailable, skipped UI checks'); return; }
     await browser('open', { url: BASE + '/' });
-    await ev(`(async()=>{ for(let i=0;i<200 && !(window.S && S.settings);i++) await new Promise(r=>setTimeout(r,80)); return true; })()`);
+    await ev(`(async()=>{ for(let i=0;i<200 && !(typeof S !== 'undefined' && S.settings);i++) await new Promise(r=>setTimeout(r,80)); return true; })()`);
     await ev(`(async()=>{ await refreshData(); await openSession(${JSON.stringify(made[3])}); return true; })()`);
 
     await check('未读会话显示圆点，打开后清除', async () => {

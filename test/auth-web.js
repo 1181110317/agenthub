@@ -63,10 +63,6 @@ async function check(name, fn) {
 (async () => {
   try {
     let healthy = false;
-    for (let i = 0; i < 80; i++) {
-      try { healthy = (await api(BASE)).code !== 502 || true; if (healthy) break; } catch {}
-      await sleep(250);
-    }
     // 启动探活
     for (let i = 0; i < 80; i++) {
       try { const r = await anon('/api/health'); if (r.code === 200) { healthy = true; break; } } catch {}

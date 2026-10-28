@@ -13,7 +13,7 @@ let server;
 async function api(route, method = 'GET', body) {
   const r = await fetch(BASE + route, {
     method, headers: { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(30000),
+    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(route === '/api/browser/open' ? 90000 : 30000),
   });
   const data = await r.json();
   assert(r.ok, `${method} ${route}: ${r.status}`);

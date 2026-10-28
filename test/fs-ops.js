@@ -6,7 +6,7 @@
 //   4) 删除是移入回收站而不是真删（可人工找回）；
 //   5) 并发保存保护：磁盘 mtime 变了要 409，而不是静默覆盖别人的修改。
 const assert = require('assert');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -18,6 +18,10 @@ const OUTSIDE = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-fsops-out-'));
 const PORT = 18973;
 const BASE = `http://127.0.0.1:${PORT}`;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const LAUNCH_LOG = path.join(DATA, 'launches.jsonl');
+const EDITOR_BIN = path.join(DATA, 'editor', 'bin');
+fs.mkdirSync(EDITOR_BIN, { recursive: true });
+fs.writeFileSync(path.join(DATA, 'editor', 'Code.exe'), 'fixture intercepted before launch');
 
 fs.mkdirSync(path.join(PROJECT, 'src', 'nested'), { recursive: true });
 fs.mkdirSync(path.join(PROJECT, '.git'), { recursive: true });
@@ -26,9 +30,9 @@ fs.writeFileSync(path.join(PROJECT, 'src', 'a.js'), 'console.log(1);\n');
 fs.writeFileSync(path.join(PROJECT, '.git', 'config'), '[core]\n');
 fs.writeFileSync(path.join(OUTSIDE, 'secret.txt'), 'outside\n');
 
-const server = spawn(process.execPath, ['server.js'], {
+const server = spawn(process.execPath, ['--require', path.join(__dirname, 'fixtures', 'system-open.cjs'), 'server.js'], {
   cwd: ROOT,
-  env: { ...process.env, AGENTHUB_PORT: String(PORT), AGENTHUB_DATA_DIR: DATA },
+  env: { ...process.env, AGENTHUB_PORT: String(PORT), AGENTHUB_DATA_DIR: DATA, AH_LAUNCH_LOG: LAUNCH_LOG, PATH: EDITOR_BIN + path.delimiter + process.env.PATH },
   stdio: 'ignore',
 });
 
@@ -210,6 +214,43 @@ async function check(name, fn) {
     });
 
     // ---------- 既有接口不能被影响 ----------
+    await check('系统打开的正常分支原样传路径，启动失败如实返回（不打开真实窗口）', async () => {
+      const directory = path.join(PROJECT, "literal & [name] %PATH% 'quote'");
+      const file = path.join(directory, 'file.txt');
+      fs.mkdirSync(directory); fs.writeFileSync(file, 'launcher fixture');
+      for (const mode of ['system','terminal','vscode','reveal']) {
+        const route = mode === 'reveal' ? '/api/fs/reveal' : '/api/fs/open';
+        const response = await api(route,'POST',{sessionId:session.id,path:file,with:mode});
+        assert.equal(response.code,200,JSON.stringify(response.data));
+        const call = fs.readFileSync(LAUNCH_LOG,'utf8').trim().split('\n').map(JSON.parse).at(-1);
+        assert(!call.options.shell,'path must never pass through a shell option');
+        if (process.platform === 'win32' && (mode === 'system' || mode === 'terminal')) {
+          const expected = "'" + (mode === 'terminal' ? directory : file).replace(/'/g,"''") + "'";
+          assert(call.script.includes(expected),'PowerShell must receive the complete literal path');
+          assert(!/cd \/d|cmd\.exe.*\/c/.test(call.script),'path cannot become command source');
+          // Exercise the real Windows parser while shadowing the launcher. The
+          // function only returns its bound arguments; it cannot open a window.
+          const parse = 'function Start-Process { param([string]$FilePath,[string]$WorkingDirectory,[string[]]$ArgumentList); @{FilePath=$FilePath;WorkingDirectory=$WorkingDirectory;ArgumentList=$ArgumentList}|ConvertTo-Json -Compress }; ' + call.script;
+          const values = JSON.parse(execFileSync('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(parse,'utf16le').toString('base64')],{windowsHide:true,encoding:'utf8',timeout:20000}));
+          if (mode === 'system') assert.equal(values.FilePath,file);
+          else { assert.equal(values.WorkingDirectory,directory);assert.deepEqual(values.ArgumentList,['/K']); }
+          if (mode === 'system') {
+            const readableError = "未关联应用：& %PATH% 'quote'";
+            const failingScript = "function Start-Process { throw '" + readableError.replace(/'/g,"''") + "' }; " + call.script;
+            let parsedError;
+            try { execFileSync('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(failingScript,'utf16le').toString('base64')],{windowsHide:true,encoding:'utf8',timeout:20000,stdio:['ignore','pipe','pipe']}); }
+            catch (error) { parsedError = error; }
+            assert.equal(parsedError?.status,1,'PowerShell must propagate the failed launch');
+            assert.equal(String(parsedError.stderr).trim(),readableError,'UI receives readable UTF-8 text instead of CLIXML');
+          }
+        } else assert(call.args.some(arg => String(arg).includes(mode === 'terminal' || (mode === 'reveal' && process.platform === 'linux') ? directory : file)),'argument must retain the literal path');
+        const failedDirectory = path.join(PROJECT,'fail-launch-dir');fs.mkdirSync(failedDirectory,{recursive:true});
+        const failedFile = path.join(failedDirectory,'file.txt');fs.writeFileSync(failedFile,'fixture');
+        const failure = await api(route,'POST',{sessionId:session.id,path:failedFile,with:mode});
+        assert.equal(failure.code,400,JSON.stringify(failure.data));assert.match(failure.data.error,/fixture launcher unavailable/);
+      }
+      assert.equal((await api('/api/health')).code,200,'launcher error must not crash the server');
+    });
     await check('原有 /api/fs/raw 预览仍然工作', async () => {
       const r = await fetch(`${BASE}/api/fs/raw?path=${encodeURIComponent(path.join(PROJECT, 'README.md'))}`);
       assert.equal(r.status, 200);

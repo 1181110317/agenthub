@@ -10,13 +10,13 @@ const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-mcp-all-data-'));
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-mcp-all-work-'));
 const PORT = 17997;
 const BASE = `http://127.0.0.1:${PORT}`;
-let server, mcp;
+let server, mcp, testSessionId;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function startMcp() {
+function startMcp(sessionId = 'mcp-all-probe') {
   const child = spawn(process.execPath, ['lib/mcp-server.js'], {
     cwd: ROOT,
-    env: { ...process.env, AGENTHUB_BASE_URL: BASE, AGENTHUB_SESSION_ID: 'mcp-all-probe' },
+    env: { ...process.env, AGENTHUB_BASE_URL: BASE, AGENTHUB_SESSION_ID: sessionId },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const pending = new Map();
@@ -78,7 +78,7 @@ async function call(name, args = {}) {
     assert.equal(init.result.serverInfo.name, 'agenthub');
     const listed = await mcp.send('tools/list');
     const names = listed.result.tools.map(x => x.name);
-    assert.equal(names.length, 15);
+    assert.deepEqual(names.sort(), require('../lib/mcp-tools').TOOL_NAMES.slice().sort());
 
     assert.equal((await call('agenthub_status')).sessionId, 'mcp-all-probe');
     assert.equal((await call('git_status', { cwd: WORK })).dirty, true);
@@ -98,6 +98,9 @@ async function call(name, args = {}) {
     assert.match(created.note, /启用/);
     const tasks = await call('scheduled_tasks');
     assert(tasks.some(t => t.id === created.created.id && t.enabled === false));
+    testSessionId = probeSession.id;
+    mcp.child.stdin.end(); await new Promise(r => mcp.child.once('exit',r)); mcp = startMcp(probeSession.id);
+    await mcp.send('initialize', { protocolVersion: '2024-11-05' });
 
     const opened = await call('browser_open', { url: BASE + '/' });
     assert.match(opened.page.title, /AgentHub/);
@@ -107,10 +110,16 @@ async function call(name, args = {}) {
     assert.equal((await call('browser_evaluate', { expression: "document.querySelector('#searchBox').value" })).value, 'mcp-all-probe');
     const shot = await call('browser_screenshot');
     assert(shot.path && fs.existsSync(shot.path));
-    console.log('[mcp-all] 15/15 tools passed');
+    const artifact = await call('html_render', { title: 'MCP artifact', html: '<h1>MCP_ARTIFACT</h1>' }); assert(/^html_[a-f0-9]{24}$/.test(artifact.id));
+    const childTask = await call('delegate_task', { prompt: 'MCP delegated task', role: 'Reviewer', owner: 'MCP audit', start: false }); assert.equal(childTask.status,'waiting');
+    assert.equal((await call('task_status', { taskId: childTask.id })).role,'Reviewer');
+    const mail = await call('task_mail', { to: childTask.sessionId, text: 'MCP_TASK_MAIL' }); assert(mail.id); assert((await call('task_mail')).messages.some(m=>m.id===mail.id));
+    assert.equal((await call('task_cancel', { taskId: childTask.id, expectedRevision: childTask.revision })).status,'cancelled');
+    assert.equal((await call('goal_update', { text: 'MCP acceptance criteria', maxTurns: 2, autoContinue: false, expectedRevision: 0 })).goal.maxTurns,2);
+    console.log('[mcp-all] ' + names.length + '/' + names.length + ' tools passed');
   } finally {
     try { mcp && mcp.child.kill(); } catch {}
-    try { await fetch(BASE + '/api/browser/close', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); } catch {}
+    try { await fetch(BASE + '/api/browser/close', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: testSessionId }) }); } catch {}
     try { server && server.kill(); } catch {}
     await sleep(500);
     fs.rmSync(DATA, { recursive: true, force: true });

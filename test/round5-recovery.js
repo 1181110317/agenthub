@@ -29,7 +29,8 @@ function startServer() {
   server.stderr.on('data', () => {});
 }
 async function waitHealthy() {
-  for (let i = 0; i < 40; i++) {
+  // 60 秒预算：满载机器上冷启动可能远超 20 秒
+  for (let i = 0; i < 120; i++) {
     try { const r = await fetch(`${BASE}/api/health`); if (r.ok) return true; } catch {}
     await new Promise(r => setTimeout(r, 500));
   }

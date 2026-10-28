@@ -20,7 +20,7 @@ const server = spawn(process.execPath, ['server.js'], {
 async function api(route, method = 'GET', body) {
   const r = await fetch(BASE + route, {
     method, headers: { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(20000),
+    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(route === '/api/browser/open' ? 90000 : 20000),
   });
   return { code: r.status, data: await r.json().catch(() => null) };
 }
@@ -61,7 +61,7 @@ const dialogAccept = (value) => ev(`(async()=>{
     const status = await (await fetch(BASE + '/api/browser/status')).json();
     if (!status.browser) { console.log('[assistants-ui] browser unavailable, skipped'); return; }
     await browser('open', { url: BASE + '/' });
-    await ev(`(async()=>{ for(let i=0;i<200 && !(window.S && S.settings);i++) await new Promise(r=>setTimeout(r,80)); return true; })()`);
+    await ev(`(async()=>{ for(let i=0;i<200 && !(typeof S !== 'undefined' && S.settings);i++) await new Promise(r=>setTimeout(r,80)); return true; })()`);
     await ev(`(async()=>{ await openSession(${JSON.stringify(session.id)}); return true; })()`);
 
     await check('助手目录已加载并能打开选择菜单', async () => {

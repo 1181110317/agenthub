@@ -51,7 +51,8 @@ function startServer() {
   server.stderr.on('data', () => {});
 }
 async function waitHealthy() {
-  for (let i = 0; i < 40; i++) {
+  // 60 秒预算：满载机器上冷启动可能远超 20 秒
+  for (let i = 0; i < 120; i++) {
     try { const r = await fetch(`${BASE}/api/health`); if (r.ok) return true; } catch {}
     await new Promise(r => setTimeout(r, 500));
   }
@@ -135,15 +136,21 @@ const get = p => body(p, {});
       ok(imported.code === 200 && imported.data.id, '导入 round6 夹具会话');
       await post('/api/browser/evaluate', { expression: `localStorage.setItem('ah.session', ${JSON.stringify(imported.data.id)}); 'ok'` });
       await post('/api/browser/open', { url: BASE + '/' });
-      await post('/api/browser/evaluate', {
-        expression: `(async () => {
-          for (let i = 0; i < 40; i++) {
-            if (document.querySelectorAll('.msg').length > 0 && document.getElementById('inpText')) break;
-            await new Promise(r => setTimeout(r, 250));
-          }
-          return document.querySelectorAll('.msg').length;
-        })()`,
-      });
+      // 等「当前会话就是夹具会话，且两条提问都已经加载进内存」。必须由 Node 侧轮询：
+      // 单次 /api/browser/evaluate 有 20 秒硬上限（lib/browser-cdp.js），页内长轮询会超时。
+      const readyExpr = `(() => {
+        const s = (typeof curSession === 'function') && curSession();
+        const users = s && (s.messages || []).filter(m => m.role === 'user' && (m.text || '').trim()).length;
+        return { id: s && s.id, users: users || 0, msgs: document.querySelectorAll('.msg').length };
+      })()`;
+      let readyState = null;
+      for (let i = 0; i < 90; i++) {
+        const r = await post('/api/browser/evaluate', { expression: readyExpr });
+        const v = r.data && r.data.value;
+        if (v && v.id === imported.data.id && v.users >= 2) { readyState = v; break; }
+        await new Promise(res => setTimeout(res, 1000));
+      }
+      if (!readyState) console.error('    [debug] 夹具会话未就绪:', JSON.stringify(await post('/api/browser/evaluate', { expression: readyExpr })).slice(0, 200));
 
       // D2. 草稿暂存：Ctrl+S 暂存两条 → 空输入 Ctrl+S 逐条恢复（LIFO）
       const stashR = await post('/api/browser/evaluate', {
@@ -166,7 +173,23 @@ const get = p => body(p, {});
       // D3. ↑/↓ 历史回溯
       const rec = await post('/api/browser/evaluate', {
         expression: `(async () => {
+          // 导入→打开会话→回溯是跨 CDP 的时序敏感路径：偶发页面还没完成 openSession
+          // （curSessionId 为空）就按了 ↑。这里显式确保当前会话就是夹具会话（本测试
+          // 测的是回溯功能本身，不是会话打开时序），重试等它加载出消息。
+          const __target = ${JSON.stringify(imported.data.id)};
+          for (let attempt = 0; attempt < 6; attempt++) {
+            const cs = (typeof curSession === 'function') && curSession();
+            if (cs && cs.id === __target && (cs.messages || []).filter(m => m.role === 'user').length >= 2) break;
+            try { await openSession(__target); } catch {}
+            await new Promise(r => setTimeout(r, 500));
+          }
           const inp = document.getElementById('inpText');
+          // 直接改 value 不触发 input 事件，上一步可能留下的 @/$ 菜单仍是打开态，
+          // 那样 ↑/↓ 会先被菜单消费（产品行为正确），历史回溯就测不到。先收干净。
+          try { closeMentionMenu(); } catch {}
+          try { if (typeof closeSkillMenu === 'function') closeSkillMenu(); } catch {}
+          try { if (typeof closeFlyMenu === 'function') closeFlyMenu(); } catch {}
+          S.recallIdx = -1;
           inp.value = '';
           const key = k => inp.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
           key('ArrowUp');  const up1 = inp.value;
@@ -177,6 +200,7 @@ const get = p => body(p, {});
         })()`,
       });
       const r6 = rec.data && rec.data.value;
+      if (!r6 || r6.up1 !== 'ROUND6 第二问' || r6.up2 !== 'ROUND6 第一问') console.error('    [debug] 历史回溯返回值:', JSON.stringify(r6));
       ok(r6 && r6.up1 === 'ROUND6 第二问' && r6.up2 === 'ROUND6 第一问', 'UI：↑ 从最近一条已发送消息向更早回溯');
       ok(r6 && r6.down1 === 'ROUND6 第二问' && r6.down2 === '', 'UI：↓ 走回最新，再按回到原草稿');
 
@@ -240,10 +264,18 @@ const get = p => body(p, {});
       const cnt0 = (await get('/api/sessions')).data.length;
       await put('/api/settings', { keybindings: { newTask: 'alt+t' } });
       await post('/api/browser/open', { url: BASE + '/' });
+      // 先等页面本身起来（Node 侧轮询，单次 evaluate 有 20s 上限），再开始派发按键：
+      // 满载时"重载后立刻派发"会因为页面还在 boot 而一直拿到 settings-not-ready。
+      for (let i = 0; i < 60; i++) {
+        const r = await post('/api/browser/evaluate', { expression: `(typeof S !== 'undefined' && S.wsReady && !!document.getElementById('inpText'))` });
+        if (r.data && r.data.value === true) break;
+        await new Promise(res => setTimeout(res, 500));
+      }
       let cnt1 = cnt0;
-      for (let i = 0; i < 15; i++) {
+      let lastDispatch = '';
+      for (let i = 0; i < 30; i++) {
         await new Promise(r => setTimeout(r, 600));
-        await post('/api/browser/evaluate', {
+        const d = await post('/api/browser/evaluate', {
           expression: `(() => {
             if (!document.getElementById('inpText')) return 'loading';
             const bound = (typeof S !== 'undefined' && S.settings && S.settings.keybindings) || {};
@@ -252,8 +284,13 @@ const get = p => body(p, {});
             return 'dispatched';
           })()`,
         });
+        lastDispatch = (d.data && d.data.value) || (d.data && d.data.error) || '';
         cnt1 = (await get('/api/sessions')).data.length;
         if (cnt1 > cnt0) break;
+      }
+      if (cnt1 <= cnt0) {
+        const diag = await post('/api/browser/evaluate', { expression: `(() => ({ keybindings: (typeof S!=='undefined'&&S.settings&&S.settings.keybindings)||null, agent: (typeof S!=='undefined'&&S.curAgent)||'', errs: (window.__r6errs||[]) }))()` });
+        console.error('    [debug] 快捷键未生效: lastDispatch=' + lastDispatch, 'diag=', JSON.stringify(diag.data && diag.data.value).slice(0, 300));
       }
       ok(cnt1 > cnt0, 'UI：自定义快捷键 alt+t 真实触发新建任务（' + cnt0 + ' → ' + cnt1 + '）');
       await put('/api/settings', { keybindings: {} });

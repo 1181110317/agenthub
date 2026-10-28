@@ -20,21 +20,25 @@ const ok = (cond, label) => {
 // kill 后等 exit 事件：Windows 上 process.exit 强拆仍在关闭中的子进程句柄
 // 会触发 libuv 断言（win/async.c），必须自然排空
 const kill = child => new Promise(res => {
-  if (!child) return res();
-  child.once('exit', res);
-  child.kill();
-  setTimeout(res, 5000).unref();
+  if (!child || child.exitCode !== null) return res();
+  child.once('close', res);
+  if (child.connected) child.send({ type: 'test.shutdown' });
+  else child.kill();
+  const deadline = setTimeout(() => { if (child.exitCode === null) child.kill(); res(); }, 10000);
+  child.once('close', () => clearTimeout(deadline));
+  deadline.unref();
 });
 
-const server = spawn(process.execPath, ['server.js'], {
+const server = spawn(process.execPath, ['--require', path.join(__dirname, 'fixtures/graceful-server.cjs'), 'server.js'], {
   cwd: ROOT,
-  env: { ...process.env, AGENTHUB_PORT: String(PORT), AGENTHUB_DATA_DIR: DATA_DIR },
-  stdio: ['ignore', 'pipe', 'pipe'],
+  env: { ...process.env, AGENTHUB_PORT: String(PORT), AGENTHUB_DATA_DIR: DATA_DIR, AGENTHUB_WORKSPACE: WORK },
+  stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
 });
 server.stderr.on('data', () => {});
 
 async function waitHealthy() {
-  for (let i = 0; i < 40; i++) {
+  // 60 秒预算：满载机器上冷启动可能远超 20 秒
+  for (let i = 0; i < 120; i++) {
     try { const r = await fetch(`${BASE}/api/health`); if (r.ok) return true; } catch {}
     await new Promise(r => setTimeout(r, 500));
   }
@@ -44,13 +48,15 @@ const j = async (p, opts) => fetch(BASE + p, opts);
 const body = async (p, opts) => { const r = await j(p, opts); return { code: r.status, data: await r.json().catch(() => null) }; };
 
 // WS 终端流：open → 等 opened → 发命令 → 收集 term.data 直到命中 → close
-function ptyEcho(hostId, command, needle, timeoutMs = 20000) {
+function ptyEcho(hostId, command, needle, timeoutMs = 45000) {
   return new Promise(resolve => {
     const socket = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
     const seen = [];
-    let opened = false;
+    let opened = false, finished = false, commandTimer;
     const finish = result => {
-      clearTimeout(timer);
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer); clearTimeout(commandTimer);
       try { socket.send(JSON.stringify({ type: 'term.close', key: hostId })); } catch {}
       setTimeout(() => { try { socket.close(); } catch {} resolve(result); }, 200);
     };
@@ -59,7 +65,7 @@ function ptyEcho(hostId, command, needle, timeoutMs = 20000) {
       let m; try { m = JSON.parse(raw); } catch { return; }
       if (m.type === 'term.opened' && m.hostId === hostId) {
         opened = true;
-        setTimeout(() => socket.send(JSON.stringify({ type: 'term.data', hostId, data: command + '\r' })), 600);
+        commandTimer = setTimeout(() => { if (!finished && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'term.data', hostId, data: command + '\r' })); }, 600);
       } else if (m.type === 'term.data' && m.hostId === hostId) {
         seen.push(m.data || '');
         if (seen.join('').includes(needle)) finish({ ok: true, opened, out: seen.join('') });
@@ -69,6 +75,7 @@ function ptyEcho(hostId, command, needle, timeoutMs = 20000) {
     });
     socket.on('open', () => socket.send(JSON.stringify({ type: 'term.open', hostId, cols: 100, rows: 30, replay: false })));
     socket.on('error', e => finish({ ok: false, err: e.message }));
+    socket.on('close', () => { if (!finished) finish({ ok: false, opened, err: 'socket closed before command output' }); });
   });
 }
 
@@ -105,10 +112,11 @@ function ptyEcho(hostId, command, needle, timeoutMs = 20000) {
     ok(ev.code === 200 && Array.isArray(ev.data.events), '事件流端点返回 {events:[...]}');
 
     // ---- WS 真实 PTY 终端流（本机 PowerShell）----
-    const pty1 = await ptyEcho('local', 'echo ah-deep-e2e', 'ah-deep-e2e');
-    ok(pty1.ok && pty1.opened, 'WS 终端 opened → 命令输出回显（E2E PTY 流）');
+    const command = suffix => process.platform === 'win32' ? "[Console]::WriteLine('ah-deep-'+'" + suffix + "')" : "printf 'ah-deep-%s\\n' '" + suffix + "'";
+    const pty1 = await ptyEcho('local', command('e2e'), 'ah-deep-e2e');
+    ok(pty1.ok && pty1.opened, 'WS 终端 opened → 命令输出回显（E2E PTY 流）' + (pty1.ok ? '' : ': ' + JSON.stringify(pty1)));
     // 第二次 open 同 key 不应产生孤儿 PTY（旧进程被先关闭）
-    const pty2 = await ptyEcho('local', 'echo ah-deep-e2e-again', 'ah-deep-e2e-again');
+    const pty2 = await ptyEcho('local', command('e2e-again'), 'ah-deep-e2e-again');
     ok(pty2.ok, '同 key 重复 open 正常（旧 PTY 被回收）');
 
     console.log(failed ? `api-deep(main) FAILED: ${failed} 项未通过` : 'api-deep(main) passed');

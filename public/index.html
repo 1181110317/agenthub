@@ -4,9 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AgentHub · 聚合 Agent 工作台</title>
+<link rel="stylesheet" href="/vendor/hljs/styles/github.css" id="hljsCss">
 <link rel="stylesheet" href="/style.css">
 <link rel="stylesheet" href="/workspace.css">
+<link rel="stylesheet" href="/workbench.css">
+<link rel="stylesheet" href="/features.css">
+<link rel="stylesheet" href="/polish.css">
+<link rel="stylesheet" href="/model-center.css">
+<link rel="stylesheet" href="/issue-fixes.css">
 <link rel="stylesheet" href="/vendor/xterm.css">
+<link rel="stylesheet" href="/interface.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⬡</text></svg>">
 </head>
 <body>
@@ -26,6 +33,16 @@
       <span>新建任务</span>
       <span class="nt-key">Alt+N</span>
     </button>
+    <nav class="side-navigation" aria-label="工作导航">
+      <button type="button" class="side-workbench" id="btnWorkbench" title="所有 Agent 的运行状态、任务与改动">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        <span class="side-nav-label">工作台</span>
+      </button>
+      <button type="button" class="side-workbench side-inbox" id="btnInbox" title="任务收件箱：等待你处理 / 运行中 / 失败 / 已完成的会话">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16l2 10v6H2v-6L4 4Z"/><path d="M2 14h6l2 3h4l2-3h6"/></svg>
+        <span class="side-nav-label">收件箱</span><span id="inboxHint" aria-live="polite"></span>
+      </button>
+    </nav>
     
 
     <div class="side-label">工作助手</div>
@@ -34,7 +51,7 @@
     <div class="side-search">
       <div class="search-wrap">
         <span class="search-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg></span>
-        <input id="searchBox" placeholder="搜索会话 / 消息…" autocomplete="off">
+        <input id="searchBox" placeholder="搜索会话 / 消息…" aria-label="搜索会话 / 消息" autocomplete="off">
         <span class="search-key">Ctrl+K</span>
       </div>
     </div>
@@ -58,30 +75,41 @@
     </div>
 
     <div class="side-footer">
-      <button class="foot-btn" id="btnLocalTerm" title="本机终端">
+      <button type="button" class="foot-btn foot-models" id="btnModelCenter" title="模型中心：模型目录、Agent 分配与配置档案">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z"/><path d="m4 7.5 8 5 8-5M12 12.5V21"/></svg><span>模型中心</span><small id="footModelCount"></small>
+      </button>
+      <button type="button" class="foot-btn" id="btnBrowserDock" title="在右侧打开任务浏览器" aria-pressed="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M14 9v11M6 6.5h.1M9 6.5h.1"/></svg><span>浏览器</span>
+      </button>
+      <button class="foot-btn" id="btnFeatures" title="工具箱：运行配置、开发与协作流程">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="4" y="7" width="16" height="13" rx="2"/><path d="M8 7V4h8v3M4 12h16M10 12v3h4v-3"/></svg><span>工具箱</span>
+      </button>
+      <div class="foot-utilities" role="group" aria-label="工作区工具">
+      <button class="foot-btn" id="btnLocalTerm" title="当前环境终端" aria-label="当前环境终端">
         <svg viewBox="0 0 24 24"><path d="M4 17l6-5-6-5M12 19h8" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>终端</span>
       </button>
-      <button class="foot-btn" id="btnStats" title="用量统计">
+      <button class="foot-btn" id="btnStats" title="用量统计" aria-label="用量统计">
         <svg viewBox="0 0 24 24"><path d="M4 20V10m6 10V4m6 16v-7m4 7H2" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
         <span>用量</span>
       </button>
-      <button class="foot-btn" id="btnProviders" title="API 管理（AgentHub 独立配置）">
+      <button class="foot-btn" id="btnProviders" title="API 连接管理" aria-label="API 连接管理">
         <svg viewBox="0 0 24 24"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" stroke="currentColor" stroke-width="2" fill="none" stroke-linejoin="round"/></svg>
         <span>API 管理</span>
       </button>
-      <button class="foot-btn" id="btnSSH" title="SSH 主机管理">
+      <button class="foot-btn" id="btnSSH" title="SSH 主机管理" aria-label="SSH 主机管理">
         <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2" stroke="currentColor" stroke-width="2" fill="none"/><path d="M8 21h8M12 18v3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
         <span>SSH</span>
       </button>
-      <button class="foot-btn" id="btnScheduled" title="定时任务">
+      <button class="foot-btn" id="btnScheduled" title="定时任务" aria-label="定时任务">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.5 2"/></svg>
         <span>定时</span>
       </button>
-      <button class="foot-btn" id="btnSettings" title="设置">
+      <button class="foot-btn" id="btnSettings" title="设置" aria-label="设置">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2" fill="none"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3M4.9 4.9l2.1 2.1m10 10l2.1 2.1m0-14.2l-2.1 2.1m-10 10l-2.1 2.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
         <span>设置</span>
       </button>
+      </div>
     </div>
   </aside>
 
@@ -95,23 +123,22 @@
         <div class="hdr-heading">
         <div class="hdr-title" id="hdrTitle" title="双击重命名">新会话</div>
         <div class="hdr-context">
-          <button class="badge ws-chip" id="wsChip" title="选择工作目录">📁 目录</button>
           <button type="button" class="badge ws-chip" id="assistantChip" title="会话助手：系统提示词与默认运行参数" aria-haspopup="menu">✦ 助手</button>
-          <button type="button" class="hdr-remote ctrl-pill ctrl-menu" id="pillRemote" aria-haspopup="listbox" title="运行位置：本机 / WSL / SSH 主机">
-            <span class="ctrl-label config-label">位置</span><span class="dd-value" id="remoteLabel">本机</span><span class="dd-caret">▾</span>
-          </button>
           <div class="hdr-badges" id="hdrBadges"></div>
         </div>
         </div>
       </div>
-      <div class="hdr-right">
+      <div class="hdr-right" role="group" aria-label="会话工具">
         <button type="button" class="btn-mini ctrl-menu" id="btnHeaderMore" aria-label="更多会话操作" aria-haspopup="menu" aria-expanded="false" title="更多会话操作"><svg class="header-action-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg></button>
         <span class="hdr-usage" id="hdrUsage" title="本机累计 token（不含 cc-switch 代理记录）"></span>
         <button class="btn-mini header-action" id="btnExport" title="导出当前会话为 Markdown">
           <svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 20h14"/></svg>
           <span>导出</span>
         </button>
-        <button class="btn-mini" id="btnFiles" title="工作区文件：浏览 / 新建 / 重命名 / 编辑（Ctrl+E）" style="display:none"><svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4l1.6 2H19.5A1.5 1.5 0 0 1 21 8.5v9A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5v-11Z"/></svg><span>文件</span></button>
+        <button class="btn-mini header-action" id="btnFiles" title="工作区文件：浏览 / 新建 / 重命名 / 编辑（Ctrl+E）" style="display:none"><svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4l1.6 2H19.5A1.5 1.5 0 0 1 21 8.5v9A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5v-11Z"/></svg><span>文件</span></button>
+        <button class="btn-mini header-action" id="btnRunning" title="查看运行中的 Agent 命令" aria-label="运行中的命令"><svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="m7.5 10 2.5 2-2.5 2M12.5 15h4"/></svg><span id="runningCount">运行</span></button>
+        <button class="btn-mini header-action" id="btnSystemMonitor" title="查看本机或 SSH 主机的 CPU、内存、显存和网速" aria-label="电脑资源"><svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="3"/><path d="M9 2v3m6-3v3M9 19v3m6-3v3M2 9h3m-3 6h3m14-6h3m-3 6h3M9 14l2-4 2 4 2-4"/></svg><span>资源</span></button>
+        <button class="btn-mini header-action" id="btnSubagents" title="子代理面板：当前会话的委派清单（Task/Agent 工具调用）" aria-label="子代理面板"><svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7" cy="7" r="2.6"/><circle cx="17" cy="7" r="2.6"/><circle cx="12" cy="18" r="2.6"/><path d="M8.6 9 10.8 15.6M15.4 9l-2.2 6.6M9.6 7h4.8"/></svg><span>子代理</span></button>
         <button class="btn-mini header-action" id="btnGit" title="项目变更中心：改动 / 会话记录 / 快照 / 提交" style="display:none"><svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="6" r="2.4"/><path d="M6 8.4v7.2M18 8.4a9 9 0 0 1-9 9.2"/></svg><span>变更</span></button>
         <button class="btn-mini header-action" id="btnCompare" title="从同一 Git 快照并行运行两个 Agent" style="display:none"><svg class="header-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 4 4 8l4 4"/><path d="M4 8h13a3 3 0 0 1 3 3v1"/><path d="M16 20l4-4-4-4"/><path d="M20 16H7a3 3 0 0 1-3-3v-1"/></svg><span>对比</span></button>
         <button class="btn-mini header-action" id="btnSessUsage" title="本会话 token 明细">
@@ -146,9 +173,18 @@
 
       <div id="composer">
       <div class="composer-inner">
+        <div class="composer-location" aria-label="项目与运行位置">
+          <button type="button" class="badge ws-chip" id="wsChip" title="选择工作目录">📁 选择项目</button>
+          <button type="button" class="ctrl-pill ctrl-menu" id="pillRemote" aria-haspopup="menu" title="运行位置：本机 / WSL / SSH 主机"><svg class="location-host-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M4 10h16M8 6.5h.01M8 14h.01M8 17.5h.01"/></svg><span class="dd-value" id="remoteLabel">本机</span><span class="dd-caret" aria-hidden="true">▾</span></button>
+          <div class="composer-insights">
+            <button type="button" id="ctxMeter" class="ctx-meter" aria-label="查看上下文容量" aria-expanded="false" aria-haspopup="dialog" aria-controls="ctxPanel" title="上下文容量与窗口设置"><svg class="ctx-symbol" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="5" width="15" height="15" rx="3"/><path d="M15 2H6a4 4 0 0 0-4 4v9M9 10h7M9 14h4"/></svg><span class="ctx-text">上下文窗口</span><svg class="ctx-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 6.5 3 3 3-3"/></svg><span class="ctx-track" aria-hidden="true"></span></button>
+            <button type="button" id="composerUsage" title="一键查看当前会话的 Token、缓存与逐请求明细"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 20h16M7 16v-5m5 5V5m5 11V8"/></svg><span>会话统计</span><b class="composer-usage-count" hidden></b></button>
+          </div>
+        </div>
         <div id="queueTray" class="queue-tray hidden" aria-live="polite"></div>
+        <div id="sendFeedback" class="send-feedback" role="status" aria-live="polite" hidden><span class="send-feedback-icon" aria-hidden="true"></span><span class="send-feedback-text"></span><button type="button" id="sendFeedbackRetry" hidden>重试发送</button><button type="button" id="sendFeedbackDismiss" aria-label="关闭发送提示" hidden>×</button></div>
         <div class="composer-panel">
-          <textarea id="inpText" rows="1" aria-label="消息内容" placeholder="描述任务，输入 @@ 引用会话，或 /btw 旁问…"></textarea>
+          <textarea id="inpText" rows="1" aria-label="消息内容" placeholder="描述任务，输入 @ 引用文件、@@ 引用会话，或 /btw 旁问…"></textarea>
           <div id="mentionMenu" class="mention-menu hidden" role="listbox" aria-label="引用其它会话"></div>
           <div id="attachStrip" class="attach-strip hidden"></div>
           <div class="composer-controls">
@@ -157,10 +193,6 @@
             </button>
             <button class="composer-icon mic-btn" id="btnMic" title="语音输入（浏览器语音识别，Chrome/Edge 可用）">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z"/><path d="M19 11a7 7 0 0 1-14 0M12 18v3"/></svg>
-            </button>
-            <button type="button" id="ctxMeter" class="ctx-meter hidden" aria-label="查看上下文容量" title="查看上下文容量">
-              <div class="ctx-track"><i class="ctx-fill"></i></div>
-              <span class="ctx-text"></span>
             </button>
             <span class="ctrl-spacer"></span>
             <button type="button" class="ctrl-pill ctrl-menu" id="pillModel" aria-haspopup="listbox" title="模型（点击选择）">
@@ -251,6 +283,7 @@
           <button class="btn-mini hidden" id="reviewEdit" title="在内置编辑器中打开（可保存）">编辑</button>
           <button class="btn-mini hidden" id="reviewDownload" title="下载 / 另存为">下载</button>
           <button class="btn-mini hidden" id="reviewSystem" title="用系统默认应用打开">系统打开</button>
+          <button class="btn-mini hidden" id="reviewMax" title="最大化 / 还原面板">⤢</button>
           <button class="btn-mini hidden" id="reviewReveal" title="在文件管理器中显示">定位</button>
           <button class="btn-mini" id="reviewClose" title="关闭审查面板">✕</button>
         </div>
@@ -341,10 +374,32 @@
 
 <!-- mermaid(3.3MB)/echarts/xterm 只在真正渲染图表或打开终端时按需加载，
      见 app.js 的 ensureMermaid/ensureEcharts/ensureXterm；hljs 每条消息都要用，保留但 defer -->
-<link rel="stylesheet" href="/vendor/hljs/styles/github.css" id="hljsCss">
 <script defer src="/vendor/hljs/highlight.min.js"></script>
+<script defer src="/vendor/hljs/highlight-extra.min.js"></script>
 <script defer src="/image-compression.js"></script>
 <script defer src="/office-preview.js"></script>
+<script defer src="/icons.js"></script>
+<script defer src="/vendor/markdown-it.min.js"></script>
+<script defer src="/vendor/markdown-it-footnote.min.js"></script>
+<script defer src="/markdown.js"></script>
 <script defer src="/app.js"></script>
+<script defer src="/resource-monitor.js"></script>
+<script defer src="/ui-controls.js"></script>
+<script defer src="/usage-details.js"></script>
+<script defer src="/waveforms.js"></script>
+<script defer src="/workbench.js"></script>
+<script defer src="/features.js"></script>
+<script defer src="/model-routes.js"></script>
+<script defer src="/model-center.js"></script>
+<script defer src="/source-control.js"></script>
+<script defer src="/task-templates.js"></script>
+<script defer src="/plan-artifacts.js"></script>
+<script defer src="/development-workflows.js"></script>
+<script defer src="/content-tools.js"></script>
+<script defer src="/workspace-tools.js"></script>
+<script defer src="/project-tools.js"></script>
+<script defer src="/event-tools.js"></script>
+<script defer src="/localization.js"></script>
+<script defer src="/extension-tools.js"></script>
 </body>
 </html>

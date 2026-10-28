@@ -41,7 +41,7 @@ const server = spawn(process.execPath, ['server.js'], {
 async function api(route, method = 'GET', body) {
   const r = await fetch(BASE + route, {
     method, headers: { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(30000),
+    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(route === '/api/browser/open' ? 90000 : 30000),
   });
   return { code: r.status, data: await r.json().catch(() => null) };
 }
@@ -136,7 +136,7 @@ async function waitForIndex(minMessages) {
     if (!status.browser) { console.log('[msg-search-ui] browser unavailable, browser checks skipped'); return; }
     await browser('open', { url: BASE + '/' });
     // 等前端 boot 完成（S.settings 就绪）再驱动会话，否则 renderComposer 会拿到空设置
-    await ev(`(async()=>{ for(let i=0;i<200 && !(window.S && S.settings);i++) await new Promise(r=>setTimeout(r,80)); return !!(window.S && S.settings); })()`);
+    await ev(`(async()=>{ for(let i=0;i<200 && !(typeof S !== 'undefined' && S.settings);i++) await new Promise(r=>setTimeout(r,80)); return !!(typeof S !== 'undefined' && S.settings); })()`);
     await ev(`(async()=>{ await openSession(${JSON.stringify(imported.id)}); return true; })()`);
 
     await check('导轨按回合生成刻度', async () => {
@@ -159,7 +159,13 @@ async function waitForIndex(minMessages) {
         const bar=document.getElementById('msgSearch'), input=document.getElementById('msgSearchInput');
         const opened=!bar.classList.contains('hidden') && document.activeElement===input;
         input.value='日志'; input.dispatchEvent(new Event('input',{bubbles:true}));
-        for(let i=0;i<60 && !document.querySelector('#messages mark.ms-hit');i++) await new Promise(r=>setTimeout(r,60));
+        // 命中标记与「当前项」是分两拍应用的：只等第一拍会在满载时读到 active=0。
+        // 等「≥2 个命中且恰好 1 个当前项」即可（计数紧随命中一起更新，不要把它塞进
+        // 同一个瞬时条件里，否则可能永远不成立）。
+        for(let i=0;i<60;i++){
+          if(document.querySelectorAll('#messages mark.ms-hit').length>=2 && document.querySelectorAll('#messages mark.ms-active').length===1) break;
+          await new Promise(r=>setTimeout(r,60));
+        }
         return { opened, marks: document.querySelectorAll('#messages mark.ms-hit').length, count: document.getElementById('msgSearchCount').textContent, active: document.querySelectorAll('#messages mark.ms-active').length };
       })()`);
       assert(out.opened, 'Ctrl+F should open the search bar and focus the input');

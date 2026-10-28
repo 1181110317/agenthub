@@ -8,7 +8,7 @@ const path = require('path');
 const original = childProcess.execFile;
 const calls = [];
 childProcess.execFile = (bin, args, options, callback) => {
-  calls.push({ bin, args, options });
+  calls.push({ bin, args, options, body: args.includes('--body-file') ? fs.readFileSync(args[args.indexOf('--body-file') + 1], 'utf8') : undefined });
   queueMicrotask(() => callback(null, bin === 'gh' && args[0] === 'pr' ? 'https://github.com/example/repo/pull/1\n' : 'gh version 2.0\n', ''));
 };
 const git = require('../lib/git');
@@ -19,7 +19,9 @@ childProcess.execFile = original;
   assert.equal(result.ok, true);
   assert.match(result.output, /pull\/1/);
   assert.deepEqual(calls.map(call => call.bin), ['gh', 'gh']);
-  assert.deepEqual(calls[1].args, ['pr', 'create', '--title', 'Audit PR', '--body', 'Body text']);
+  assert.deepEqual(calls[1].args.slice(0, 5), ['pr', 'create', '--title', 'Audit PR', '--body-file']);
+  assert.equal(calls[1].body, 'Body text');
+  assert(!fs.existsSync(calls[1].args[5]), 'temporary PR body is removed');
   assert.equal(calls[1].options.cwd, process.cwd());
   console.log('[git-pr] GitHub CLI success path passed');
 

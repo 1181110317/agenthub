@@ -28,7 +28,7 @@ const server = spawn(process.execPath, ['server.js'], {
 async function api(route, method = 'GET', body) {
   const r = await fetch(BASE + route, {
     method, headers: { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(20000),
+    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(route === '/api/browser/open' ? 90000 : 20000),
   });
   return { code: r.status, data: await r.json().catch(() => null) };
 }
@@ -71,7 +71,7 @@ const dialogText = () => ev(`document.getElementById('confirmMsg').textContent`)
     const status = await (await fetch(BASE + '/api/browser/status')).json();
     if (!status.browser) { console.log('[ws-files-ui] browser unavailable, skipped'); return; }
     await browser('open', { url: BASE + '/' });
-    await ev(`(async()=>{ for(let i=0;i<200 && !(window.S && S.settings);i++) await new Promise(r=>setTimeout(r,80)); return true; })()`);
+    await ev(`(async()=>{ for(let i=0;i<200 && !(typeof S !== 'undefined' && S.settings);i++) await new Promise(r=>setTimeout(r,80)); return true; })()`);
     await ev(`(async()=>{ await openSession(${JSON.stringify(session.id)}); return true; })()`);
 
     await check('文件 tab 打开后列出工作区条目（目录在前）', async () => {
@@ -96,13 +96,19 @@ const dialogText = () => ev(`document.getElementById('confirmMsg').textContent`)
     await check('点击目录展开加载子项', async () => {
       const out = await ev(`(async()=>{
         const row=[...document.querySelectorAll('#reviewDiff .ws-row')].find(r=>r.dataset.wsPath==='src');
-        row.click();
+        row.querySelector('.ws-row-main').click();
         for(let i=0;i<60 && !document.querySelector('#reviewDiff .ws-row[data-ws-path="src/main.js"]');i++) await new Promise(r=>setTimeout(r,80));
         const fresh=[...document.querySelectorAll('#reviewDiff .ws-row')].find(r=>r.dataset.wsPath==='src');
-        return { child: !!document.querySelector('#reviewDiff .ws-row[data-ws-path="src/main.js"]'), open: fresh ? fresh.classList.contains('open') : false };
+        const child=document.querySelector('#reviewDiff .ws-row[data-ws-path="src/main.js"]');
+        const parentBox=fresh?.getBoundingClientRect(), childBox=child?.getBoundingClientRect();
+        return { child: !!child, open: fresh ? fresh.classList.contains('open') : false,
+          below: !!childBox && childBox.top >= parentBox.bottom - 1,
+          sameWidth: !!childBox && Math.abs(childBox.width-parentBox.width)<2,
+          indented: !!child && parseFloat(getComputedStyle(child).paddingLeft)>parseFloat(getComputedStyle(fresh).paddingLeft) };
       })()`);
       assert(out.child, 'expanding src should load its children');
       assert(out.open, 'row should be marked open');
+      assert(out.below && out.sameWidth && out.indented, 'children must occupy full rows below the folder with deeper indentation: '+JSON.stringify(out));
     });
 
     await check('文件名搜索给出结果并可打开', async () => {
@@ -117,6 +123,33 @@ const dialogText = () => ev(`document.getElementById('confirmMsg').textContent`)
       })()`);
       assert(out.hits.some(h => h.includes('main.js')), 'expected main.js in ' + JSON.stringify(out.hits));
       assert(out.backToTree, 'clearing the query should restore the tree');
+    });
+
+    await check('代码文件可直接编辑，输入实时同步语法高亮', async () => {
+      const out = await ev(`(async()=>{
+        openFileEditor(${JSON.stringify(path.join(PROJECT, 'src', 'main.js'))});
+        for(let i=0;i<80 && !document.querySelector('#edHighlightLayer code');i++) await new Promise(r=>setTimeout(r,80));
+        const code=document.querySelector('#edHighlightLayer code');
+        const area=document.getElementById('edText');
+        const preview={ visible: !!code && document.getElementById('edCodeEditor').classList.contains('highlight-on'), language: code?.className || '', tokens: code?.querySelectorAll('span[class^="hljs-"]').length || 0, editorHidden: area?.hidden };
+        const original=area.value;
+        area.value='const edited = 123;'; area.dispatchEvent(new Event('input',{bubbles:true}));
+        const immediate=code.textContent===area.value;
+        await new Promise(r=>setTimeout(r,150));
+        const highlighted=code.textContent===area.value && code.querySelectorAll('span[class^="hljs-"]').length>0;
+        area.value=original; area.dispatchEvent(new Event('input',{bubbles:true}));
+        document.getElementById('edCodeToggle').click();
+        const editorVisible=!document.getElementById('edText').hidden;
+        const editor=document.getElementById('edText').value;
+        openWorkspaceFilesTab();
+        return { preview, editorVisible, editor, immediate, highlighted };
+      })()`);
+      assert(out.preview.visible, 'source preview should be visible when the file opens');
+      assert(/language-javascript/.test(out.preview.language), 'JavaScript should use its declared highlighter: ' + JSON.stringify(out.preview));
+      assert(out.preview.tokens > 0, 'source preview should contain syntax tokens');
+      assert(!out.preview.editorHidden && out.editorVisible, 'the editor should stay editable with highlighting on or off');
+      assert(out.immediate && out.highlighted, 'typing should update visible text immediately and then refresh tokens');
+      assert(out.editor.includes('answer = 42'), 'switching back should preserve the source text');
     });
 
     await check('新建文件（走真实弹窗）后出现在树里', async () => {

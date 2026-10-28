@@ -7,8 +7,14 @@
     "lib": "lib"
   },
   "scripts": {
-    "test": "node test/syntax.js && node test/logic.js && node test/claude-resume.js && node test/message-features.js && node test/permission-memory.js && node test/sqlite-db.js && node test/msg-search-ui.js && node test/fs-ops.js && node test/ws-files-ui.js && node test/project-changes.js && node test/git-compare.js && node test/balance-codex.js && node test/ported-libs.js && node test/differential.js && node test/session-split.js && node test/store-flush.js && node test/archive-bodies.js && node test/file-undo.js && node test/front-back-contract.js && node test/cwd-migration.js && node test/round5-recovery.js && node test/round6-verify.js && node test/api-smoke.js && node test/api-advanced.js && node test/api-deep.js && node test/api-round4.js && node test/list-details.js && node test/message-actions.js && node test/mcp-servers.js && node test/mcp-all.js && node test/provider-presets.js && node test/provider-integrations.js && node test/ssh-loopback.js && node test/file-previews.js && node test/workspace-default.js && node test/office-generation.js && node test/browser-concurrency.js && node test/git-pr.js && node test/custom-agent.js && node test/auth-web.js && node test/ro-guard.js && node test/reasoning-smoke.js && node test/scheduled-cron.js && node test/scheduled-ui.js && node test/workspace-ui.js && node test/assistants.js && node test/assistants-ui.js && node test/settings-ui.js && node test/async-ui.js && node test/ui-surface-matrix.js && node test/audit-persistence.js && node test/audit-git.js && node test/audit-engine.js && node test/audit-import.js && node test/audit-api.js && node test/audit-concurrency.js",
-    "start": "node server.js"
+    "test": "node test/syntax.js && node test/static-audit.js && node test/invariant-lint.js && node test/doc-lint.js && node test/logic.js && node test/claude-resume.js && node test/stop-recovery.js && node test/provider-gateway.js && node test/message-features.js && node test/permission-memory.js && node test/sqlite-db.js && node test/msg-search-ui.js && node test/fs-ops.js && node test/ws-files-ui.js && node test/project-changes.js && node test/git-compare.js && node test/balance-codex.js && node test/ported-libs.js && node test/differential.js && node test/session-split.js && node test/store-flush.js && node test/archive-bodies.js && node test/file-undo.js && node test/front-back-contract.js && node test/cwd-migration.js && node test/round5-recovery.js && node test/round6-verify.js && node test/api-smoke.js && node test/api-advanced.js && node test/api-deep.js && node test/api-round4.js && node test/inbox-features.js && node test/batch-features.js && node test/steer-feature.js && node test/list-details.js && node test/message-actions.js && node test/mcp-servers.js && node test/mcp-all.js && node test/provider-presets.js && node test/provider-integrations.js && node test/ssh-loopback.js && node test/file-previews.js && node test/workspace-default.js && node test/office-generation.js && node test/browser-concurrency.js && node test/git-pr.js && node test/custom-agent.js && node test/acp-detect.js && node test/dsh-adapter.js && node test/auth-web.js && node test/ro-guard.js && node test/reasoning-smoke.js && node test/scheduled-cron.js && node test/scheduled-once.js && node test/scheduled-ui.js && node test/workspace-ui.js && node test/assistants.js && node test/assistants-ui.js && node test/settings-ui.js && node test/async-ui.js && node test/ui-surface-matrix.js && node test/audit-persistence.js && node test/audit-git.js && node test/audit-engine.js && node test/audit-import.js && node test/audit-api.js && node test/audit-concurrency.js && node test/round7-verify.js && node test/round7-ui.js && node test/api-fuzz.js && node test/api-agent-tools.js && node test/api-uncovered.js && node test/concurrency-soak.js && node test/ui-deep.js && node test/code-presentation.js && node test/features-runtime.js && node test/git-workflows.js && node test/mcp-oauth.js && node test/source-control.js && node test/terminal-durable.js && node test/workflows-ui.js && node test/task-templates.js && node test/development-workflows.js && node test/target-workspace.js && node test/remote-workspace-ssh.js && node test/remote-files-sftp.js && node test/shared-browser.js && node test/project-events-extensions.js && node test/code-hosts.js && node test/media-inputs.js && node test/office-structured.js && node test/expansion-ui.js && node test/document-issues.js && node test/model-center.js && node test/updated-document-issues.js",
+    "test:code-ui": "node test/code-presentation.js",
+    "start": "node server.js",
+    "test:workflows": "node test/features-runtime.js && node test/mcp-oauth.js && node test/terminal-durable.js && node test/git-workflows.js && node test/source-control.js && node test/workflows-ui.js && node test/task-templates.js",
+    "test:expansion": "node test/development-workflows.js && node test/target-workspace.js && node test/remote-workspace-ssh.js && node test/shared-browser.js && node test/project-events-extensions.js && node test/code-hosts.js && node test/media-inputs.js && node test/office-structured.js && node test/expansion-ui.js",
+    "test:issues": "node test/provider-gateway.js && node test/stop-recovery.js && node test/remote-workspace-ssh.js && node test/remote-files-sftp.js && node test/document-issues.js",
+    "test:models": "node test/model-center.js && node test/provider-gateway.js && node test/shared-browser.js && node test/expansion-ui.js",
+    "test:updated-issues": "node test/updated-document-issues.js"
   },
   "keywords": [],
   "author": "",
@@ -16,6 +22,7 @@
   "type": "commonjs",
   "dependencies": {
     "@highlightjs/cdn-assets": "^11.12.0",
+    "@modelcontextprotocol/sdk": "1.32.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "docx": "^9.7.1",
@@ -23,11 +30,13 @@
     "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "image-size": "file:vendor/image-size-safe",
+    "json5": "2.2.3",
     "jszip": "^3.10.1",
     "node-pty": "^1.1.0",
     "pptxgenjs": "^4.0.1",
     "ssh2": "^1.17.0",
     "undici": "^8.10.2",
+    "wavedrom": "3.7.0",
     "ws": "^8.21.3"
   },
   "overrides": {
@@ -35,5 +44,8 @@
     "exceljs": {
       "uuid": "^11.1.1"
     }
+  },
+  "engines": {
+    "node": ">=22.19.0"
   }
 }

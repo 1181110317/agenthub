@@ -55,7 +55,9 @@ function freshLib() {
 }
 // store 的 save() 有 200ms 防抖：写完之后立刻读文件可能读到旧内容，
 // 这里重试到条件成立（或超时）为止。
-async function libSettled(predicate, timeoutMs = 4000) {
+// 等库层缓存刷新到期望状态。预算放宽到 20 秒：写盘点在 200ms 防抖后落盘，满载
+// 机器上 4 秒会把「还没落盘」误报成「过滤逻辑错了」。
+async function libSettled(predicate, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const lib = freshLib();
@@ -139,13 +141,17 @@ async function check(name, fn) {
       await api(`/api/mcp/servers/${created.id}`, 'PUT', {
         name: 'fixture-stdio', transport: 'stdio', command: process.execPath, args: [FIXTURE], env: {}, agents: ['codex'],
       });
-      const lib = await libSettled(l => !l.claudeEntries('claude')['fixture-stdio']);
+      // 两个条件要在**同一次轮询**里等：先等 claude 侧清掉、再断言 codex 侧存在，
+      // 会让「claude 已更新、codex 注入参数晚一拍」的时序变成随机失败。
+      const lib = await libSettled(l => !l.claudeEntries('claude')['fixture-stdio']
+        && l.codexMcpArgs('codex').join(' ').includes('mcp_servers.fixture-stdio.command='));
       assert(!lib.claudeEntries('claude')['fixture-stdio'], 'claude 不该包含只挂给 codex 的服务器');
       assert(lib.codexMcpArgs('codex').join(' ').includes('mcp_servers.fixture-stdio.command='), 'codex 应当包含该服务器');
       await api(`/api/mcp/servers/${created.id}`, 'PUT', {
         name: 'fixture-stdio', transport: 'stdio', command: process.execPath, args: [FIXTURE], env: {}, agents: ['claude', 'codex'],
       });
-      const lib2 = await libSettled(l => !!l.claudeEntries('claude')['fixture-stdio']);
+      const lib2 = await libSettled(l => !!l.claudeEntries('claude')['fixture-stdio']
+        && l.codexMcpArgs('codex').join(' ').includes('mcp_servers.fixture-stdio.args=['));
       const both = lib2.claudeEntries('claude');
       assert(both['fixture-stdio'], 'claude 应该包含该服务器');
       assert.equal(both['fixture-stdio'].command, process.execPath);

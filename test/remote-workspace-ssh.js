@@ -1,0 +1,85 @@
+const assert = require('assert'), fs = require('fs'), path = require('path'), crypto = require('crypto');
+const {spawn,execFileSync} = require('child_process'), {Server} = require('ssh2'), WebSocket=require('ws');
+const {create} = require('./fixtures/expansion-harness.cjs');
+let h, ssh; const clients=new Set(), children=new Set(), commands=[];
+const bash=process.platform==='win32'?['C:/Program Files/Git/bin/bash.exe','C:/Program Files/Git/usr/bin/bash.exe'].find(p=>fs.existsSync(p)):'/bin/sh';
+(async()=>{try {
+  h=await create('remote-workspace'); const privateKey=crypto.generateKeyPairSync('rsa',{modulusLength:2048,privateKeyEncoding:{type:'pkcs1',format:'pem'},publicKeyEncoding:{type:'pkcs1',format:'pem'}}).privateKey;
+  ssh=new Server({hostKeys:[privateKey]},client=>{
+    clients.add(client);client.on('close',()=>clients.delete(client));client.on('error',()=>{});
+    client.on('authentication',ctx=>ctx.method==='password'&&ctx.username==='fixture'&&ctx.password==='fixture-password'?ctx.accept():ctx.reject());
+    client.on('ready',()=>client.on('session',accept=>{const session=accept();session.on('exec',(acceptExec,rejectExec,info)=>{
+      commands.push(info.command); const stream=acceptExec(), child=/^powershell\.exe /.test(info.command)?spawn(info.command,{shell:true,windowsHide:true,stdio:['pipe','pipe','pipe']}):spawn(bash,['-c',info.command],{windowsHide:true,stdio:['pipe','pipe','pipe']});
+      children.add(child);stream.on('data',b=>child.stdin.write(b));stream.on('end',()=>child.stdin.end()); child.stdin.on('error',()=>{});
+      child.stdout.on('data',b=>{if(!stream.destroyed)stream.write(b);});child.stderr.on('data',b=>{if(!stream.destroyed)stream.stderr.write(b);});
+      child.on('error',e=>{stream.stderr.write(e.message);stream.exit(1);stream.end();});child.on('close',code=>{children.delete(child);if(!stream.destroyed){stream.exit(code||0);stream.end();}});stream.on('close',()=>{if(child.exitCode==null)child.kill();});
+    });}));
+  }); await new Promise(r=>ssh.listen(0,'127.0.0.1',r));
+  const cliScript=path.join(h.tmp,'remote-cli.cjs');fs.writeFileSync(cliScript,"const fs=require('fs');fs.appendFileSync('测试.txt','\\nREMOTE_CLI_SNAPSHOT');fs.writeFileSync('CLI-new.txt','REMOTE_CLI_NEW');console.log('REMOTE_CLI_DONE');");
+  assert.equal((await h.api('/api/settings','PUT',{customAgents:[{id:'c_snapshot_fixture',name:'Remote snapshot fixture',bin:'node',args:JSON.stringify(cliScript.replace(/\\/g,'/')),argPrompt:true}]})).status,200);
+  const platforms=process.platform==='win32'?['posix','windows']:['posix'];
+  assert.equal((await h.api('/api/system/metrics','GET',undefined,'fixture-read')).status,403,'read-only tokens cannot inspect local or SSH machine resources');
+  assert.equal((await h.api('/api/system/metrics?host=missing-host')).status,404);
+  assert.equal((await h.api('/api/system/metrics?host=a&host=b')).status,400,'arbitrary host arrays are rejected');
+  for (const platform of platforms) {
+    const directory=path.join(h.work,platform+' 项目');fs.mkdirSync(directory);
+    execFileSync('git',['init','-b','main'],{cwd:directory,stdio:'ignore',windowsHide:true});execFileSync('git',['config','user.name','QA'],{cwd:directory});execFileSync('git',['config','user.email','qa@example.test'],{cwd:directory});
+    const host=(await h.api('/api/ssh/hosts','POST',{name:platform+' fixture',host:'127.0.0.1',port:ssh.address().port,user:'fixture',authType:'password',password:'fixture-password',platform})).data;assert(host.id);
+    const resourceUrl='/api/system/metrics?host='+encodeURIComponent(host.id),beforeResource=commands.length;
+    const [resourceA,resourceB]=await Promise.all([h.api(resourceUrl),h.api(resourceUrl)]);
+    assert.equal(resourceA.status,200,JSON.stringify(resourceA.data));assert.equal(resourceB.status,200);
+    assert.equal(resourceA.data.target.kind,'ssh');assert.equal(resourceA.data.target.id,host.id);assert.equal(resourceA.data.platform,process.platform);
+    assert(resourceA.data.memory.total>0 && resourceA.data.memory.used>=0 && resourceA.data.memory.used<=resourceA.data.memory.total);
+    assert(Number.isFinite(resourceA.data.cpu.percent),'the first SSH response includes a measured short-interval CPU baseline');
+    assert(resourceA.data.network.status==='unavailable'||resourceA.data.network.adapters.every(a=>Number.isFinite(a.receiveBps)),'supported NICs have measured rates in the first SSH response');
+    assert.equal(commands.length-beforeResource,1,'two viewers execute only one remote metrics worker');
+    assert.equal((await h.api(resourceUrl,'GET',undefined,'fixture-read')).status,403,'remote metrics share the local resource permission guard');
+    await new Promise(resolve=>setTimeout(resolve,2100));
+    const resourceNext=await h.api(resourceUrl);assert.equal(resourceNext.status,200,JSON.stringify(resourceNext.data));
+    assert(Number.isFinite(resourceNext.data.cpu.percent) && resourceNext.data.cpu.percent>=0 && resourceNext.data.cpu.percent<=100,'subsequent SSH samples measure elapsed CPU counters');
+    const s=(await h.api('/api/sessions','POST',{agent:'codex',cwd:directory,remoteHostId:host.id,title:'Remote fixture'})).data;assert(s.id);
+    const qp='?sessionId='+encodeURIComponent(s.id);
+    let created=await h.api('/api/fs/new','POST',{sessionId:s.id,path:'测试.txt',kind:'file'});assert.equal(created.status,200,JSON.stringify(created.data));
+    const read=(await h.api('/api/fs/text'+qp+'&path='+encodeURIComponent('测试.txt'))).data;assert(read.hash);
+    const edited=await h.api('/api/fs/write','POST',{sessionId:s.id,path:'测试.txt',content:'SSH_TRANSPORT_OK 中文',expectedHash:read.hash,expectedMtime:read.mtime});assert.equal(edited.status,200,JSON.stringify(edited.data));assert.equal(fs.readFileSync(path.join(directory,'测试.txt'),'utf8'),'SSH_TRANSPORT_OK 中文');
+    assert.equal((await h.api('/api/fs/write','POST',{sessionId:s.id,path:'测试.txt',content:'stale',expectedHash:read.hash})).status,409);
+    assert((await h.api('/api/fs/tree'+qp)).data.entries.some(e=>e.name==='测试.txt'));
+    const gitUrl='/api/sessions/'+s.id+'/remote-git'; const st=(await h.api(gitUrl+'?action=status','GET',undefined,'fixture-read')).data;assert(st.ok);assert(st.files.some(f=>f.path==='测试.txt'));
+    assert.equal(st.lineStatsVersion,1);assert.deepEqual([st.files.find(f=>f.path==='测试.txt').added,st.files.find(f=>f.path==='测试.txt').deleted],[1,0],'SSH status preserves real new-file line counts');
+    const freshDiff=(await h.api(gitUrl+'?action=diff&path='+encodeURIComponent('测试.txt'),'GET',undefined,'fixture-read')).data;assert(freshDiff.ok&&freshDiff.diff.includes('+SSH_TRANSPORT_OK 中文'),'SSH preview renders an untracked file');
+    assert.equal((await h.api(gitUrl,'POST',{action:'stage',path:'测试.txt'})).status,200);
+    const commit=await h.api(gitUrl,'POST',{action:'commit',expectedHead:st.head,message:'remote commit'});assert.equal(commit.status,200,JSON.stringify(commit.data));assert(commit.data.head);
+    const snapshotBefore=await h.api(gitUrl,'POST',{action:'snapshot'});assert.equal(snapshotBefore.status,200,JSON.stringify(snapshotBefore.data));
+    const stageBefore=execFileSync('git',['ls-files','--stage'],{cwd:directory}).toString();
+    const current=(await h.api('/api/fs/text'+qp+'&path='+encodeURIComponent('测试.txt'))).data;
+    assert.equal((await h.api('/api/fs/write','POST',{sessionId:s.id,path:'测试.txt',content:'SSH_SNAPSHOT_CHANGE',expectedHash:current.hash})).status,200);
+    const snapshotAfter=(await h.api(gitUrl,'POST',{action:'snapshot'})).data;assert(snapshotAfter.id);
+    const turn=(await h.api(gitUrl,'POST',{action:'turnDiff',beforeId:snapshotBefore.data.id,afterId:snapshotAfter.id})).data;
+    assert(turn.files.some(file=>file.path==='测试.txt'));
+    const patch=(await h.api(gitUrl,'POST',{action:'turnDiff',beforeId:snapshotBefore.data.id,afterId:snapshotAfter.id,path:'测试.txt'})).data;
+    assert(patch.patch.includes('+SSH_SNAPSHOT_CHANGE'));assert.equal(execFileSync('git',['ls-files','--stage'],{cwd:directory}).toString(),stageBefore);
+    await h.api(gitUrl,'POST',{action:'snapshotDelete',id:snapshotBefore.data.id});await h.api(gitUrl,'POST',{action:'snapshotDelete',id:snapshotAfter.id});
+    const cliSession=(await h.api('/api/sessions','POST',{agent:'c_snapshot_fixture',cwd:directory.replace(/\\/g,'/'),remoteHostId:host.id,title:'Remote CLI automatic turn diff'})).data;assert(cliSession.id);
+    const socket=new WebSocket(h.base.replace('http','ws')+'/ws?token=fixture-full'),events=[];
+    try {
+      await new Promise((resolve,reject)=>{socket.once('open',resolve);socket.once('error',reject);});
+      const finished=new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('remote CLI timeout: '+JSON.stringify(events))),60000);socket.on('message',raw=>{const event=JSON.parse(raw);events.push(event);if(event.type==='chat.done'&&event.sessionId===cliSession.id){clearTimeout(timer);resolve(event);}});});
+      socket.send(JSON.stringify({type:'chat',sessionId:cliSession.id,text:'Execute the isolated remote CLI fixture'}));assert.equal((await finished).code,0,JSON.stringify(events));
+    } finally {socket.close();}
+    const complete=(await h.api('/api/sessions/'+cliSession.id)).data,reply=complete.messages.find(m=>m.role==='assistant'&&m.turnDiff);
+    assert(reply,'remote CLI reply must include automatically captured file changes: '+JSON.stringify(complete.messages));
+    assert(reply.turnDiff.files.some(file=>file.path==='CLI-new.txt'&&file.status==='A'));assert(reply.turnDiff.files.some(file=>file.path==='测试.txt'&&file.status==='M'));
+    const savedPatch=await h.api('/api/sessions/'+cliSession.id+'/turn-diff?ts='+reply.ts+'&path='+encodeURIComponent('测试.txt'));assert.equal(savedPatch.status,200,JSON.stringify(savedPatch.data));assert(savedPatch.data.patch.includes('+REMOTE_CLI_SNAPSHOT'));
+    fs.appendFileSync(path.join(directory,'测试.txt'),'\nLATER_EDIT');const immutable=await h.api('/api/sessions/'+cliSession.id+'/turn-diff?ts='+reply.ts+'&path='+encodeURIComponent('测试.txt'));assert(!immutable.data.patch.includes('LATER_EDIT'));
+    assert.equal(execFileSync('git',['ls-files','--stage'],{cwd:directory}).toString(),stageBefore);
+    assert.equal((await h.api(gitUrl,'POST',{action:'commit',message:'RO'},'fixture-read')).status,403);
+    assert.equal((await h.api('/api/fs/text'+qp+'&path=..%2Fescape.txt')).status,400);
+  }
+  const workerCommands=commands.filter(c=>c.includes('new Function'));
+  assert(workerCommands.length&&workerCommands.every(c=>c.startsWith('bash -lc ')||c.startsWith('powershell.exe ')));
+  assert(commands.some(c=>c.startsWith('bash -lc ')&&c.includes('.nvm/nvm.sh')), 'POSIX worker restores the login Node path');
+  const closedPortProbe=require('node:net').createServer();await new Promise(r=>closedPortProbe.listen(0,'127.0.0.1',r));const closedPort=closedPortProbe.address().port;await new Promise(r=>closedPortProbe.close(r));
+  const offline=(await h.api('/api/ssh/hosts','POST',{name:'offline fixture',host:'127.0.0.1',port:closedPort,user:'fixture',authType:'password',password:'fixture-password',platform:'posix'})).data;
+  const offlineMetrics=await h.api('/api/system/metrics?host='+offline.id);assert(offlineMetrics.status>=400 && offlineMetrics.data.error,'SSH failure is an explicit error, never a local or all-zero resource snapshot');
+  console.log('[remote-workspace-ssh] actual SSH stdin worker transport in '+platforms.join('/')+' command forms, local/remote resource guards and shared probes, Unicode CRUD, conflict detection, scope guard, staged commits, automatic CLI turn snapshots, immutable turn-diff and read-only Git access passed');
+}catch(e){console.error(e);if(h)console.error(h.errors());process.exitCode=1;}finally{await h?.stop();for(const child of children)child.kill();for(const client of clients)client.end();if(ssh)await new Promise(r=>ssh.close(r));}})();

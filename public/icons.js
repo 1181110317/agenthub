@@ -1,0 +1,76 @@
+/* One local SVG vocabulary for controls. No icon font or network dependency. */
+(() => {
+  'use strict';
+  const paths = {
+    chevronRight: '<path d="m9 6 6 6-6 6"/>',
+    chevronDown: '<path d="m6 9 6 6 6-6"/>',
+    chevronLeft: '<path d="m15 6-6 6 6 6"/>',
+    close: '<path d="m6 6 12 12M6 18 18 6"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>',
+    minus: '<path d="M5 12h14"/>',
+    more: '<circle cx="5" cy="12" r="1" fill="currentColor"/><circle cx="12" cy="12" r="1" fill="currentColor"/><circle cx="19" cy="12" r="1" fill="currentColor"/>',
+    folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/>',
+    file: '<path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10l-7-7Z"/><path d="M13 3v7h7M8 14h8M8 17h5"/>',
+    server: '<rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 6.5h.01M7 17.5h.01M11 6.5h6M11 17.5h6"/>',
+    monitor: '<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/>',
+    browser: '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01M15 9v11"/>',
+    terminal: '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3m6 0h4"/>',
+    cpu: '<rect x="5" y="5" width="14" height="14" rx="3"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v3m6-3v3M9 19v3m6-3v3M2 9h3m-3 6h3m14-6h3m-3 6h3"/>',
+    memory: '<rect x="3" y="6" width="18" height="11" rx="2"/><path d="M7 10v3m5-3v3m5-3v3M6 17v3m4-3v3m4-3v3m4-3v3"/>',
+    network: '<path d="M7 3v15m-4-4 4 4 4-4M17 21V6m-4 4 4-4 4 4"/>',
+    arrowDown: '<path d="M12 4v16m-6-6 6 6 6-6"/>',
+    arrowUp: '<path d="M12 20V4m-6 6 6-6 6 6"/>',
+    workflow: '<rect x="9" y="3" width="6" height="5" rx="1.5"/><rect x="3" y="16" width="6" height="5" rx="1.5"/><rect x="15" y="16" width="6" height="5" rx="1.5"/><path d="M12 8v4M6 16v-4h12v4"/>',
+    branch: '<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="6" r="2"/><path d="M6 7v10m0-5h5a7 7 0 0 0 7-4"/>',
+    chart: '<path d="M4 20h16M7 16v-5m5 5V5m5 11V8"/>',
+    activity: '<path d="M3 12h4l3-7 4 14 3-7h4"/>',
+    moon: '<path d="M20.5 14A8.5 8.5 0 1 1 10 3.5 6.5 6.5 0 0 0 20.5 14Z"/>',
+    search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/>',
+    gear: '<path d="m9 3-.6 2.2-2 .9L4.3 5.5 2 9.5l1.6 1.6v2L2 14.5l2.3 4 2.1-.6 2 .9L9 21h6l.6-2.2 2-.9 2.1.6 2.3-4-1.6-1.4v-2L22 9.5l-2.3-4-2.1.6-2-.9L15 3H9Z"/><circle cx="12" cy="12" r="3"/>',
+    list: '<path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/>',
+    pin: '<path d="M9 3h6l-1 6 4 4v2H6v-2l4-4-1-6Zm3 12v6"/>',
+    bulb: '<path d="M9 17h6l1-3a6 6 0 1 0-8 0l1 3Zm1 4h4M9 17v1h6v-1"/>',
+    brain: '<path d="M12 5a3 3 0 0 0-5-2 4 4 0 0 0-4 6 4 4 0 0 0 1 7 4 4 0 0 0 8 3V5Zm0 0a3 3 0 0 1 5-2 4 4 0 0 1 4 6 4 4 0 0 1-1 7 4 4 0 0 1-8 3M8 9l4 2m4-2-4 2M8 16l4-2m4 2-4-2"/>',
+    pencil: '<path d="m15 5 4 4M4 20l4-1L20 7l-3-3L5 16l-1 4Z"/>',
+    globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a17 17 0 0 1 0 18 17 17 0 0 1 0-18Z"/>',
+    rocket: '<path d="M9 15c-2-7 3-12 11-12 0 8-5 13-12 11M8 7H5l-3 5h5m6 5v3l-5 2v-6M4 17l-1 4 4-1"/><circle cx="15" cy="8" r="1.5"/>',
+    grid: '<rect x="3.5" y="3.5" width="6" height="6" rx="1.5"/><rect x="14.5" y="3.5" width="6" height="6" rx="1.5"/><rect x="3.5" y="14.5" width="6" height="6" rx="1.5"/><rect x="14.5" y="14.5" width="6" height="6" rx="1.5"/>',
+    inbox: '<path d="M4 4h16l2 11v5H2v-5L4 4Z"/><path d="M2 15h6l2 3h4l2-3h6"/>',
+    toolbox: '<rect x="3" y="7" width="18" height="14" rx="3"/><path d="M8 7V3h8v4M3 13h18m-12 0v3h6v-3"/>',
+    shield: '<path d="m12 3 8 4v5c0 5-4 8-8 10-4-2-8-5-8-10V7l8-4Z"/><path d="m8.5 12 2.5 2.5 4.5-5"/>',
+    clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    calendar: '<rect x="3" y="5" width="18" height="16" rx="3"/><path d="M7 3v4m10-4v4M3 11h18M8 15h.01M12 15h.01M16 15h.01"/>',
+    cube: '<path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z"/><path d="m4 7.5 8 5 8-5M12 12.5V21"/>',
+    spark: '<path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5L12 3Z"/>',
+    refresh: '<path d="M20 8a8 8 0 0 0-14-2L3 9m0-6v6h6M4 16a8 8 0 0 0 14 2l3-3m0 6v-6h-6"/>',
+    copy: '<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V3H3v13h5"/>',
+    quote: '<path d="m9 6-5 5 5 5"/><path d="M4 11h9a7 7 0 0 1 7 7"/>',
+    check: '<path d="m5 12 4 4L19 6"/>',
+    checkSquare: '<rect x="3" y="3" width="18" height="18" rx="3"/><path d="m7 12 3 3 7-7"/>',
+    warning: '<path d="m12 3 10 18H2L12 3ZM12 9v5m0 3h.01"/>',
+    play: '<path d="m8 4 12 8-12 8V4Z"/>',
+    stop: '<rect x="5" y="5" width="14" height="14" rx="3"/>',
+    pause: '<path d="M8 5v14M16 5v14"/>',
+    clip: '<path d="m8 12 7-7a3 3 0 0 1 4 4l-9 9a5 5 0 0 1-7-7l10-10"/>',
+    up: '<path d="m5 12 7-7 7 7M12 5v15"/>',
+    down: '<path d="m5 12 7 7 7-7M12 19V4"/>',
+    left: '<path d="m12 5-7 7 7 7M5 12h15"/>',
+    external: '<path d="M14 3h7v7m0-7L11 13M10 3H3v18h18v-7"/>',
+    archive: '<rect x="3" y="3" width="18" height="5" rx="1.5"/><path d="M5 8v13h14V8M9 12h6"/>',
+    mail: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="m3 7 9 6 9-6"/>',
+    home: '<path d="m3 11 9-8 9 8M5 10v11h5v-7h4v7h5V10"/>',
+    lock: '<rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2"/>',
+    help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 4 2c-1 .6-1.5 1-1.5 2m0 4h.01"/>',
+    sliders: '<path d="M4 7h6m4 0h6M4 17h10m4 0h2"/><circle cx="12" cy="7" r="2"/><circle cx="16" cy="17" r="2"/>',
+    microphone: '<rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0m-7 7v3m-3 0h6"/>',
+    sidebar: '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/>',
+  };
+  const aliases = { chevron: 'chevronRight', right: 'chevronRight', chevDown: 'chevronDown', cloud: 'server', term: 'terminal', pulse: 'activity', fork: 'branch', clipboard: 'copy', zap: 'activity' };
+  const resolve = name => aliases[name] || name;
+  function has(name) { return Object.hasOwn(paths, resolve(name)); }
+  function svg(name) {
+    const key = has(name) ? resolve(name) : 'spark';
+    return `<svg class="ui-icon" data-icon="${key}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${paths[key]}</svg>`;
+  }
+  window.AgentHubIcons = Object.freeze({ svg, has });
+})();

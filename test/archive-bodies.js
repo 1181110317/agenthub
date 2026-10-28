@@ -63,6 +63,8 @@ const ok = (cond, label) => { if (cond) console.log('  ✓ ' + label); else { fa
     const rec = lines.find(x => String(x.id) === String(id));
     ok(!!rec, '归档 JSONL 里有该会话');
     ok(Array.isArray(rec.messages) && rec.messages.length === 2 && rec.messages[0].text === '要保留的正文', '归档记录带完整正文');
+    const archiveSummary = (await api('/api/sessions/archive')).data.find(s => String(s.id) === String(id));
+    ok(archiveSummary && archiveSummary.msgCount === 2 && archiveSummary.sizeBytes > 0 && archiveSummary.messages === undefined, '归档列表给出条数和体积，不传完整正文');
     ok(await waitFor(() => !fs.existsSync(bodyFile)), '归档后正文文件已清理');
 
     const restored = await api(`/api/sessions/${id}/restore`, {});

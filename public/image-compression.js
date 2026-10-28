@@ -5,7 +5,7 @@
 //   2) HEIC 转码由「动态 import("heic-to/csp")」改为可选：页面若加载了
 //      heic-to 就用（window.heicTo），否则如实报 unreadable，不新增依赖。
 // 算法（质量阶梯、回退降分辨率、像素上限、预算换算）与常量保持原样。
-// 完整许可与署名见仓库根目录 THIRD-PARTY-NOTICES.md。
+// 完整许可与署名见仓库根目录 THIRD-PARTY-LICENSES.md。
 (function (root, factory) {
   const api = factory();
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
@@ -208,11 +208,13 @@
   function createComposerImageThumbnail(file) {
     const cached = composerThumbnails.get(file);
     if (cached) return cached;
-    const thumbnail = (async () => {
+    // 注：createImageBitmap 显式按 EXIF 方向解码（from-image）——旧引擎默认不旋转，
+  // 压缩重编码会丢掉方向元数据，照片横倒
+  const thumbnail = (async () => {
       if (!canRecompress()) return null;
       let bitmap;
       try {
-        bitmap = await createImageBitmap(file);
+        bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
         const side = Math.min(bitmap.width, bitmap.height);
         if (side <= 0) return null;
         const dimension = Math.min(256, side);
@@ -282,7 +284,7 @@
 
     let bitmap;
     try {
-      bitmap = await createImageBitmap(file);
+      bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
     } catch {
       return { ok: false, reason: 'unreadable' };
     }

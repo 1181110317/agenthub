@@ -56,7 +56,8 @@ async function check(name, fn) {
       assert(r.data.presets && r.data.presets.weekdays9, 'presets should be exposed');
     });
     await check('cron 预览：非法表达式给出可读原因', async () => {
-      for (const bad of ['', '0 9 * *', '70 * * * *', '* * * * 9', 'a b c d e', '*/0 * * * *']) {
+      for (const bad of ['', '0 9 * *', '70 * * * *', '* * * * 9', 'a b c d e', '*/0 * * * *',
+        '-1 * * * *', '0- * * * *', '0x1-5 * * * *', '1e1-20 * * * *', '1.0-5 * * * *', '*/' + '9'.repeat(320) + ' * * * *']) {
         const r = await api('/api/cron/preview', 'POST', { cron: bad });
         assert.equal(r.code, 400, bad + ' should be rejected, got ' + r.code);
         assert(r.data.error, 'error message required for ' + JSON.stringify(bad));
