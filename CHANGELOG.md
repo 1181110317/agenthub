@@ -2,6 +2,7 @@
 
 ## 2026-10-28
 
+- Refresh the README with a screenshot tour, an animated demo and a grouped feature guide; add ready-to-use assets under `docs/assets/`.
 - Add a shared model center, Magpie catalog discovery, Agent model routes and saved assignment profiles. Keep credentials in their existing encrypted stores.
 - Preserve native Claude, Codex and ZCode session protocols, cancellation and startup feedback. Recover failed SSH sends and retain unconfirmed drafts.
 - Add target-side workspace operations, accurate Git change counts and immutable turn diffs, with explicit unknown/binary states.

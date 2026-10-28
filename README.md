@@ -1,119 +1,239 @@
-# AgentHub
+<h1 align="center">AgentHub</h1>
 
-A local web workspace that brings multiple coding agents (Claude Code / Codex / ZCode / DeepSeek Harness / Gemini CLI / OpenCode / custom) into one UI, with an AgentHub-local ChatGPT-style chat mode.
+<p align="center">
+  <b>One local workspace for every coding agent.</b><br>
+  Claude Code · Codex · ZCode · DeepSeek Harness · Gemini CLI · OpenCode · Built-in Agent · Custom
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/1181110317/agenthub"><img alt="GitHub" src="https://img.shields.io/badge/github-1181110317%2Fagenthub-24292f?logo=github"></a>
+  <img alt="Node.js" src="https://img.shields.io/badge/node-%E2%89%A522.19-339933?logo=node.js&logoColor=white">
+  <img alt="License" src="https://img.shields.io/badge/license-ISC-blue">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4?logo=windows">
+</p>
 
-- **Model center and Magpie** — search a unified model catalog with context, vision, reasoning and routing-group metadata. A running local Magpie gateway is discovered at `127.0.0.1:3425`; its models can be assigned to Claude, Codex, ZCode, the built-in Agent and chat. Save and apply named multi-Agent profiles, refresh provider catalogs, or switch the current idle task. Magpie retains its subscription credentials; a custom gateway key is encrypted locally.
-- **Docked task browser** — browse beside chat, resize the desktop panel, take over input, select elements and view diagnostics. Closing the panel returns control to the Agent; task switches follow the selected session. The sidebar groups model/browser/toolbox navigation above a compact utility bar.
-- **Multi-agent switch** — Claude Code / Codex / ZCode / DeepSeek Harness / Gemini CLI / OpenCode / built-in / custom, each with its own session list
-- **DeepSeek Harness** — `dsh headless --json -` maps committed conversation, tool and usage events into the timeline; `--session-id` resumes turns. DSH keeps its own profile settings for model, provider and permissions. Its headless stream does not expose token deltas or AgentHub permission dialogs; dsh-TUI remains a separate terminal interface.
-- **Chronological timeline** — commentary, thinking and tools keep their event order while streaming and after reload. Completed activity folds together, with the final answer visible. Tool-read images stay inside their tool step; other reply images use a bounded, collapsed collection. Interrupted text survives stopping and refreshing. Output rates require reliable request timing; sufficiently large historical replies can show a whole-turn average estimate marked ≈.
-- **Diagram source** — Mermaid diagrams retain their exact source with separate diagram/source views, copying and theme-aware syntax colours. Invalid diagrams keep a readable source view; long code uses bounded highlighting without truncating the original.
-- **Markdown and math** — local CommonMark parsing supports nested lists, task lists, escaped table pipes, reference links and footnotes. KaTeX recognises dollar and bracket delimiters, renders in bounded batches and preserves invalid formulas as readable source. Code and currency stay literal; Markdown file previews resolve images and source links relative to their own directory.
-- **Consistent UI controls** — a local SVG vocabulary covers navigation, toolbars, menus, settings and tool cards. Matching usage chips, 36px header actions, readable sidebar labels and responsive menus keep the same visual rhythm; long titles truncate while preserving full labels and keyboard access.
-- **Built-in agent** — no CLI install needed; auto-detects Anthropic / OpenAI-compatible endpoints; tools include file ops, shell, web search / fetch, one-click PPT/Word/Excel generation
-- **Persistent native bridges** — Claude uses `--input-format stream-json`; ZCode uses `app-server`; Codex uses `app-server --stdio`; permissions / AskUserQuestion bridge to the web UI
-- **Session fork / rewind / retry** — native where supported, bounded replay fallback otherwise
-- **Provider & model management** — AgentHub-local CRUD (no cc-switch dependency at runtime); cc-switch is imported once on first launch for backward compatibility
-- **Shared model routes** — API management → Agent model routes configures provider, model and reasoning defaults for Claude, Codex, ZCode, the built-in Agent and chat. An authenticated loopback gateway translates Messages, Responses and Chat, including tools, images and streaming. SSH/WSL can reach converted routes through target-side loopback forwarding. Windows networking follows an enabled system HTTP proxy when proxy environment variables are absent; internal loopback requests stay direct.
-- **Token usage stats** — Today / Last N days / All time, daily charts and Agent/model/provider/session/project breakdowns; searchable records, CSV export and current-session metrics. Billing totals, latest request context, request counts, cache writes, TTFT and measured decode speed use separate fields. Missing prices and historical timing/count gaps stay visible.
-- **Context window** — A compact window icon and progress bar open request usage and capacity settings. Recover measured context from request details or the session ledger, update received usage events immediately, and label an older measurement or missing historical data. Twelve presets include 1M, 1.024M, 2M and 4M; custom model capacities persist across reloads.
-- **SSH / WSL remote** — SSH host manager, local WSL as first-class, remote session streaming, image preview over SSH. Sending shows startup/connection status immediately; startup failures preserve unconfirmed drafts and offer retry. SSH exec channel opening times out after 15 seconds, disconnects settle affected commands, and startup can be cancelled before the Agent is ready.
-- **Command palette** — Ctrl+Shift+P opens everything: new task, switch theme / agent / panels
-- **Conversation directory / computer resources** — Hover or open the right-side question outline to preview and jump through long conversations. The Resources button beside Running shows local CPU, RAM, supported NVIDIA GPU/VRAM and per-adapter network rates, plus backend RSS and estimated page JS heap; sampling runs only while the panel is visible and the owned collector retires after inactivity.
-- **Themes** — 10 themes with IDs `paper`, `aionui`, `cottage`, `forest`, `ocean`, `sakura`, `ink`, `graphite`, `aurora`, `dusk`; preview cards and persistent custom theme import/export; terminal and diagram modes follow the selected palette
-- **Workspace layout** — responsive navigation, aligned message/composer columns, and collapsible provider / permission / reasoning controls; choose a palette from the top-right theme button or Settings → Appearance
+<p align="center">
+  <a href="docs/assets/demo.gif"><img src="docs/assets/demo.gif" alt="AgentHub demo: chat, model center, usage and themes" width="100%"></a>
+</p>
 
-## Added in the seventh round
+<p align="center">
+  <sub>Chat, model center, usage accounting and themes — all in one local workspace. Screenshots use an isolated demo dataset.</sub>
+</p>
 
-- **SQLite data layer** — sessions / messages / turn events / usage are mirrored into `data/agenthub.db` (built-in `node:sqlite`, no new dependency). JSON stays authoritative; the database is a rebuildable index. Backs in-session search (FTS5 for long queries, LIKE for 2-char CJK), usage aggregation in SQL, and per-session event history. `AGENTHUB_DB=0` disables it; `/api/db/rebuild` rebuilds it; the connection is closed when idle so the data directory can be moved or deleted while the server runs
-- **In-session search (Ctrl+F)** — highlights every occurrence in the rendered conversation, cycles with Enter / Shift+Enter, expands collapsed process blocks, and shows the counter as a fraction; the hit set comes from the index so text inside collapsed steps is still found
-- **Turn navigation rail** — one tick per user turn (plus tool-bearing assistant turns) along the right edge, highlights the turn you are reading, click to jump
-- **On-demand resource monitor** — switch between the AgentHub computer and configured SSH hosts for CPU, available-memory usage, supported GPU/VRAM and per-interface network rates. SSH samples share a short cache and use a one-shot Node stdlib worker; no remote installation or resident service. Backend RSS and browser JS heap remain explicitly local. Unknown readings are never reported as zero.
-- **Windows startup feedback** — `start-server.cmd` shows runtime checks, the service PID, HTTP readiness and live server errors while appending both output streams to the data directory's `logs/server.log`. It reports an occupied port without terminating the existing service; failed interactive launches stay visible. Set `AGENTHUB_NO_PAUSE=1` for unattended invocation.
-- **Git changes preview** — searchable file list with actual staged/working/untracked line counts for local and SSH repositories, explicit binary/unavailable states, incremental rendering, and patch previews for modified, deleted, renamed and new files. Counts describe uncommitted work; commit history remains in the changes center.
-- **Workspace file operations** — a Files tab in the right panel with a lazy tree, filename search, new file/folder, rename, move, delete (moved to `data/trash/`, not unlinked), copy path, reveal in Explorer, open with VS Code / terminal. Scoped to the session working directory, refuses `..`, symlink escapes, `.git`, and remote/WSL sessions
-- **Built-in editor** — edit text/markdown/code in place with Ctrl+S, mtime conflict detection (asks before overwriting someone else's change), split-screen live Markdown preview with scroll sync, dirty markers, and a confirmation before closing an unsaved tab
-- **Preview upgrades** — source files preview with highlighting instead of "unsupported", download / save-as, open with the system app, reveal in the file manager, and auto-refresh when an agent rewrites the file on disk
-- **Third-party MCP servers** — add stdio or http servers, import from JSON, auto-detect what is already configured in `~/.claude.json` / `~/.codex/config.toml`, test the connection for real (spawns the process, lists tools), encrypt configuration and OAuth credentials at rest, and mask secrets in the UI. Built-in Agents call configured tools with permissions; ACP, Claude and Codex receive their native MCP configuration
-- **Assistants and skills** — 12 built-in roles plus your own, with prompt and model / permission / reasoning defaults. Built-in, Claude and Codex receive native prompts; ACP and other CLIs receive explicit task context. Choose skills per session in Toolbox → Runtime; negotiated ACP models, modes, configuration and command catalogs appear there after initialization
-- **Durable terminals** — reconnect or refresh to attach to the same running shell; one page controls input and viewers can explicitly take over. Unattached terminals expire after 30 minutes. Bounded disk history survives service restarts; the original process does not
-- **Git and PR workflows** — Toolbox provides branches, fast-forward pull, fetch and stash. The GitHub PR workspace includes CI, diffs, local review drafts, inline reviews, comments, metadata and merge / draft / reopen actions with stale-head protection and persistent write receipts. Uses your existing `gh` account; other hosting providers remain gated
-- **Task templates** — Toolbox includes review, testing, documentation and release checks, plus editable custom templates. Fill parameters, preview the complete prompt and append it to your draft or create a task draft using a saved project profile. Sending stays explicit; revisions protect edits from another page
-- **Saved plans** — save or download a plan from its conversation card, find it later in Toolbox, and create an implementation draft using the source task's project and Agent configuration. Planning-only permission changes to editable mode; creation never sends a model request. Version checks protect edits, and saved text remains available after its source task is deleted
-- **Scheduled tasks, deepened** — raw 5-field cron (with description and next-run preview), weekly / weekday / monthly patterns, execution mode "continue this conversation" vs "start a fresh session each run", per-run history (last 20), per-task notification toggle, and a desktop notification when a run finishes
-- **Provider presets & health checks** — 17 platform presets (including local Ollama / LM Studio endpoints) prefill name, base URL, protocol and common models; a health check really calls the provider (`/models` without spending tokens, or a 1-token chat probe) and reports latency or a readable failure reason. Providers can be marked as accepting image input
-- **WebUI accounts** — optional username/password access control: scrypt-hashed password, httpOnly session cookie, CSRF double-submit header on writes, per-IP login rate limit, password change (rotates the signing key so every other device must sign in again), and disable/ logout. Enabling requires loopback or `AGENTHUB_TOKEN`, and the environment token keeps working as the operator channel
-- **Session list details** — unread dots (cleared when you open the conversation), multi-select with a bulk bar (archive / settle / pin / mark read / delete, each item reported individually), and pinned ordering you can move up or down; bulk archive cleans up message bodies and event files just like single archive
-- **Agents can propose schedules** — the injected MCP server gained `scheduled_propose`, which only ever creates a *disabled* draft the user must enable, keeping the "no silent side effects" rule for injected tools
-- **Cross-session mentions** — type `@@` in the composer to find another session and insert a clickable `@@[title](id)` reference; nested references are expanded server-side with cycle, depth, count and context-size guards
-- **`/btw` side questions** — ask a one-off question in a floating panel using the current session's recent context; the answer is kept out of the main timeline and the endpoint is rate-limited
-- **Project-scoped always-allow permissions** — an explicit “allow and remember” choice is scoped to the current project, Agent and tool; it never silently carries across projects, and can be listed or revoked through the permissions API
+AgentHub brings multiple coding agents into one browser-based workspace. Each agent keeps its own native session protocol, while AgentHub adds a shared chat timeline, model routing, workspace files, Git/PR tools, terminals, remote hosts, scheduled tasks and token accounting. Everything runs locally: no cloud account, no external database, no build step for the front end.
 
-## Install & Run
+## Highlights
 
-Exports include encrypted SSH/MCP, speech, code-host, event and model-center records, while excluding their encryption keys (`.agenthub-ssh.key`, `.mcp-servers.key`, `.mcp-auth.key`, `.speech-input.key`, `.code-hosts.key`, `.event-triggers.key`, `.model-center.key`). Keep original keys separately when migrating credentials to another machine; unreadable ciphertext is preserved until its original key is restored.
+- **Every agent, one window** — Claude Code, Codex, ZCode, DeepSeek Harness, Gemini CLI, OpenCode, custom CLI/ACP agents, a built-in agent and a ChatGPT-style chat mode share one UI, one project list and one keyboard model.
+- **Native bridges, not screen scraping** — Claude speaks `--input-format stream-json`, Codex and ZCode use their official `app-server` protocols, and DeepSeek Harness uses `dsh headless --json`. Permissions, questions, model choice and usage events flow both ways.
+- **A real model center** — search a unified catalog of context length, vision, reasoning and routing metadata; assign models per agent; save reusable profiles; connect Magpie or any Anthropic/OpenAI-compatible API.
+- **A workspace, not just a chat box** — browse and edit files, preview diffs, inspect Git changes, create commits and PRs, run durable terminals and monitor CPU/GPU/network usage without leaving the conversation.
+- **Remote and WSL first-class** — manage SSH hosts, stream remote sessions, preview images over SSH, run target-side file operations and share the same workflow across local, WSL and remote projects.
+- **Local-first and inspectable** — JSON is the authoritative store, SQLite is a rebuildable index, credentials are encrypted at rest, and the optional WebUI account layer adds CSRF protection and login rate limits.
 
-Requires Node.js ≥ 22.19.0 (uses the built-in `node:sqlite`).
+## Screenshots
+
+| Chat & agent timeline | Model center |
+| --- | --- |
+| [![Chat with Claude Code](docs/assets/showcase-chat.png)](docs/assets/showcase-chat.png) | [![Model center](docs/assets/showcase-model-center.png)](docs/assets/showcase-model-center.png) |
+| **Usage & cost accounting** | **Ten built-in themes** |
+| [![Usage dashboard](docs/assets/showcase-usage.png)](docs/assets/showcase-usage.png) | [![Theme picker](docs/assets/showcase-themes.png)](docs/assets/showcase-themes.png) |
+
+<p align="center">
+  <a href="docs/assets/theme-wall.jpg"><img src="docs/assets/theme-wall.jpg" alt="AgentHub in Paper, Forest, Ink and Sakura themes" width="100%"></a><br>
+  <sub>Paper · Forest · Ink · Sakura — every panel, terminal and diagram follows the selected palette.</sub>
+</p>
+
+<p align="center">
+  <img src="docs/assets/showcase-mobile.png" alt="AgentHub mobile layout" width="300"><br>
+  <sub>On narrow screens the sidebar becomes a drawer while the composer, usage meter and conversation stay usable.</sub>
+</p>
+
+## Feature tour
+
+### Agents & sessions
+
+- **Multi-agent switch** — a dedicated session list for each agent, with capability chips that only appear when the backend really detects the corresponding bridge.
+- **Native session recovery** — persistent Claude, Codex and ZCode bridges; rewind, retry and fork use native session history where available, with a bounded replay fallback only when necessary.
+- **DeepSeek Harness adapter** — `dsh headless --json -` maps committed conversation, tool and usage events into the timeline; `--session-id` resumes turns. DSH keeps its own model, provider and permission profile.
+- **ACP discovery** — probes candidate CLIs for a real `acp` subcommand and registers only those that advertise it (Qwen Code, CodeBuddy, Cursor Agent, Copilot, Goose and more).
+- **Session operations** — pin, unread state, multi-select, bulk archive/settle/delete, cross-session mentions with `@@`, and project-scoped defaults.
+- **Per-session runtime** — agent, provider, model, reasoning effort, permission mode, working directory and local/WSL/SSH location are saved per conversation.
+
+### Chat experience
+
+- **Chronological timeline** — commentary, thinking, tool calls and the final answer keep their real order while streaming and after reload. Completed steps fold into a compact activity summary and can be expanded later.
+- **Markdown, math and diagrams** — local CommonMark parsing with nested lists, task lists, tables, footnotes and relative document images; KaTeX rendering for `$…$`, `$$…$$`, `\(…\)` and `\[…\]`; Mermaid and WaveDrom with source view and copy.
+- **Code that stays useful** — syntax highlighting, exact-copy code blocks, runnable shell/Python snippets, file-diff chips with undo, and image previews.
+- **Find your place** — in-session search (`Ctrl+F`) across collapsed steps, a per-turn navigation rail, conversation outline, and `Ctrl+Shift+P` command palette for everything.
+- **Responsive by design** — 10 themes, 85%–130% UI scaling, a collapsible sidebar, and a phone layout with drawer navigation.
+- **Side questions and scheduled prompts** — `/btw` asks a one-off question without polluting the timeline; scheduled tasks can continue a chat or start a fresh one and record per-run history.
+
+### Models, providers & accounting
+
+- **Unified model catalog** — context window, vision input, reasoning levels, routing groups and provider health in one place; search, filter and assign models from the Model Center.
+- **Agent model routes** — save named profiles for Claude, Codex, ZCode, the built-in agent and chat; apply a profile to new sessions without touching existing ones.
+- **Provider presets** — 17 platform presets (including local Ollama and LM Studio), real health checks with latency, and encrypted API keys.
+- **Shared gateway** — an authenticated loopback gateway translates Messages, Responses and Chat protocols, including tools, images and streaming. Magpie is auto-discovered at `127.0.0.1:3425`.
+- **Token and cost accounting** — today / last N days / all time, daily charts, agent/model/provider/session/project breakdowns, CSV export, cache-hit rate, TTFT and measured decode speed.
+- **Context and quota visibility** — a context-window meter with 1M/1.024M/2M/4M presets, provider quota badges, and `/usage-limits` snapshots that do not spend a model turn.
+
+### Workspace, Git & remote
+
+- **Files and editor** — lazy workspace tree, filename search, create/rename/move/delete (moved to `data/trash/`), copy path, reveal in Explorer, open with VS Code or terminal.
+- **Built-in editor** — edit text, Markdown and code in place with `Ctrl+S`, mtime conflict detection, split-screen Markdown preview and dirty-tab protection.
+- **Preview upgrades** — highlighted source preview, download/save-as, system-app open, file-manager reveal and auto-refresh when an agent rewrites a file.
+- **Git changes center** — staged/working/untracked line counts, patch previews for modified/deleted/renamed/new files, branch switching, fast-forward pull, fetch and stash, checkpoints and one-click PR creation.
+- **GitHub PR workspace** — CI status, diffs, local review drafts, inline comments, metadata and merge/draft/reopen actions with stale-head protection and persistent write receipts.
+- **Durable terminals** — reconnect or refresh to attach to the same shell; one page controls input, other viewers can explicitly take over; history survives service restarts.
+- **Local and SSH resource monitor** — CPU, memory, NVIDIA GPU/VRAM and per-interface network rates, with explicit unknown states instead of invented zeroes.
+- **Remote workspace** — SSH host manager, first-class WSL, target-side file operations, immutable turn diffs and remote Git workflows.
+
+### Automation & collaboration
+
+- **Assistants and skills** — 12 built-in roles plus custom assistants with prompt, model, permission and reasoning defaults; per-session skill selection in Toolbox → Runtime.
+- **Third-party MCP servers** — stdio and HTTP servers, JSON import, auto-detection from Claude/Codex configs, real connection tests, encrypted OAuth credentials and masked secrets.
+- **Task queue and templates** — editable review/testing/documentation/release templates, parameter previews, project profiles and explicit sending.
+- **Saved plans** — save or download plans from a conversation card, then create an implementation draft with the original project and agent configuration.
+- **Event triggers and schedules** — cron, weekly/weekday/monthly patterns and one-shot schedules with notifications, per-run history and missed-run catch-up.
+- **Agent handoff and subagents** — preview context, continue a task with another agent, and inspect delegated work in the subagents panel.
+- **Shared browser and speech input** — dock a controllable browser beside the chat, take over input, pick elements or capture diagnostics; dictate prompts in Chrome/Edge.
+
+### Data & security
+
+- **Local-first persistence** — JSON remains authoritative; SQLite mirrors sessions, messages, events and usage as a rebuildable index (`AGENTHUB_DB=0` disables it).
+- **Encrypted secrets at rest** — SSH, MCP, speech, code-host, event and model-center records use AES-256-GCM with per-store keys kept beside the data directory.
+- **Optional WebUI accounts** — scrypt-hashed passwords, httpOnly session cookies, CSRF double-submit headers, per-IP login rate limits and key rotation on password change.
+- **Operator controls** — shared `AGENTHUB_TOKEN`, read-only `AGENTHUB_RO_TOKEN`, trusted-host checks, loopback-only defaults and explicit permission modes.
+- **Portable data** — export includes encrypted credential records but excludes their encryption keys; unreadable ciphertext is preserved rather than overwritten.
+
+## Quick start
+
+### Requirements
+
+- **Node.js ≥ 22.19.0** (the server uses the built-in `node:sqlite`).
+- Windows 10/11 is the primary target for the bundled `start-server.cmd`; the Node entry point can also run on macOS/Linux where the underlying agent CLIs are available.
+- Optional: the CLI for each agent you want to use (see [Supported agents](#supported-agents)).
+
+### Install and run
 
 ```bash
-cd C:\agent\agenthub
+git clone https://github.com/1181110317/agenthub.git
+cd agenthub
 npm install
 npm start
 ```
 
-Open http://127.0.0.1:7261 (loopback only).
+Open **http://127.0.0.1:7261** (loopback only by default).
 
-On Windows, `start-server.cmd` runs the foreground service with startup diagnostics and console/log output. It uses its own directory, so it can also be launched from Explorer.
+On Windows, you can also double-click **`start-server.cmd`**. It shows runtime checks, the service PID, HTTP readiness and live server errors, and appends both output streams to `data/logs/server.log`. Set `AGENTHUB_NO_PAUSE=1` for unattended launches.
 
-For LAN / phone access:
+### LAN / phone access
 
 ```bash
-AGENTHUB_HOST=0.0.0.0 AGENTHUB_TOKEN=any-secret npm start
+AGENTHUB_HOST=0.0.0.0 AGENTHUB_TOKEN=choose-a-secret npm start
 ```
 
-Then visit `http://<your-ip>:7261/?token=<secret>`.
+Then open `http://<your-ip>:7261/?token=choose-a-secret`.
 
-For local agents (Claude / Codex / ZCode / DeepSeek Harness / Gemini / OpenCode) the matching CLI must be installed on the local machine or on the WSL / SSH target.
+PowerShell:
+
+```powershell
+$env:AGENTHUB_HOST = '0.0.0.0'
+$env:AGENTHUB_TOKEN = 'choose-a-secret'
+npm start
+```
+
+Add `AGENTHUB_RO_TOKEN=another-secret` for view-only devices: they can watch sessions and progress but cannot send, approve permissions, open terminals or change settings.
+
+## Supported agents
+
+| Agent | What runs | Requires |
+| --- | --- | --- |
+| **Claude Code** | Native `claude` stream-json bridge | `claude` CLI on the local machine, WSL or SSH target |
+| **Codex** | Native `codex app-server --stdio` | `codex` CLI on the target |
+| **ZCode** | Official `app-server` protocol | ZCode with `app-server` support |
+| **DeepSeek Harness** | `dsh headless --json -` | `dsh` CLI; keeps its own profile |
+| **Gemini CLI** | Raw CLI stream adapter | `gemini` CLI |
+| **OpenCode** | Raw CLI stream adapter | `opencode` CLI |
+| **Built-in Agent** | Local engine, no CLI | Nothing extra; configure an Anthropic/OpenAI-compatible provider |
+| **Custom / ACP** | Command template or ACP discovery | Any CLI that speaks the selected protocol |
+
+## Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AGENTHUB_PORT` | `7261` | HTTP/WS port |
+| `AGENTHUB_HOST` | `127.0.0.1` | Bind address; use `0.0.0.0` for LAN |
+| `AGENTHUB_TOKEN` | — | Shared access token; required for non-loopback access |
+| `AGENTHUB_RO_TOKEN` | — | Read-only token for phones and observers |
+| `AGENTHUB_DATA_DIR` | `./data` | Sessions, usage, credentials and logs |
+| `AGENTHUB_WORKSPACE` | `~/AgentHub` | Default workspace when a session has no directory |
+| `AGENTHUB_DB` | on | Set to `0` to disable the SQLite mirror |
+| `AGENTHUB_BROWSER` | auto | Chrome or Edge path for the docked browser |
+| `AGENTHUB_MAGPIE_URL` | `http://127.0.0.1:3425/v1` | Magpie gateway address |
+| `AGENTHUB_ALLOWED_HOSTS` | — | Extra trusted Host headers for reverse proxies |
+| `AGENTHUB_MAX_ACTIVE_SESSIONS` | `500` | Active-session cap before archival |
+| `AGENTHUB_TERMINAL_IDLE_MS` | `1800000` | Idle terminal retention (30 minutes) |
+| `AGENTHUB_NO_PAUSE` | — | `1` prevents the Windows launcher from pausing on exit |
+
+## Architecture
+
+```mermaid
+flowchart LR
+  UI["Browser UI<br/>chat · model center · usage · workspace"] -->|HTTP + WebSocket| SERVER["AgentHub server<br/>Express + ws"]
+  SERVER --> ADAPTERS["Agent adapters<br/>Claude · Codex · ZCode · DSH · Gemini · OpenCode · ACP · Built-in"]
+  ADAPTERS --> LOCAL["Local CLIs"]
+  ADAPTERS --> REMOTE["WSL / SSH targets"]
+  SERVER --> PROVIDERS["Model providers<br/>Anthropic · OpenAI · Magpie · compatible APIs"]
+  SERVER --> STORE[("JSON (authoritative)<br/>SQLite (rebuildable index)")]
+  SERVER --> TOOLS["Workspace tools<br/>files · editor · terminal · Git · PR · MCP"]
+```
+
+The front end is a zero-build vanilla SPA (`public/`); the server is Node.js + Express + WebSocket. Agent adapters sit behind one event model, so the browser does not need to know which CLI produced a thought, tool call or usage record.
 
 ## Directory
 
-```
+```text
 agenthub/
-├─ server.js              # Express + WebSocket server (API + chat/terminal bridges + image preview)
+├─ server.js                 # Express + WebSocket server (API, chat, terminal, preview)
 ├─ lib/
-│  ├─ agents.js           # Agent adapters (dsh/claude/codex/zcode/gemini/opencode/custom, local+WSL+remote)
-│  ├─ api-agent.js        # Built-in agent engine (Anthropic + OpenAI-compatible)
-│  ├─ claude-bridge.js    # Claude Code native stream-json bridge
-│  ├─ codex-bridge.js     # Codex app-server stdio bridge
-│  ├─ zcode-bridge.js     # ZCode app-server bridge
-│  ├─ acp-agent.js        # ACP preset integration
-│  ├─ ccswitch.js         # cc-switch SQLite read-only (one-time import for back-compat)
-│  ├─ balance.js          # Balance queries + model catalog fetch
-│  ├─ usage.js            # Usage records + local history scan + aggregation
-│  ├─ ssh.js              # ssh2 pool / exec / shell
-│  ├─ store.js            # JSON persistence
-│  ├─ events.js           # Internal event bus
-│  ├─ page-security.js    # Page-level security checks
-│  ├─ permission-policy.js# Per-session permission policy
-│  ├─ session-policy.js   # Session archive / lifecycle policy
-│  ├─ native-runtime.js   # Native binary resolution
-│  ├─ nativesessions.js   # Native session metadata
-│  └─ claude-parser.js    # Claude stream-json parser
-├─ public/                # Frontend SPA (vanilla HTML/CSS/JS + echarts + xterm + mermaid)
-├─ vendor/
-│  └─ image-size-safe/    # Patched image-size that handles malformed inputs safely
-├─ test/                  # Syntax, logic, isolated API and browser regression tests
-└─ data/                  # Runtime data (sessions / usage / ssh / model-cache / providers) — gitignored
+│  ├─ agents.js              # Agent adapters (Claude / Codex / ZCode / DSH / Gemini / OpenCode / ACP)
+│  ├─ api-agent.js           # Built-in agent engine (Anthropic + OpenAI compatible)
+│  ├─ claude-bridge.js       # Claude Code native stream-json bridge
+│  ├─ codex-bridge.js        # Codex app-server stdio bridge
+│  ├─ zcode-bridge.js        # ZCode app-server bridge
+│  ├─ acp-agent.js           # ACP preset integration
+│  ├─ model-center.js        # Model catalog, routes and assignment profiles
+│  ├─ provider-gateway.js    # Messages / Responses / Chat translation gateway
+│  ├─ usage.js               # Usage records, pricing and aggregation
+│  ├─ ssh.js                 # ssh2 pool / exec / shell
+│  ├─ store.js               # JSON persistence
+│  ├─ events.js              # Internal event bus
+│  ├─ session-files.js       # Split message bodies per session
+│  └─ ...                    # Git, workspace, MCP, permissions, scheduling, metrics
+├─ public/                   # Vanilla SPA (HTML/CSS/JS + ECharts + xterm + Mermaid)
+├─ test/                     # Syntax, logic, isolated API and browser regression tests
+├─ docs/assets/              # README screenshots and demo GIF
+└─ data/                     # Runtime data (gitignored)
 ```
 
 ## Validation
 
-`npm test` runs 95 registered scripts covering syntax, logic, API and browser regressions. Browser checks require a local Chrome or Edge installation and report a skip if neither is available. Tests use separate data directories; live provider credentials and real remote hosts are not required.
+`npm test` runs the full registered suite: 95 scripts covering syntax, logic, API, protocol, durability and browser regressions. Browser checks require a local Chrome or Edge and report a skip when neither is available. Tests use isolated data directories; live provider credentials and real remote hosts are not required.
 
-Run `node test/logic.js` and `node test/provider-gateway.js` for usage normalization, cache reads/writes, request accounting, Markdown and protocol conversion. `node test/updated-document-issues.js --api-only` covers HTTP/WS accounting without a browser.
+Useful focused commands:
 
-Run `node test/remote-workspace-ssh.js` for target-side file operations, measured resources, Git line counts and immutable turn diffs through SSH in POSIX and Windows command forms. `npm run test:models` covers the model center, gateway protocols and docked browser; `npm run test:expansion` covers the toolbox and development workflows.
+```bash
+node test/logic.js                 # usage normalization, cache accounting, markdown and protocol conversion
+node test/provider-gateway.js      # Messages / Responses / Chat conversion
+node test/remote-workspace-ssh.js  # SSH file ops, resource metrics, Git counts and turn diffs
+npm run test:models                # model center, gateway protocols and docked browser
+npm run test:expansion             # toolbox, target workspace and development workflows
+```
 
-See [the change summary](CHANGELOG.md) for the implementation scope and limitations. Local troubleshooting reports, runtime captures and screenshots are kept out of the published repository. Vendored code attribution and licenses are documented in [third-party licenses](THIRD-PARTY-LICENSES.md).
+See [CHANGELOG.md](CHANGELOG.md) for the implementation scope, known limits and latest changes. Vendored code attribution is in [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
+
+## License
+
+ISC. See [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) for bundled third-party notices.
