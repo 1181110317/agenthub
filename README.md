@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <sub>Chat, model center, usage accounting and themes — all in one local workspace. Screenshots use an isolated demo dataset.</sub>
+  <sub>Chat, model center, usage accounting and themes — all in one local workspace. Demo runs on an isolated dataset.</sub>
 </p>
 
 AgentHub brings multiple coding agents into one browser-based workspace. Each agent keeps its own native session protocol, while AgentHub adds a shared chat timeline, model routing, workspace files, Git/PR tools, terminals, remote hosts, scheduled tasks and token accounting. Everything runs locally: no cloud account, no external database, no build step for the front end.
@@ -30,24 +30,6 @@ AgentHub brings multiple coding agents into one browser-based workspace. Each ag
 - **A workspace, not just a chat box** — browse and edit files, preview diffs, inspect Git changes, create commits and PRs, run durable terminals and monitor CPU/GPU/network usage without leaving the conversation.
 - **Remote and WSL first-class** — manage SSH hosts, stream remote sessions, preview images over SSH, run target-side file operations and share the same workflow across local, WSL and remote projects.
 - **Local-first and inspectable** — JSON is the authoritative store, SQLite is a rebuildable index, credentials are encrypted at rest, and the optional WebUI account layer adds CSRF protection and login rate limits.
-
-## Screenshots
-
-| Chat & agent timeline | Model center |
-| --- | --- |
-| [![Chat with Claude Code](docs/assets/showcase-chat.png)](docs/assets/showcase-chat.png) | [![Model center](docs/assets/showcase-model-center.png)](docs/assets/showcase-model-center.png) |
-| **Usage & cost accounting** | **Ten built-in themes** |
-| [![Usage dashboard](docs/assets/showcase-usage.png)](docs/assets/showcase-usage.png) | [![Theme picker](docs/assets/showcase-themes.png)](docs/assets/showcase-themes.png) |
-
-<p align="center">
-  <a href="docs/assets/theme-wall.jpg"><img src="docs/assets/theme-wall.jpg" alt="AgentHub in Paper, Forest, Ink and Sakura themes" width="100%"></a><br>
-  <sub>Paper · Forest · Ink · Sakura — every panel, terminal and diagram follows the selected palette.</sub>
-</p>
-
-<p align="center">
-  <img src="docs/assets/showcase-mobile.png" alt="AgentHub mobile layout" width="300"><br>
-  <sub>On narrow screens the sidebar becomes a drawer while the composer, usage meter and conversation stay usable.</sub>
-</p>
 
 ## Feature tour
 
