@@ -16,11 +16,11 @@
 </div>
 
 <p align="center">
-  <a href="docs/assets/demo.gif"><img src="docs/assets/demo.gif" alt="AgentHub demo: chat, model center, usage and themes" width="92%"></a>
+  <a href="docs/assets/demo.gif"><img src="docs/assets/demo.gif" alt="AgentHub demo: Agent management, models, chat and toolbox" width="92%"></a>
 </p>
 
 <p align="center">
-  <sub>One workspace for chat, models, usage and themes. The demo runs on an isolated dataset.</sub>
+  <sub>Agent management, shared models, chat and terminal, and the toolbox in one workspace. Demo runs on an isolated dataset.</sub>
 </p>
 
 AgentHub is a local-first web workspace that brings multiple coding agents into one browser tab. Each agent keeps its own native session protocol; AgentHub adds a shared timeline, model routing, workspace tools, Git/PR flows, terminals, remote hosts, schedules and token accounting. No cloud account, no external database, and no build step for the front end.
