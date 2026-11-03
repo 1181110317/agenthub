@@ -2,7 +2,7 @@
 
 <h1>AgentHub</h1>
 
-<p><strong>One local workspace for every coding agent.</strong></p>
+<p><strong>One local workspace for every coding agent, on every computer.</strong></p>
 
 <p>Claude Code · Codex · ZCode · DeepSeek Harness · Gemini CLI · OpenCode · Built-in Agent · Custom</p>
 
@@ -25,6 +25,23 @@
 
 AgentHub is a local-first web workspace that brings multiple coding agents into one browser tab. Each agent keeps its own native session protocol; AgentHub adds a shared timeline, model routing, workspace tools, Git/PR flows, terminals, remote hosts, schedules and token accounting. No cloud account, no external database, and no build step for the front end.
 
+## What's new
+
+**Agent management is now a first-class workspace.** Every executor, computer and default lives in one place.
+
+- **Agent / Models / Environments** — separate pages for executor configuration, shared model connections and the same Agent across local, WSL and SSH targets.
+- **Per-computer defaults** — default provider, model, reasoning, permissions and workspace are stored per Agent and environment; existing sessions keep their own settings.
+- **On-demand diagnostics** — check a CLI, version and capabilities without launching a turn; disabled Agents stay out of new-task choices.
+- **Studio theme** — a restrained light palette with the new shared interface system, while the existing themes remain available.
+
+<p align="center">
+  <a href="docs/assets/agent-management.jpg"><img src="docs/assets/agent-management.jpg" alt="Agent management: environments, shared model defaults and recent sessions" width="92%"></a>
+</p>
+
+<p align="center">
+  <sub>Agent management: per-computer environments, shared model defaults, diagnostics and recent sessions.</sub>
+</p>
+
 ## Contents
 
 | Start here | What's inside |
@@ -33,6 +50,9 @@ AgentHub is a local-first web workspace that brings multiple coding agents into 
 | 🚀 [Deployment guide](docs/deployment.md) | Local install, Windows launcher, LAN/phone access, reverse proxy, accounts, backups, upgrades and service examples |
 | ✨ [Feature reference](docs/features.md) | Every capability: agents, chat timeline, models, usage, workspace, Git/PR, terminals, remote, automation and security |
 | ⚙️ [Configuration](docs/configuration.md) | Environment variables, data directory, agent CLI setup, provider setup and access control |
+| 🧭 [Agent management](docs/agent-management.md) | Per-computer Agent defaults, shared models, diagnostics, task creation and the Studio theme |
+| 🧩 [Management centers](docs/management-centers.md) | Model catalog, shared API connections, global presets, skills, MCP servers, assistants and settings |
+| 🎨 [Interface design](docs/interface-design.md) | Shared typography, controls, icons and responsive surfaces across every built-in workspace |
 | 🏗 [Architecture](docs/architecture.md) | Browser/server split, agent adapters, event model, storage layers and directory layout |
 | 🧪 [Testing](docs/testing.md) | Test suite, focused commands, browser checks and coverage boundaries |
 | 🩺 [Troubleshooting](docs/troubleshooting.md) | Port conflicts, missing CLIs, browser/docked-page issues, proxy problems, data recovery and common errors |
@@ -57,6 +77,7 @@ On Windows, double-click **`start-server.cmd`** for a launcher with runtime chec
 ## Feature highlights
 
 - **Every agent, one window** — Claude Code, Codex, ZCode, DeepSeek Harness, Gemini CLI, OpenCode, custom CLI/ACP agents, a built-in agent and a ChatGPT-style chat mode share one UI and one project list.
+- **Agent management** — a catalog with pinning, ordering, status filters and enable/disable controls; environment tiles, shared model defaults, recent sessions and supported per-Agent tool settings. Local, WSL and SSH defaults remain separate; diagnostics run on demand. Project conversations include all agents unless explicitly filtered.
 - **Native bridges, not screen scraping** — Claude speaks `--input-format stream-json`, Codex and ZCode use their official `app-server` protocols, and DeepSeek Harness uses `dsh headless --json`. Permissions, questions, model choice and usage events flow both ways.
 - **A model center, not a dropdown** — search context, vision, reasoning and routing metadata; assign models per agent; save reusable profiles; connect Magpie or any Anthropic/OpenAI-compatible API.
 - **A workspace, not just a chat box** — browse and edit files, preview diffs, inspect Git changes, create commits and PRs, run durable terminals and monitor CPU/GPU/network usage without leaving the conversation.
@@ -80,7 +101,9 @@ Details for each adapter, including WSL/SSH notes and capability limits, are in 
 
 ## Project status
 
-AgentHub is actively developed and Windows-first. The registered test suite contains 95 scripts covering syntax, logic, isolated API, protocols, durability and browser regressions. External provider accounts, real SSH hosts and every third-party CLI are not exercised by the default suite; use the [testing guide](docs/testing.md) for the exact scope. The application stores runtime data locally; there is no built-in cloud sync or multi-user cloud service.
+AgentHub is actively developed and Windows-first. The registered test suite contains 96 scripts covering syntax, logic, isolated API, protocols, durability and browser regressions. External provider accounts, real SSH hosts and every third-party CLI are not exercised by the default suite; use the [testing guide](docs/testing.md) for the exact scope. The application stores runtime data locally; there is no built-in cloud sync or multi-user cloud service.
+
+Appearance includes 11 themes: `studio`, `paper`, `aionui`, `cottage`, `forest`, `ocean`, `sakura`, `ink`, `graphite`, `aurora`, `dusk`. Studio is the clean demo style; existing theme preferences remain available.
 
 ## License
 

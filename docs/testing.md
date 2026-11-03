@@ -1,6 +1,10 @@
 # Testing
 
-AgentHub’s test suite is a set of Node.js scripts rather than a single test runner. `npm test` runs all 95 registered scripts in sequence.
+AgentHub’s test suite is a set of Node.js scripts rather than a single test runner. `npm test` runs all 96 registered scripts in sequence.
+
+`node test/agent-center.js` checks target-specific defaults, runtime command selection, input validation, late diagnostic results, read-only access, custom Agent creation and real isolated HTTP session creation. It does not require external SSH or model accounts.
+
+`node test/model-center.js` checks catalog discovery and caching, connection validation, credential redaction, partial model presets and a real isolated HTTP/WebSocket model round. It exercises backend contracts without driving a browser. The redesigned management UI is covered by the interaction checklist in [Management centers](management-centers.md), including narrow layouts and dialog forms.
 
 ## Run the full suite
 
@@ -27,10 +31,10 @@ Browser checks create their own headless Chrome/Edge profile and data directory.
 
 | Command | What it exercises |
 | --- | --- |
-| `node test/logic.js` | Usage normalization, cache accounting, Markdown and protocol conversion |
+| `node test/logic.js` | Usage normalization, cache accounting, Markdown, protocol conversion and file-layout/editor preservation |
 | `node test/provider-gateway.js` | Messages / Responses / Chat conversion |
 | `node test/remote-workspace-ssh.js` | SSH file operations, resource metrics, Git counts and immutable turn diffs |
-| `npm run test:models` | Model center, gateway protocols and docked browser |
+| `npm run test:models` | Model catalog, shared routing, presets and gateway protocols |
 | `npm run test:expansion` | Toolbox, target workspace and development workflows |
 | `npm run test:workflows` | Features runtime, MCP OAuth, durable terminals, Git workflows, templates |
 | `npm run test:issues` | Provider gateway, stop/recovery, remote workspace, SFTP and document issues |

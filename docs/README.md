@@ -10,6 +10,9 @@ Start with the page that matches what you want to do.
 | Access AgentHub from another device on my LAN or phone | [Deployment → LAN / phone access](deployment.md#lan--phone-access) |
 | Put AgentHub behind Nginx, Caddy or a domain | [Deployment → reverse proxy](deployment.md#reverse-proxy-and-https) |
 | Know every feature in detail | [Feature reference](features.md) |
+| Manage Agents, models, environments and diagnostics | [Agent management](agent-management.md) |
+| Browse models, connections, skills, MCP servers and presets | [Management centers](management-centers.md) |
+| Reuse the shared interface system | [Interface design](interface-design.md) |
 | Set environment variables or configure an agent CLI | [Configuration](configuration.md) |
 | Understand how the server and agents fit together | [Architecture](architecture.md) |
 | Run or extend the tests | [Testing](testing.md) |
